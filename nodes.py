@@ -1,69 +1,97 @@
 import math
 import torch
-import numpy as np
 from PIL import Image
 
+from .util import (
+    tensor_to_pil,
+    pil_to_tensor,
+    fit_inside,
+    aligned_offset,
+    paste_with_alpha,
+    add_white_padding,
+)
 
-def tensor_to_pil(img_tensor):
+
+# ---------------------------------------------------------------------------
+# FrameRangedFaceLoader
+# ---------------------------------------------------------------------------
+
+class FrameRangedFaceLoader:
     """
-    Converts a ComfyUI IMAGE tensor [H, W, C] float32 in range 0..1
-    into a PIL image.
+    Wraps a single face IMAGE with a frame range [frame_start, frame_end].
+    Returns a FACE_SEQUENCE — a list of dicts used by ReservedRegionFrameComposer.
+
+    frame_end = -1 means "until the last frame" (no upper limit).
     """
-    img = img_tensor.cpu().numpy()
-    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(img)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "frame_start": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 999999, "step": 1},
+                ),
+                "frame_end": (
+                    "INT",
+                    {"default": -1, "min": -1, "max": 999999, "step": 1},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("FACE_SEQUENCE",)
+    RETURN_NAMES = ("face_sequence",)
+    FUNCTION = "load"
+    CATEGORY = "video/composition"
+
+    def load(self, image, frame_start, frame_end):
+        """
+        image: IMAGE tensor [N, H, W, C] — only the first image is used.
+        Returns a FACE_SEQUENCE list with a single entry.
+        """
+        face_pil = tensor_to_pil(image[0]).convert("RGBA")
+        face_pil = add_white_padding(face_pil, 16)
+
+        entry = {
+            "image": face_pil,
+            "frame_start": frame_start,
+            "frame_end": frame_end,  # -1 == no upper limit
+        }
+        return ([entry],)
 
 
-def pil_to_tensor(img_pil):
+# ---------------------------------------------------------------------------
+# FaceSequenceBatch
+# ---------------------------------------------------------------------------
+
+class FaceSequenceBatch:
     """
-    Converts a PIL image into a ComfyUI IMAGE tensor [H, W, C] float32 0..1.
+    Joins two FACE_SEQUENCE lists into one.
+    Chain multiple nodes to build batches with many ranges.
     """
-    arr = np.array(img_pil).astype(np.float32) / 255.0
-    return torch.from_numpy(arr)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "face_sequence_a": ("FACE_SEQUENCE",),
+                "face_sequence_b": ("FACE_SEQUENCE",),
+            }
+        }
+
+    RETURN_TYPES = ("FACE_SEQUENCE",)
+    RETURN_NAMES = ("face_sequence",)
+    FUNCTION = "batch"
+    CATEGORY = "video/composition"
+
+    def batch(self, face_sequence_a, face_sequence_b):
+        return (face_sequence_a + face_sequence_b,)
 
 
-def fit_inside(src_w, src_h, max_w, max_h):
-    """
-    Resizes while preserving aspect ratio so the source fits entirely inside
-    the target box, without cropping.
-    """
-    if src_w <= 0 or src_h <= 0:
-        return 1, 1
-
-    scale = min(max_w / src_w, max_h / src_h)
-    new_w = max(1, int(round(src_w * scale)))
-    new_h = max(1, int(round(src_h * scale)))
-    return new_w, new_h
-
-
-def aligned_offset(container_size, content_size, align):
-    """
-    Returns the position offset for start / center / end alignment.
-    """
-    if align == "start":
-        return 0
-    elif align == "end":
-        return max(0, container_size - content_size)
-    return max(0, (container_size - content_size) // 2)
-
-
-def paste_with_alpha(dst, src_rgba, xy):
-    """
-    Pastes an image onto another, preserving alpha if present.
-    """
-    if src_rgba.mode == "RGBA":
-        dst.paste(src_rgba, xy, src_rgba.split()[-1])
-    else:
-        dst.paste(src_rgba, xy)
-
-
-def add_white_padding(img_rgba, pad_px=16):
-    new_w = img_rgba.width + pad_px * 2
-    new_h = img_rgba.height + pad_px * 2
-
-    canvas = Image.new("RGBA", (new_w, new_h), (255, 255, 255, 255))
-    canvas.paste(img_rgba, (pad_px, pad_px), img_rgba if img_rgba.mode == "RGBA" else None)
-    return canvas
+# ---------------------------------------------------------------------------
+# ReservedRegionFrameComposer
+# ---------------------------------------------------------------------------
 
 class ReservedRegionFrameComposer:
     """
@@ -75,7 +103,8 @@ class ReservedRegionFrameComposer:
     - Fits video content into remaining area without crop
     - Fills reserved region with chroma color
     - Places one or many face images in that region
-    - Supports temporal distribution modes for face batches
+    - Supports temporal distribution modes for face batches (IMAGE input)
+    - Supports per-frame ranges via FACE_SEQUENCE input
     """
 
     @classmethod
@@ -83,7 +112,6 @@ class ReservedRegionFrameComposer:
         return {
             "required": {
                 "frames": ("IMAGE",),
-                "face_images": ("IMAGE",),
 
                 "region_position": (
                     ["left", "right", "top", "bottom"],
@@ -157,7 +185,16 @@ class ReservedRegionFrameComposer:
                     "INT",
                     {"default": 0, "min": 0, "max": 255, "step": 1}
                 ),
-            }
+            },
+            "optional": {
+                # When connected, overrides face_images completely.
+                # face_distribution / interval_frames are ignored.
+                "face_sequence": ("FACE_SEQUENCE",),
+
+                # Legacy flat batch input (IMAGE). Used only when
+                # face_sequence is NOT connected.
+                "face_images": ("IMAGE",),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -165,15 +202,19 @@ class ReservedRegionFrameComposer:
     FUNCTION = "process"
     CATEGORY = "video/composition"
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _prepare_face(self, face_tensor):
-        """
-        Converts input tensor to RGBA PIL so alpha transparency is preserved.
-        """
+        """Converts input tensor to RGBA PIL so alpha transparency is preserved."""
         face = tensor_to_pil(face_tensor).convert("RGBA")
         face = add_white_padding(face, 16)
         return face
 
-    def _resolve_faces_for_frame(
+    # --- Resolution for plain IMAGE input ---
+
+    def _resolve_faces_for_frame_image(
         self,
         faces_pil,
         frame_idx,
@@ -182,7 +223,8 @@ class ReservedRegionFrameComposer:
         overflow_mode,
     ):
         """
-        Returns the list of face images that should be used for the current frame.
+        Returns the list of face PIL images for the current frame
+        when a plain IMAGE batch is used (legacy mode).
         """
         total = len(faces_pil)
 
@@ -196,7 +238,6 @@ class ReservedRegionFrameComposer:
             idx = frame_idx
             if idx < total:
                 return [faces_pil[idx]]
-
             if overflow_mode == "loop":
                 return [faces_pil[idx % total]]
             elif overflow_mode == "clamp":
@@ -212,7 +253,6 @@ class ReservedRegionFrameComposer:
             idx = frame_idx // interval_frames
             if idx < total:
                 return [faces_pil[idx]]
-
             if overflow_mode == "loop":
                 return [faces_pil[idx % total]]
             elif overflow_mode == "clamp":
@@ -229,17 +269,50 @@ class ReservedRegionFrameComposer:
 
         raise ValueError(f"Unsupported face_distribution mode: {face_distribution}")
 
-    def _resize_single_face(
-        self,
-        face,
-        region_w,
-        region_h,
-        face_scale_pct,
-        face_padding_px,
-    ):
+    # --- Resolution for FACE_SEQUENCE input ---
+
+    def _resolve_faces_for_frame_sequence(self, face_sequence, frame_idx, overflow_mode):
         """
-        Resizes one face to fit inside the usable region area.
+        Returns the list of face PIL images for the current frame
+        when a FACE_SEQUENCE is used (range mode).
+
+        Collects all entries whose [frame_start, frame_end] covers frame_idx.
+        frame_end == -1 means no upper limit.
+
+        If no entry matches:
+          - loop: wraps around using sorted order by frame_start
+          - clamp: uses the last entry (highest frame_start)
+          - error: raises ValueError
         """
+        matched = [
+            e for e in face_sequence
+            if e["frame_start"] <= frame_idx and (
+                e["frame_end"] == -1 or frame_idx <= e["frame_end"]
+            )
+        ]
+
+        if matched:
+            return [e["image"] for e in matched]
+
+        # Fallback
+        sorted_seq = sorted(face_sequence, key=lambda e: e["frame_start"])
+        if not sorted_seq:
+            raise ValueError("FACE_SEQUENCE is empty.")
+
+        if overflow_mode == "loop":
+            total = len(sorted_seq)
+            return [sorted_seq[frame_idx % total]["image"]]
+        elif overflow_mode == "clamp":
+            return [sorted_seq[-1]["image"]]
+        else:
+            raise ValueError(
+                f"No face entry covers frame {frame_idx} and overflow_mode is 'error'."
+            )
+
+    # --- Layout helpers ---
+
+    def _resize_single_face(self, face, region_w, region_h, face_scale_pct, face_padding_px):
+        """Resizes one face to fit inside the usable region area."""
         usable_w = max(1, region_w - 2 * face_padding_px)
         usable_h = max(1, region_h - 2 * face_padding_px)
 
@@ -283,8 +356,7 @@ class ReservedRegionFrameComposer:
             for face in faces_pil:
                 fw, fh = face.size
                 tw, th = fit_inside(
-                    fw,
-                    fh,
+                    fw, fh,
                     max(1, int(round(slot_w * (face_scale_pct / 100.0)))),
                     max(1, int(round(slot_h * (face_scale_pct / 100.0))))
                 )
@@ -299,8 +371,7 @@ class ReservedRegionFrameComposer:
             for face in faces_pil:
                 fw, fh = face.size
                 tw, th = fit_inside(
-                    fw,
-                    fh,
+                    fw, fh,
                     max(1, int(round(slot_w * (face_scale_pct / 100.0)))),
                     max(1, int(round(slot_h * (face_scale_pct / 100.0))))
                 )
@@ -318,8 +389,7 @@ class ReservedRegionFrameComposer:
             for face in faces_pil:
                 fw, fh = face.size
                 tw, th = fit_inside(
-                    fw,
-                    fh,
+                    fw, fh,
                     max(1, int(round(cell_w * (face_scale_pct / 100.0)))),
                     max(1, int(round(cell_h * (face_scale_pct / 100.0))))
                 )
@@ -342,9 +412,7 @@ class ReservedRegionFrameComposer:
         face_align_main,
         face_align_cross,
     ):
-        """
-        Pastes one face inside the reserved region.
-        """
+        """Pastes one face inside the reserved region."""
         tw, th = face.size
         area_w = max(1, region_w - 2 * face_padding_px)
         area_h = max(1, region_h - 2 * face_padding_px)
@@ -373,9 +441,7 @@ class ReservedRegionFrameComposer:
         face_align_cross,
         stack_direction,
     ):
-        """
-        Pastes multiple faces inside the reserved region.
-        """
+        """Pastes multiple faces inside the reserved region."""
         layout = self._layout_faces_stack(
             faces_pil=faces_pil,
             region_w=region_w,
@@ -395,7 +461,9 @@ class ReservedRegionFrameComposer:
         kind = layout[0]
 
         if kind == "vertical":
-            _, items, usable_w, usable_h = layout
+            items   = layout[1]
+            usable_w = layout[2]
+            usable_h = layout[3]
             total_h = sum(img.size[1] for img in items) + face_gap_px * (len(items) - 1)
             start_y = usable_y + aligned_offset(usable_h, total_h, face_align_main)
 
@@ -407,7 +475,9 @@ class ReservedRegionFrameComposer:
             return
 
         if kind == "horizontal":
-            _, items, usable_w, usable_h = layout
+            items    = layout[1]
+            usable_w = layout[2]
+            usable_h = layout[3]
             total_w = sum(img.size[0] for img in items) + face_gap_px * (len(items) - 1)
             start_x = usable_x + aligned_offset(usable_w, total_w, face_align_main)
 
@@ -419,7 +489,11 @@ class ReservedRegionFrameComposer:
             return
 
         if kind == "grid":
-            _, items, usable_w, usable_h, cols, rows = layout
+            items    = layout[1]
+            usable_w = layout[2]
+            usable_h = layout[3]
+            cols     = layout[4]  # type: ignore[index]
+            rows     = layout[5]  # type: ignore[index]
 
             cell_w = max(1, (usable_w - face_gap_px * (cols - 1)) // cols)
             cell_h = max(1, (usable_h - face_gap_px * (rows - 1)) // rows)
@@ -444,10 +518,13 @@ class ReservedRegionFrameComposer:
 
         raise ValueError(f"Unsupported stack layout kind: {kind}")
 
+    # ------------------------------------------------------------------
+    # Main execution
+    # ------------------------------------------------------------------
+
     def process(
         self,
         frames,
-        face_images,
         region_position,
         region_size_px,
         face_distribution,
@@ -462,24 +539,37 @@ class ReservedRegionFrameComposer:
         chroma_r,
         chroma_g,
         chroma_b,
+        face_sequence=None,
+        face_images=None,
     ):
-        """
-        Main node execution.
-        """
+        """Main node execution."""
         if len(frames.shape) != 4:
             raise ValueError(
                 "Input 'frames' must be a batch IMAGE tensor with shape [N, H, W, C]."
             )
 
-        if len(face_images.shape) != 4 or face_images.shape[0] < 1:
+        # Determine input mode
+        use_sequence = face_sequence is not None
+        use_image = face_images is not None
+
+        if not use_sequence and not use_image:
             raise ValueError(
-                "Input 'face_images' must be a valid IMAGE batch with at least one image."
+                "You must connect either 'face_sequence' (FACE_SEQUENCE) "
+                "or 'face_images' (IMAGE) to the node."
             )
 
-        n, orig_h, orig_w, _ = frames.shape
-        face_count = face_images.shape[0]
+        # Pre-process legacy IMAGE input
+        if use_image and not use_sequence:
+            if len(face_images.shape) != 4 or face_images.shape[0] < 1:
+                raise ValueError(
+                    "Input 'face_images' must be a valid IMAGE batch with at least one image."
+                )
+            face_count = face_images.shape[0]
+            faces_pil_legacy = [self._prepare_face(face_images[i]) for i in range(face_count)]
+        else:
+            faces_pil_legacy = []
 
-        faces_pil = [self._prepare_face(face_images[i]) for i in range(face_count)]
+        n, orig_h, orig_w, _ = frames.shape
 
         if region_position in ["left", "right"]:
             max_region_size = max(1, orig_w - 1)
@@ -534,16 +624,23 @@ class ReservedRegionFrameComposer:
 
             region_img = Image.new("RGBA", (region_w, region_h), color=chroma_rgba)
             canvas.paste(region_img, (region_x, region_y))
-
             canvas.paste(frame_pil.convert("RGBA"), (video_x, video_y))
 
-            faces_for_frame = self._resolve_faces_for_frame(
-                faces_pil=faces_pil,
-                frame_idx=i,
-                face_distribution=face_distribution,
-                interval_frames=interval_frames,
-                overflow_mode=overflow_mode,
-            )
+            # Resolve faces for this frame
+            if use_sequence:
+                faces_for_frame = self._resolve_faces_for_frame_sequence(
+                    face_sequence=face_sequence,
+                    frame_idx=i,
+                    overflow_mode=overflow_mode,
+                )
+            else:
+                faces_for_frame = self._resolve_faces_for_frame_image(
+                    faces_pil=faces_pil_legacy,
+                    frame_idx=i,
+                    face_distribution=face_distribution,
+                    interval_frames=interval_frames,
+                    overflow_mode=overflow_mode,
+                )
 
             if len(faces_for_frame) == 1:
                 single_face = self._resize_single_face(
@@ -595,10 +692,18 @@ class ReservedRegionFrameComposer:
         return (out,)
 
 
+# ---------------------------------------------------------------------------
+# ComfyUI registration
+# ---------------------------------------------------------------------------
+
 NODE_CLASS_MAPPINGS = {
-    "ReservedRegionFrameComposer": ReservedRegionFrameComposer
+    "ReservedRegionFrameComposer": ReservedRegionFrameComposer,
+    "FrameRangedFaceLoader": FrameRangedFaceLoader,
+    "FaceSequenceBatch": FaceSequenceBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ReservedRegionFrameComposer": "Reserved Region Frame Composer"
+    "ReservedRegionFrameComposer": "Reserved Region Frame Composer",
+    "FrameRangedFaceLoader": "Frame Ranged Face Loader",
+    "FaceSequenceBatch": "Face Sequence Batch",
 }
