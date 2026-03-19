@@ -28,7 +28,7 @@ Documentation = "https://github.com/alisson-anjos/ComfyUI-BFSNodes/wiki"
 "Bug Tracker" = "https://github.com/alisson-anjos/ComfyUI-BFSNodes/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "alisson-anjos"
 DisplayName = "ComfyUI-BFSNodes"
 Icon = ""
 includes = [] 
