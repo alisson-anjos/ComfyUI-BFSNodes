@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
-description = "Custom ComfyUI nodes including LTXV Edit Anything, Head-Swap/Anime2Real Bernini conditioning, and the AMV Guide Builder."
-version = "1.7.0"
+description = "Custom ComfyUI nodes including LTXV Edit Anything, Head-Swap/Anime2Real Bernini conditioning, the AMV Guide Builder, and LTX Identity Transfer (IPT2V reference + source-phase RoPE)."
+version = "1.8.0"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
@@ -9,6 +9,9 @@ dependencies = [
     "Pillow",
     "safetensors",
     "librosa",
+    "opencv-python",
+    "insightface==0.7.3",
+    "onnxruntime",
 ]
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
