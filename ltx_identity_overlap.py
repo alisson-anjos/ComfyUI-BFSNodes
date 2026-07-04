@@ -66,10 +66,12 @@ def _get_face_app():
 
 
 class IdentityProjector(nn.Module):
-    def __init__(self, in_dim=512, context_dim=4096, num_tokens=4, hidden_dim=1024):
+    def __init__(self, in_dim=512, context_dim=4096, num_tokens=4, proj=None):
         super().__init__()
         self.in_dim = in_dim; self.context_dim = context_dim; self.num_tokens = num_tokens
-        self.proj = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, num_tokens * context_dim))
+        # `proj` is built from the checkpoint (variable depth); fallback = original 2-linear MLP.
+        self.proj = proj if proj is not None else nn.Sequential(
+            nn.Linear(in_dim, 1024), nn.GELU(), nn.Linear(1024, num_tokens * context_dim))
         self.norm = nn.LayerNorm(context_dim)
 
     def forward(self, e):
@@ -77,10 +79,25 @@ class IdentityProjector(nn.Module):
 
 
 def _load_projector(path, device):
+    """Load an IdentityProjector of ANY depth by rebuilding proj.N Linears from the state_dict
+    (old = 2 linears proj.0/proj.2; new enhanced = 3 linears proj.0/proj.2/proj.4, 16 tokens)."""
     sd = load_file(path)
-    p = IdentityProjector(sd["proj.0.weight"].shape[1], sd["norm.weight"].shape[0],
-                          sd["proj.2.weight"].shape[0] // sd["norm.weight"].shape[0], sd["proj.0.weight"].shape[0])
+    context_dim = sd["norm.weight"].shape[0]
+    # collect Linear layers in order (proj.<idx>.weight), with GELU between them
+    idxs = sorted({int(k.split(".")[1]) for k in sd if k.startswith("proj.") and k.endswith(".weight")})
+    layers = []
+    for j, i in enumerate(idxs):
+        w = sd[f"proj.{i}.weight"]
+        layers.append(nn.Linear(w.shape[1], w.shape[0]))
+        if j < len(idxs) - 1:
+            layers.append(nn.GELU())
+    proj = nn.Sequential(*layers)
+    in_dim = sd["proj.0.weight"].shape[1]
+    num_tokens = sd[f"proj.{idxs[-1]}.weight"].shape[0] // context_dim
+    # Sequential indices must match the state_dict (Linear at even positions, GELU odd) — they do.
+    p = IdentityProjector(in_dim=in_dim, context_dim=context_dim, num_tokens=num_tokens, proj=proj)
     p.load_state_dict(sd)
+    log.info("IdentityProjector loaded: %d tokens, %d Linear layers", num_tokens, len(idxs))
     return p.to(device=device, dtype=torch.float32).eval()
 
 

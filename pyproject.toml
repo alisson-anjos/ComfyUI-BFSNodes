@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
 description = "Custom ComfyUI nodes including LTXV Edit Anything, Head-Swap/Anime2Real Bernini conditioning, the AMV Guide Builder, and LTX Identity Transfer (IPT2V reference + source-phase RoPE)."
-version = "1.8.0"
+version = "1.8.1"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
