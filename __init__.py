@@ -16,9 +16,16 @@ try:
 except Exception as _e:  # noqa
     print(f"[BFSNodes] LTX Identity Gemma-Vision node not loaded: {_e!r}")
     GV_NODE_CLASS_MAPPINGS, GV_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+try:
+    from .ltx_identity_can import NODE_CLASS_MAPPINGS as CAN_NODE_CLASS_MAPPINGS
+    from .ltx_identity_can import NODE_DISPLAY_NAME_MAPPINGS as CAN_NODE_DISPLAY_NAME_MAPPINGS
+except Exception as _e:  # noqa
+    print(f"[BFSNodes] LTX Identity CAN node not loaded: {_e!r}")
+    CAN_NODE_CLASS_MAPPINGS, CAN_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 
 NODE_CLASS_MAPPINGS = {
     **GV_NODE_CLASS_MAPPINGS,
+    **CAN_NODE_CLASS_MAPPINGS,
     **BFS_NODE_CLASS_MAPPINGS,
     **LTXV_EA_NODE_CLASS_MAPPINGS,
     **HEADSWAP_NODE_CLASS_MAPPINGS,
@@ -29,6 +36,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     **GV_NODE_DISPLAY_NAME_MAPPINGS,
+    **CAN_NODE_DISPLAY_NAME_MAPPINGS,
     **BFS_NODE_DISPLAY_NAME_MAPPINGS,
     **LTXV_EA_NODE_DISPLAY_NAME_MAPPINGS,
     **HEADSWAP_NODE_DISPLAY_NAME_MAPPINGS,
