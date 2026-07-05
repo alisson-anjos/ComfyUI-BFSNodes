@@ -358,10 +358,13 @@ class LTXIdentityOverlapConditioning:
         ltxv = _find_ltxv(m)
 
         # CAN / AdaLN identity modulation (the strong channel) — applied to the same model+reference.
+        # The CAN REQUIRES the reference ArcFace, so always try to detect (auto_adjust), independent
+        # of arcface_mode (which only governs the weak projector; 'disable' must not disable the CAN).
         if can_weights and can_weights != "None":
             try:
                 from .ltx_identity_can import apply_can_to_model
-                apply_can_to_model(m, reference_face, can_weights, can_strength, arcface_mode)
+                can_mode = "auto_adjust" if arcface_mode == "disable" else arcface_mode
+                apply_can_to_model(m, reference_face, can_weights, can_strength, can_mode)
             except Exception as e:
                 print(f"[LTXIdOverlap] CAN not applied: {e!r}")
 
