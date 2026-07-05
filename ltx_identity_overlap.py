@@ -325,6 +325,10 @@ class LTXIdentityOverlapConditioning:
                                         "identity channel (much better than the projector). 'None' = off."}),
             "can_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                              "tooltip": "Strength of the CAN AdaLN modulation (1.0 = as trained)."}),
+            "can_face_mode": (["auto_adjust", "as_is"], {"default": "auto_adjust",
+                             "tooltip": "Face detection for the CAN reference ArcFace. auto_adjust: retry with "
+                                        "zoom-out/upscale if no face. The CAN NEEDS a face (that's the identity it "
+                                        "injects), so this is independent of the projector's arcface_mode."}),
             "source_id": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 8.0, "step": 1.0,
                                     "tooltip": "source_phase segment id (training used 2). 0 = no phase."}),
             "phase_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1}),
@@ -347,7 +351,7 @@ class LTXIdentityOverlapConditioning:
 
     def apply(self, model, positive, negative, vae, latent, reference_face,
               identity_projector="None", can_weights="None", can_strength=1.0,
-              source_id=2.0, phase_scale=1.0, id_strength=1.0,
+              can_face_mode="auto_adjust", source_id=2.0, phase_scale=1.0, id_strength=1.0,
               arcface_mode="auto_adjust", debug_log=False):
         import comfy.utils
 
@@ -363,8 +367,7 @@ class LTXIdentityOverlapConditioning:
         if can_weights and can_weights != "None":
             try:
                 from .ltx_identity_can import apply_can_to_model
-                can_mode = "auto_adjust" if arcface_mode == "disable" else arcface_mode
-                apply_can_to_model(m, reference_face, can_weights, can_strength, can_mode)
+                apply_can_to_model(m, reference_face, can_weights, can_strength, can_face_mode)
             except Exception as e:
                 print(f"[LTXIdOverlap] CAN not applied: {e!r}")
 
