@@ -71,12 +71,13 @@ def apply_can_to_model(model_patcher, reference_image, can_weights_name, strengt
         if sst.shape[0] < 3:
             continue
         dim = sst.shape[1]
+        dev = sst.device
         can = CANModulation(id_dim=id_global.shape[1], dim=dim)
         can.load_state_dict({k[len(f"can.{idxs[j]}."):]: v for k, v in sd.items()
                              if k.startswith(f"can.{idxs[j]}.")})
-        can = can.eval()
+        can = can.to(dev, torch.float32).eval()
         with torch.no_grad():
-            dshift, dgate = can(id_global)               # [1, dim]
+            dshift, dgate = can(id_global.to(dev, torch.float32))       # [1, dim], on the model device
         new_sst = sst.detach().clone().float()
         new_sst[0] = new_sst[0] + strength * dshift[0]                 # shift_msa
         new_sst[2] = new_sst[2] + strength * torch.tanh(dgate)[0]      # gate_msa
