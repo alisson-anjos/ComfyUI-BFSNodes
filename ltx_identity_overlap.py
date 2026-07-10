@@ -236,13 +236,20 @@ def _install_patches(ltxv):
                 timestep = timestep.view(-1, 1).expand(batch_size, target_len).contiguous()
             if timestep.dim() >= 2 and target_len is not None:
                 cur = timestep.shape[1]
-                # With audio connected, LTXAV can produce a combined video+audio per-token
-                # timestep (e.g. 24576 = video 6144 + audio 18432). Trim to video-only first.
-                if cur > target_len + ref_len:
+                _gm0 = kw.get("grid_mask")
+                _full = _gm0.shape[-1] if (_gm0 is not None and hasattr(_gm0, "shape")) else None
+                if _full is not None and cur == _full:
+                    # Per-token timestep spans the grid-mask domain (video + IC-LoRA guide
+                    # tokens, indexed later via timestep[:, grid_mask]). Do NOT trim — append
+                    # ref zeros and let the grid_mask pad below keep everything in lockstep.
+                    ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
+                    timestep = torch.cat([timestep, ref_ts], dim=1)
+                    _dbg("prepare_timestep: grid-domain cur", cur, "-> appended ref", ref_len)
+                elif cur > target_len + ref_len:
                     _dbg("prepare_timestep: oversized", cur, "-> trimming to video-only", target_len)
                     timestep = timestep[:, :target_len]
                     cur = target_len
-                if cur == target_len:
+                if (_full is None or timestep.shape[1] != _full + ref_len) and cur == target_len:
                     ref_ts = torch.zeros(batch_size, ref_len, *timestep.shape[2:], device=timestep.device, dtype=timestep.dtype)
                     timestep = torch.cat([timestep, ref_ts], dim=1)
                     _dbg("prepare_timestep: ref_len", ref_len, "| timestep ->", _shape(timestep), "| target_len", target_len)
