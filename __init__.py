@@ -22,6 +22,12 @@ try:
 except Exception as _e:  # noqa
     print(f"[BFSNodes] LTX Identity Gemma-Vision node not loaded: {_e!r}")
     GV_NODE_CLASS_MAPPINGS, GV_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+try:
+    from .multiref_sheet_node import NODE_CLASS_MAPPINGS as MRS_NODE_CLASS_MAPPINGS
+    from .multiref_sheet_node import NODE_DISPLAY_NAME_MAPPINGS as MRS_NODE_DISPLAY_NAME_MAPPINGS
+except Exception as _e:  # noqa
+    print(f"[BFSNodes] Multi-Ref Sheet Builder node not loaded: {_e!r}")
+    MRS_NODE_CLASS_MAPPINGS, MRS_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 # CAN / AdaLN node disabled: empirically the AdaLN modulation degrades the video (the identity
 # gain came from the projector + LoRA, not the CAN). Kept the file but not registered.
 CAN_NODE_CLASS_MAPPINGS, CAN_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
@@ -36,6 +42,7 @@ NODE_CLASS_MAPPINGS = {
     **AMV_NODE_CLASS_MAPPINGS,
     **IDT_NODE_CLASS_MAPPINGS,
     **MA_NODE_CLASS_MAPPINGS,
+    **MRS_NODE_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -48,4 +55,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **AMV_NODE_DISPLAY_NAME_MAPPINGS,
     **IDT_NODE_DISPLAY_NAME_MAPPINGS,
     **MA_NODE_DISPLAY_NAME_MAPPINGS,
+    **MRS_NODE_DISPLAY_NAME_MAPPINGS,
 }
