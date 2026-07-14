@@ -41,28 +41,63 @@ def _cover_resize_crop(img: Image.Image, size: int) -> Image.Image:
     return img.crop((x0, y0, x0 + size, y0 + size))
 
 
-def _fit_resize_pad(img: Image.Image, size: int, bg) -> Image.Image:
-    """Resize preserving aspect ratio so the WHOLE image fits inside the panel (no
-    cropping), then pad the leftover space with `bg` (letterbox/pillarbox)."""
-    img = img.convert("RGB")
-    w, h = img.size
-    scale = min(size / w, size / h)
-    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-    img = img.resize((nw, nh), Image.LANCZOS)
-    panel = Image.new("RGB", (size, size), bg)
-    panel.paste(img, ((size - nw) // 2, (size - nh) // 2))
-    return panel
+def _justified_compose(imgs, rows_counts, canvas_w, canvas_h, bg):
+    """Row-justified layout (no cropping, no distortion) -- identical algorithm to
+    build_multiref_sheet.py's _justified_compose, kept in sync so inference-time
+    sheets match training-time sheets exactly. Each row is split into
+    `rows_counts[i]` images; every image in a row shares that row's height, and
+    its width = row_height * (image's own aspect ratio) -- one uniform scale
+    factor per image, so nothing is stretched.
+
+    Each row's natural height fills canvas_w at scale=1. If all rows fit within
+    canvas_h, they're drawn at natural size (leftover vertical space -> a single
+    top+bottom bar, whole block centered) -- never blown up past canvas_w. Only
+    if rows would collectively overflow canvas_h do all rows shrink by one
+    shared factor < 1, giving a single shared pair of side bars instead of
+    per-panel scattered padding.
+    """
+    it = iter(imgs)
+    rows = []
+    for count in rows_counts:
+        row_imgs = [next(it) for _ in range(count)]
+        aspects = [im.width / im.height for im in row_imgs]
+        rows.append((row_imgs, aspects))
+
+    natural_heights = [canvas_w / sum(aspects) for _, aspects in rows]
+    scale = min(1.0, canvas_h / sum(natural_heights))
+
+    row_heights = [round(nat_h * scale) for nat_h in natural_heights]
+    drift_h = round(sum(natural_heights) * scale) - sum(row_heights)
+    if row_heights:
+        row_heights[-1] += drift_h
+
+    sheet = Image.new("RGB", (canvas_w, canvas_h), bg)
+    y = (canvas_h - sum(row_heights)) // 2
+    for (row_imgs, aspects), row_h in zip(rows, row_heights):
+        widths = [max(1, round(row_h * a)) for a in aspects]
+        row_w = sum(widths)
+        x = (canvas_w - row_w) // 2
+        for im, w_i in zip(row_imgs, widths):
+            resized = im.convert("RGB").resize((max(1, w_i), max(1, row_h)), Image.LANCZOS)
+            sheet.paste(resized, (x, y))
+            x += w_i
+        y += row_h
+    return sheet
 
 
 def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVAS_H, bg=BG_COLOR, fit_mode="crop"):
-    """fit_mode: 'crop' fills each panel completely (crops excess, current default,
-    matches the training data); 'fit' keeps every pixel of each reference (letterboxed
-    inside its panel) at the cost of some background padding."""
+    """fit_mode: 'crop' fills each fixed-size panel completely (crops excess, current
+    default, matches the training data); 'fit' uses a row-justified layout that keeps
+    every pixel of every reference (no cropping, no distortion) while maximizing
+    canvas coverage."""
     n = len(imgs)
     if not 1 <= n <= 5:
         raise ValueError(f"expected 1-5 reference images, got {n}")
-    panel_fn = _cover_resize_crop if fit_mode == "crop" else (lambda im, sz: _fit_resize_pad(im, sz, bg))
     rows = LAYOUTS[n]
+
+    if fit_mode == "fit":
+        return _justified_compose(imgs, rows, canvas_w, canvas_h, bg)
+
     native_w = max(rows) * panel_size
     native_h = len(rows) * panel_size
     native = Image.new("RGB", (native_w, native_h), bg)
@@ -73,7 +108,7 @@ def compose_sheet(imgs, panel_size=PANEL_SIZE, canvas_w=CANVAS_W, canvas_h=CANVA
         x_offset = (native_w - row_w) // 2  # center short rows (e.g. bottom row of a 5-ref sheet)
         y = row_idx * panel_size
         for col in range(count):
-            panel = panel_fn(next(it), panel_size)
+            panel = _cover_resize_crop(next(it), panel_size)
             x = x_offset + col * panel_size
             native.paste(panel, (x, y))
 
