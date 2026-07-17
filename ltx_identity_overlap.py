@@ -484,6 +484,14 @@ class LTXIdentityOverlapConditioning:
                                   "trained with layout='st_drc' (ltx_trainer's flexible strategy); using it with an "
                                   "'overlap'-trained checkpoint will not work, the model never learned that "
                                   "coordinate convention."}),
+            "reference_guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1,
+                             "tooltip": "ST-DRC-style reference-CFG (arxiv 2606.02441). 1.0 = off (identical to "
+                                        "before this input existed). >1.0 adds a THIRD forward pass per step with "
+                                        "the reference tokens dropped, and amplifies the reference's own "
+                                        "contribution: denoised += (scale-1)*(with_ref - without_ref) -- the same "
+                                        "way CFG amplifies the text prompt's. Costs one extra (cheaper, "
+                                        "ref-token-free) forward pass per step when enabled. Start around 2-4; "
+                                        "same units/convention as CFG scale on the sampler."}),
         }}
 
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "STRING", "IMAGE", "IMAGE")
@@ -498,7 +506,8 @@ class LTXIdentityOverlapConditioning:
     def apply(self, model, positive, negative, vae, latent, reference_face,
               identity_projector="None", source_id=2.0, phase_scale=1.0, id_strength=1.0,
               arcface_mode="auto_adjust", ref_resize_mode="match_target", debug_log=False,
-              crop_anchor="center", layout="overlap"):
+              crop_anchor="center", layout="overlap", reference_guidance_scale=1.0):
+        import comfy.samplers
         import comfy.utils
 
         global _DEBUG_ENABLED
@@ -546,6 +555,33 @@ class LTXIdentityOverlapConditioning:
         to["_id_ref_latent"] = ref_lat
         m.model_options["transformer_options"] = to
 
+        if reference_guidance_scale != 1.0:
+            # ST-DRC reference-CFG: a third forward pass per step with the reference tokens
+            # dropped isolates the reference's own contribution, the same way CFG isolates
+            # the text prompt's (arxiv 2606.02441). `args["input_cond"]` is the exact
+            # conditioning list KSampler passed for the positive/"cond" branch (same prompt,
+            # same batching) -- reuse it unchanged, only strip `_id_ref_latent` from the
+            # model_options used for THIS extra call so process_input sees no reference.
+            noref_to = dict(to)
+            noref_to.pop("_id_ref_latent", None)
+            ref_scale = float(reference_guidance_scale)
+
+            def _ref_cfg_function(args, _noref_to=noref_to, _ref_scale=ref_scale):
+                cond = args["cond"]
+                uncond = args["uncond"]
+                cond_scale = args["cond_scale"]
+                denoised = uncond + (cond - uncond) * cond_scale
+                noref_model_options = dict(args["model_options"])
+                noref_model_options["transformer_options"] = _noref_to
+                (noref_pred,) = comfy.samplers.calc_cond_batch(
+                    args["model"], [args["input_cond"]], args["input"], args["timestep"], noref_model_options,
+                )
+                noref_denoised = args["input"] - noref_pred
+                denoised = denoised + (_ref_scale - 1.0) * (cond - noref_denoised)
+                return denoised
+
+            m.set_model_sampler_cfg_function(_ref_cfg_function, disable_cfg1_optimization=True)
+
         # ArcFace projector tokens on the text context — fully OPTIONAL. Skipped when the
         # projector dropdown is 'None', arcface is disabled, or no face is detected. The
         # overlap latent carries the bulk of identity, so this is safe to skip.
@@ -588,6 +624,7 @@ class LTXIdentityOverlapConditioning:
             f"patches on {type(ltxv).__name__}: process_input/prepare_timestep/prepare_pe/process_output\n"
             f"crop preview: kept region {crop_box[2]}x{crop_box[3]}px of the {src_w0}x{src_h0}px reference "
             "-- see the ref_preview/crop_overlay IMAGE outputs to inspect what gets kept vs discarded.\n"
+            f"reference-CFG: {'off' if reference_guidance_scale == 1.0 else f'ON, scale={reference_guidance_scale} (+1 forward pass/step)'}\n"
             "Set LTX_IDOVERLAP_DEBUG=1 for per-step shape logs. Connect negative + CFG 3-5, no LightX2V."
         )
         log.info("\n" + dbg)
