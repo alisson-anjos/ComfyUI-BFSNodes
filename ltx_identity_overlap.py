@@ -566,18 +566,23 @@ class LTXIdentityOverlapConditioning:
             noref_to.pop("_id_ref_latent", None)
             ref_scale = float(reference_guidance_scale)
 
-            def _ref_cfg_function(args, _noref_to=noref_to, _ref_scale=ref_scale):
+            # NOTE: must take exactly ONE parameter -- set_model_sampler_cfg_function()
+            # inspects the signature's parameter COUNT (regardless of defaults) and treats
+            # anything with 3 params as the legacy (cond, uncond, cond_scale) calling
+            # convention, silently passing those three tensors/floats positionally instead
+            # of the `args` dict. Keep noref_to/ref_scale as plain closure vars, not defaults.
+            def _ref_cfg_function(args):
                 cond = args["cond"]
                 uncond = args["uncond"]
                 cond_scale = args["cond_scale"]
                 denoised = uncond + (cond - uncond) * cond_scale
                 noref_model_options = dict(args["model_options"])
-                noref_model_options["transformer_options"] = _noref_to
+                noref_model_options["transformer_options"] = noref_to
                 (noref_pred,) = comfy.samplers.calc_cond_batch(
                     args["model"], [args["input_cond"]], args["input"], args["timestep"], noref_model_options,
                 )
                 noref_denoised = args["input"] - noref_pred
-                denoised = denoised + (_ref_scale - 1.0) * (cond - noref_denoised)
+                denoised = denoised + (ref_scale - 1.0) * (cond - noref_denoised)
                 return denoised
 
             m.set_model_sampler_cfg_function(_ref_cfg_function, disable_cfg1_optimization=True)
