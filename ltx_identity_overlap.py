@@ -177,6 +177,26 @@ def _find_ltxv(model):
     return m
 
 
+def _letterbox_resize(ref_img, tgt_w, tgt_h, pad_value=1.0):
+    """Resize `ref_img` ([B,H,W,C]) to fit ENTIRELY inside tgt_w x tgt_h, preserving its own
+    aspect ratio (no crop, no distortion), padding the leftover space with `pad_value`
+    (default white, matching the composite sheet's own white background). Unlike
+    common_upscale(..., crop="center") -- which center-crops to the target aspect ratio
+    BEFORE resizing, silently discarding whatever isn't in the middle of the source image --
+    this never discards any pixel of the reference."""
+    import comfy.utils
+    x = ref_img.movedim(-1, 1)  # [B,C,H,W]
+    _, _, src_h, src_w = x.shape
+    scale = min(tgt_w / src_w, tgt_h / src_h)
+    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
+    resized = comfy.utils.common_upscale(x, new_w, new_h, "bilinear", "disabled")
+    pad_w, pad_h = tgt_w - new_w, tgt_h - new_h
+    left, top = pad_w // 2, pad_h // 2
+    right, bottom = pad_w - left, pad_h - top
+    padded = F.pad(resized, (left, right, top, bottom), mode="constant", value=pad_value)
+    return padded.movedim(1, -1)
+
+
 def _install_patches(ltxv):
     if getattr(ltxv, "_id_overlap_patched", False):
         return
@@ -360,13 +380,22 @@ class LTXIdentityOverlapConditioning:
             "arcface_mode": (["auto_adjust", "as_is", "disable"], {"default": "auto_adjust",
                              "tooltip": "auto_adjust: retry face detection with zoom-out/upscale, skip tokens if none. "
                                         "as_is: detect on the image only. disable: skip ArcFace, use only the overlap latent."}),
-            "ref_resize_mode": (["match_target", "native_resolution"], {"default": "match_target",
-                             "tooltip": "match_target: resize ref to the OUTPUT video's pixel size (old single-face-crop "
-                                        "recipes — ref resolution never mattered). native_resolution: encode the ref at "
+            "ref_resize_mode": (["match_target", "match_target_letterbox", "native_resolution"], {"default": "match_target",
+                             "tooltip": "match_target: resize ref to the OUTPUT video's pixel size via a CENTER-CROP then "
+                                        "resize (old single-face-crop recipes — ref resolution never mattered, but this "
+                                        "silently discards whatever isn't in the middle of the ref for mismatched aspect "
+                                        "ratios, e.g. a landscape character sheet used for a portrait output loses the "
+                                        "side panels/face closeup). match_target_letterbox: same target pixel size, but "
+                                        "fits the WHOLE ref inside it preserving aspect ratio (no crop, pads with white) "
+                                        "-- use this for a landscape composite sheet + portrait (or any mismatched-aspect) "
+                                        "output so no panel/face-detail gets cut off. native_resolution: encode the ref at "
                                         "ITS OWN size (rounded to the nearest 32px), independent of the video size — "
                                         "REQUIRED for checkpoints trained on a fixed ref resolution bucket that differs "
                                         "from the video's own bucket (e.g. the composite face+3views ref, trained at "
-                                        "2048x1024 regardless of output video size)."}),
+                                        "2048x1024 regardless of output video size) -- but for aspect-mismatched outputs "
+                                        "(e.g. portrait video) this can bias the model toward the ref's own (landscape) "
+                                        "composition, causing an off-center/cropped-looking result; try "
+                                        "match_target_letterbox first if you hit that."}),
             "debug_log": ("BOOLEAN", {"default": False,
                           "tooltip": "Print per-step [LTXIdOverlap] shape logs to the console (for debugging)."}),
         }}
@@ -402,7 +431,10 @@ class LTXIdentityOverlapConditioning:
             # face crop — resolution never mattered there).
             _, _, _, lat_h, lat_w = latent["samples"].shape
             tgt_w, tgt_h = lat_w * w_sf, lat_h * h_sf
-        ref_px = comfy.utils.common_upscale(reference_face.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
+        if ref_resize_mode == "match_target_letterbox":
+            ref_px = _letterbox_resize(reference_face, tgt_w, tgt_h)[:1, :, :, :3]
+        else:
+            ref_px = comfy.utils.common_upscale(reference_face.movedim(-1, 1), tgt_w, tgt_h, "bilinear", "center").movedim(1, -1)[:1, :, :, :3]
         ref_lat = vae.encode(ref_px)
 
         _install_patches(ltxv)
