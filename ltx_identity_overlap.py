@@ -254,12 +254,17 @@ def _draw_crop_overlay(ref_img, box):
 
 
 # Seconds reserved per numbered strata slot -- MUST match ltx_trainer's
-# training_strategies.tass.STRATA_SLOT_WIDTH (0.5) for a strata-trained checkpoint's RoPE
+# training_strategies.tass.STRATA_SLOT_WIDTH for a strata-trained checkpoint's RoPE
 # convention to line up at inference. Slot 0 (1st ref in the batch) lands at
 # target_max_t + this value, slot 1 (2nd ref) at target_max_t + 2*this value, etc. --
 # dynamic/target-relative, same as st_drc's own shift, so it stays correct for whatever
 # video length is actually generated.
-STRATA_SLOT_WIDTH = 0.5
+# CHANGED 2026-07-18 (0.5 -> 1.5): 0.5 caused a real slot0/slot1 collision -- a single-frame
+# reference image (fps=1.0 convention) spans a full 1.0-SECOND range on the T axis, not a
+# point, so width=0.5 let adjacent slots overlap. See tass.py's STRATA_SLOT_WIDTH docstring.
+# Any checkpoint trained before this fix (e.g. phantom_stacked_r128/_p2) learned under the
+# collided geometry; continuing training from one now adapts to the corrected spacing.
+STRATA_SLOT_WIDTH = 1.5
 
 
 def _apply_tass_layout(reference_positions, target_positions, layout: str, strata_start: float | None = None):
