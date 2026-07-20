@@ -220,3 +220,66 @@ class MultiRefSheetBuilder:
 
 NODE_CLASS_MAPPINGS = {"BFSMultiRefSheetBuilder": MultiRefSheetBuilder}
 NODE_DISPLAY_NAME_MAPPINGS = {"BFSMultiRefSheetBuilder": "Multi-Ref Sheet Builder"}
+
+
+# ---------------------------------------------------------------------------
+# Entity Sheet 2x2 (HuMoSet v7 convention) -- SEMANTIC panel positions, unlike
+# MultiRefSheetBuilder's index-ordered justified layout. The humoset_sheets_v7
+# LoRA was trained on sheets where each quadrant has a fixed MEANING:
+#     top-left  = person identity        top-right    = clothing/garment
+#     bottom-left = object OR 2nd person bottom-right = scene/background
+# Panels are 768x512, each ref letterboxed (fit, white padding) inside its
+# quadrant; unused quadrants stay pure white (training used white = "no info").
+# ---------------------------------------------------------------------------
+V7_PANEL_W, V7_PANEL_H = 768, 512
+
+
+def _v7_fit_panel(img: Image.Image) -> Image.Image:
+    img = img.convert("RGB")
+    s = min(V7_PANEL_W / img.width, V7_PANEL_H / img.height)
+    nw, nh = max(1, round(img.width * s)), max(1, round(img.height * s))
+    canvas = Image.new("RGB", (V7_PANEL_W, V7_PANEL_H), BG_COLOR)
+    canvas.paste(img.resize((nw, nh), Image.LANCZOS), ((V7_PANEL_W - nw) // 2, (V7_PANEL_H - nh) // 2))
+    return canvas
+
+
+class EntitySheet2x2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "person": ("IMAGE", {"tooltip": "Person identity reference -> TOP-LEFT quadrant."}),
+                "clothing": ("IMAGE", {"tooltip": "Garment reference (isolated clothing item) -> TOP-RIGHT quadrant."}),
+                "object_or_person2": ("IMAGE", {"tooltip": "Held object OR a second person -> BOTTOM-LEFT quadrant."}),
+                "scene": ("IMAGE", {"tooltip": "Background/scene reference (no people) -> BOTTOM-RIGHT quadrant."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("sheet", "n_refs", "debug")
+    FUNCTION = "build"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("Builds the FIXED 1536x1024 2x2 entity sheet the humoset_sheets_v7 multi-ref LoRA "
+                   "was trained on. Quadrant meaning is fixed (person TL, clothing TR, object/person2 BL, "
+                   "scene BR); leave inputs empty for white quadrants. Use with LTXIdentityOverlapConditioning: "
+                   "layout=overlap, source_id=2, phase_scale=1.0, ref_resize_mode=native_resolution.")
+
+    def build(self, person=None, clothing=None, object_or_person2=None, scene=None):
+        entries = {(0, 0): person, (1, 0): clothing, (0, 1): object_or_person2, (1, 1): scene}
+        n = sum(1 for v in entries.values() if v is not None)
+        if n == 0:
+            raise ValueError("EntitySheet2x2 needs at least one input image.")
+        sheet = Image.new("RGB", (CANVAS_W, CANVAS_H), BG_COLOR)
+        for (cx, cy), t in entries.items():
+            if t is None:
+                continue
+            pil = tensor_to_pil(t[0] if t.dim() == 4 else t)
+            sheet.paste(_v7_fit_panel(pil), (cx * V7_PANEL_W, cy * V7_PANEL_H))
+        sheet_t = pil_to_tensor(sheet).unsqueeze(0)
+        dbg = f"EntitySheet2x2 | {n} refs -> {CANVAS_W}x{CANVAS_H} (v7 semantic grid)"
+        return (sheet_t, n, dbg)
+
+
+NODE_CLASS_MAPPINGS["BFSEntitySheet2x2"] = EntitySheet2x2
+NODE_DISPLAY_NAME_MAPPINGS["BFSEntitySheet2x2"] = "Entity Sheet 2x2 (HuMoSet v7)"
