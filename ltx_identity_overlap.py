@@ -339,7 +339,7 @@ def _tass_axis_stats(positions):
 
 
 def _apply_tass_layout(reference_positions, target_positions, layout: str, strata_start: float | None = None,
-                       sidecar_margin_pixels: float = 0.0):
+                       sidecar_margin_pixels: float = 0.0, use_middle_indices_grid: bool = True):
     """Place reference pixel-coords in a non-overlapping TASS region -- mirrors
     ltx_core.conditioning.reference_layout.apply_reference_layout (kept in sync manually since
     this node can't import the trainer package). Handles both coordinate shapes ComfyUI emits;
@@ -380,13 +380,24 @@ def _apply_tass_layout(reference_positions, target_positions, layout: str, strat
         shifted[:, 2:3, ...] += (
             target_extent[:, 2:3, ...] + float(sidecar_margin_pixels) - reference_origin[:, 2:3, ...]
         )
-        # T: a referencia cobre todo o intervalo do alvo -- com patch bounds isso e o par
-        # (inicio, fim) do alvo; com um unico canto, so o inicio existe para ser escrito.
-        if shifted.dim() == 4:
-            shifted[:, 0, :, 0] = target_min[:, 0, 0, 0]
-            shifted[:, 0, :, 1] = target_extent[:, 0, 0, 0]
+        # T: a referencia cobre todo o intervalo do alvo. O trainer escreve o par
+        # (inicio, fim) = (t_min, t_max), e o modelo o colapsa num unico numero por token --
+        # de duas maneiras diferentes, e e por isso que aqui tem um `if`:
+        #   use_middle_indices_grid=True  (2.5, e qualquer 2.3 cujo metadata declare) -> (inicio+fim)/2
+        #   use_middle_indices_grid=False (2.3 nos checkpoints antigos)                -> so o inicio
+        # Escrever (t_min, t_max) nos dois casos poria a referencia no MEIO do clipe no 2.5 e no
+        # FRAME 0 no 2.3 -- placements diferentes para o mesmo LoRA. Escrever o ponto medio nos
+        # dois bounds da a mesma posicao efetiva sob qualquer uma das regras.
+        t_min = target_min[:, 0, 0, 0] if target_min.dim() == 4 else target_min[:, 0, 0]
+        t_max = target_extent[:, 0, 0, 0] if target_extent.dim() == 4 else target_extent[:, 0, 0]
+        if shifted.dim() == 4 and use_middle_indices_grid:
+            shifted[:, 0, :, 0] = t_min
+            shifted[:, 0, :, 1] = t_max
+        elif shifted.dim() == 4:
+            shifted[:, 0, :, :] = ((t_min + t_max) * 0.5).unsqueeze(-1)
         else:
-            shifted[:, 0, :] = target_min[:, 0, 0]
+            # Coordenadas legadas [B, 3, N]: um canto por token, lido direto pelo RoPE.
+            shifted[:, 0, :] = (t_min + t_max) * 0.5
         return shifted
     raise ValueError(f"Unsupported TASS layout {layout!r}")
 
@@ -501,8 +512,11 @@ def _install_patches(ltxv):
                     slot = int(spec["strata_slot"])
                     strata_start_sec = target_max_t_raw / frame_rate + (slot + 1) * STRATA_SLOT_WIDTH
                     strata_start_raw = strata_start_sec * frame_rate
-                rpc = _apply_tass_layout(rpc, vco, spec["layout"], strata_start=strata_start_raw,
-                                         sidecar_margin_pixels=spec.get("sidecar_margin_pixels", 0.0))
+                rpc = _apply_tass_layout(
+                    rpc, vco, spec["layout"], strata_start=strata_start_raw,
+                    sidecar_margin_pixels=spec.get("sidecar_margin_pixels", 0.0),
+                    use_middle_indices_grid=bool(getattr(self, "use_middle_indices_grid", False)),
+                )
                 # Appearance references may be placed before frame zero to reduce the learned
                 # overlap frame-0 copy/leak. Old/external specs without this key retain offset 0.
                 # The shift is applied AFTER layout placement so it remains explicit for every
