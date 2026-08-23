@@ -111,6 +111,22 @@ class TassLayoutTest(unittest.TestCase):
                 # atol covers float32 rounding on ~600px coordinates, not a real drift
                 torch.testing.assert_close(moved[:, axes], span[:, axes], atol=1e-3, rtol=0)
 
+    def test_integer_coordinates_keep_their_dtype(self):
+        """ComfyUI hands out int64 pixel coords -- float shifts must not blow up on them."""
+        target = self.target.round().to(torch.int64)
+        reference = self.reference.round().to(torch.int64)
+        for layout, kwargs in (
+            ("overlap", {}), ("st_drc", {}), ("strata", {"strata_start": 600.0}), ("sidecar", {})
+        ):
+            with self.subTest(layout=layout):
+                shifted = OVERLAP._apply_tass_layout(reference, target, layout, **kwargs)
+                self.assertEqual(shifted.dtype, torch.int64)
+                float_result = OVERLAP._apply_tass_layout(
+                    reference.float(), target.float(), layout, **kwargs
+                )
+                # rounded, never truncated: at most half a pixel from the exact placement
+                self.assertLessEqual(float((shifted.float() - float_result).abs().max()), 0.5)
+
     def test_overlap_is_an_exact_noop(self):
         self.assertIs(
             OVERLAP._apply_tass_layout(self.reference, self.target, "overlap"), self.reference

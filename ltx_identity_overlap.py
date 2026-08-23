@@ -356,16 +356,33 @@ def _apply_tass_layout(reference_positions, target_positions, layout: str, strat
     """
     if layout == "overlap":
         return reference_positions
+    # ComfyUI's pixel coords are int64 (latent corners times integer VAE scale factors), while
+    # centring and midpoints are inherently half-pixel maths -- an in-place += of a float shift
+    # into a Long tensor just raises "result type Float can't be cast to the desired output
+    # type Long". Compute in float and round back on the way out, so callers keep the dtype
+    # they passed in (the caller casts to the target grid's dtype when concatenating, and a
+    # cast truncates where rounding is what we want).
+    coordinate_dtype = reference_positions.dtype
+    if not reference_positions.is_floating_point():
+        reference_positions = reference_positions.to(torch.float32)
+    if not target_positions.is_floating_point():
+        target_positions = target_positions.to(torch.float32)
+
+    def _restore(shifted):
+        if shifted.dtype == coordinate_dtype:
+            return shifted
+        return shifted.round().to(coordinate_dtype)
+
     target_min, target_extent = _tass_axis_stats(target_positions)
     reference_origin, reference_extent = _tass_axis_stats(reference_positions)
     if layout == "st_drc":
-        return reference_positions + (target_extent - reference_origin)
+        return _restore(reference_positions + (target_extent - reference_origin))
     if layout == "strata":
         if strata_start is None:
             raise ValueError("layout='strata' requires strata_start")
         shifted = reference_positions.clone()
         shifted[:, 0:1, ...] += strata_start - reference_origin[:, 0:1, ...]
-        return shifted
+        return _restore(shifted)
     if layout == "sidecar":
         if reference_positions.shape[1] < 3:
             raise ValueError(
@@ -398,7 +415,7 @@ def _apply_tass_layout(reference_positions, target_positions, layout: str, strat
         else:
             # Coordenadas legadas [B, 3, N]: um canto por token, lido direto pelo RoPE.
             shifted[:, 0, :] = (t_min + t_max) * 0.5
-        return shifted
+        return _restore(shifted)
     raise ValueError(f"Unsupported TASS layout {layout!r}")
 
 
