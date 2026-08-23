@@ -320,13 +320,30 @@ def _draw_crop_overlay(ref_img, box):
 STRATA_SLOT_WIDTH = 1.5
 
 
+def _tass_axis_stats(positions):
+    """Per-axis (min, max), reduced over every dimension EXCEPT the T/H/W one.
+
+    Two coordinate shapes reach this node: older LTX builds hand out one corner per token,
+    [B, 3 (T/H/W), N], while LTX-2.5 hands out patch bounds, [B, 3, N, 2] -- the same shape
+    the trainer works in. Reducing over "everything but the axis" is correct for both, and
+    keeps a patch's two bounds shifted by the SAME amount instead of by their own separate
+    minima (which would squeeze the span).
+
+    The batch is reduced too. Layouts run before the reference tokens are expanded to the CFG
+    batch, so target_positions can be [2, ...] while the reference is still [1, ...]; cond and
+    uncond share one geometry, so a batch-wide min/max is the same number either way and
+    broadcasts into whichever side is batch-1.
+    """
+    dims = (0,) + tuple(range(2, positions.dim()))
+    return positions.amin(dim=dims, keepdim=True), positions.amax(dim=dims, keepdim=True)
+
+
 def _apply_tass_layout(reference_positions, target_positions, layout: str, strata_start: float | None = None,
                        sidecar_margin_pixels: float = 0.0):
     """Place reference pixel-coords in a non-overlapping TASS region -- mirrors
-    ltx_trainer.training_strategies.tass.apply_tass_layout (kept in sync manually since this
-    node can't import the trainer package), adapted to ComfyUI's own coordinate tensor shape
-    [B, 3 (T/H/W), N] (one corner coordinate per token) instead of the trainer's [B, 3, N, 2]
-    patch-bounds shape -- the shifts only need min/max per axis either way.
+    ltx_core.conditioning.reference_layout.apply_reference_layout (kept in sync manually since
+    this node can't import the trainer package). Handles both coordinate shapes ComfyUI emits;
+    see _tass_axis_stats.
     layout='overlap' returns the input unchanged.
     layout='st_drc' shifts every axis (T, H, W) past the target's own extent.
     layout='strata' shifts ONLY the T axis to an absolute band start (`strata_start`, in the
@@ -339,33 +356,37 @@ def _apply_tass_layout(reference_positions, target_positions, layout: str, strat
     """
     if layout == "overlap":
         return reference_positions
+    target_min, target_extent = _tass_axis_stats(target_positions)
+    reference_origin, reference_extent = _tass_axis_stats(reference_positions)
     if layout == "st_drc":
-        target_extent = target_positions.amax(dim=2, keepdim=True)
-        reference_origin = reference_positions.amin(dim=2, keepdim=True)
         return reference_positions + (target_extent - reference_origin)
     if layout == "strata":
         if strata_start is None:
             raise ValueError("layout='strata' requires strata_start")
         shifted = reference_positions.clone()
-        ref_origin_t = shifted[:, 0:1, :].amin(dim=2, keepdim=True)
-        shifted[:, 0:1, :] = shifted[:, 0:1, :] + (strata_start - ref_origin_t)
+        shifted[:, 0:1, ...] += strata_start - reference_origin[:, 0:1, ...]
         return shifted
     if layout == "sidecar":
+        if reference_positions.shape[1] < 3:
+            raise ValueError(
+                f"layout='sidecar' expects at least 3 coordinate axes, got {reference_positions.shape[1]}"
+            )
         shifted = reference_positions.clone()
-        target_min = target_positions.amin(dim=2, keepdim=True)
-        target_extent = target_positions.amax(dim=2, keepdim=True)
-        ref_origin = shifted.amin(dim=2, keepdim=True)
-        ref_extent = shifted.amax(dim=2, keepdim=True)
         # H: centraliza a referencia na altura do alvo
-        target_center_h = (target_min[:, 1:2, :] + target_extent[:, 1:2, :]) * 0.5
-        ref_center_h = (ref_origin[:, 1:2, :] + ref_extent[:, 1:2, :]) * 0.5
-        shifted[:, 1:2, :] = shifted[:, 1:2, :] + (target_center_h - ref_center_h)
+        target_center_h = (target_min[:, 1:2, ...] + target_extent[:, 1:2, ...]) * 0.5
+        reference_center_h = (reference_origin[:, 1:2, ...] + reference_extent[:, 1:2, ...]) * 0.5
+        shifted[:, 1:2, ...] += target_center_h - reference_center_h
         # W: desloca para a direita do alvo, mais a margem
-        shifted[:, 2:3, :] = shifted[:, 2:3, :] + (
-            target_extent[:, 2:3, :] + float(sidecar_margin_pixels) - ref_origin[:, 2:3, :]
+        shifted[:, 2:3, ...] += (
+            target_extent[:, 2:3, ...] + float(sidecar_margin_pixels) - reference_origin[:, 2:3, ...]
         )
-        # T: a referencia cobre todo o intervalo do alvo
-        shifted[:, 0, :] = target_min[:, 0, 0].unsqueeze(-1)
+        # T: a referencia cobre todo o intervalo do alvo -- com patch bounds isso e o par
+        # (inicio, fim) do alvo; com um unico canto, so o inicio existe para ser escrito.
+        if shifted.dim() == 4:
+            shifted[:, 0, :, 0] = target_min[:, 0, 0, 0]
+            shifted[:, 0, :, 1] = target_extent[:, 0, 0, 0]
+        else:
+            shifted[:, 0, :] = target_min[:, 0, 0]
         return shifted
     raise ValueError(f"Unsupported TASS layout {layout!r}")
 
@@ -480,7 +501,8 @@ def _install_patches(ltxv):
                     slot = int(spec["strata_slot"])
                     strata_start_sec = target_max_t_raw / frame_rate + (slot + 1) * STRATA_SLOT_WIDTH
                     strata_start_raw = strata_start_sec * frame_rate
-                rpc = _apply_tass_layout(rpc, vco, spec["layout"], strata_start=strata_start_raw)
+                rpc = _apply_tass_layout(rpc, vco, spec["layout"], strata_start=strata_start_raw,
+                                         sidecar_margin_pixels=spec.get("sidecar_margin_pixels", 0.0))
                 # Appearance references may be placed before frame zero to reduce the learned
                 # overlap frame-0 copy/leak. Old/external specs without this key retain offset 0.
                 # The shift is applied AFTER layout placement so it remains explicit for every
