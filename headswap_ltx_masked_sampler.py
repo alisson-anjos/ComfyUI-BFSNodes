@@ -286,7 +286,10 @@ class BFSHeadSwapMaskedSampler:
             n = min(result.shape[0], out.shape[0], len(box))
             for i in range(n):
                 b = box[i][0] if isinstance(box[i], list) else box[i]
-                x0, y0, w, h = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                if isinstance(b, dict):  # planner boxes: {"x","y","width","height"}
+                    x0, y0, w, h = int(b["x"]), int(b["y"]), int(b["width"]), int(b["height"])
+                else:                    # a plain (x, y, w, h) sequence
+                    x0, y0, w, h = int(b[0]), int(b[1]), int(b[2]), int(b[3])
                 patch = result[i:i + 1]
                 if patch.shape[1] != h or patch.shape[2] != w:
                     patch = comfy.utils.common_upscale(
@@ -443,7 +446,17 @@ class BFSHeadSwapMaskedSampler:
             a = masks_full[:n].unsqueeze(-1).clamp(0, 1) * 0.45
             tint = torch.tensor([1.0, 0.15, 0.15], device=overlay.device)
             overlay[:n] = overlay[:n] * (1 - a) + tint * a
-        if crop_ctx is not None and crop_ctx[0] == "static":
+        if crop_ctx is not None and crop_ctx[0] == "planned":
+            g = torch.tensor([0.1, 1.0, 0.2], device=overlay.device)
+            t = 2
+            for i in range(min(overlay.shape[0], len(crop_ctx[1]))):
+                b = crop_ctx[1][i][0] if isinstance(crop_ctx[1][i], list) else crop_ctx[1][i]
+                x0, y0, w, h = int(b["x"]), int(b["y"]), int(b["width"]), int(b["height"])
+                overlay[i, y0:y0 + t, x0:x0 + w] = g
+                overlay[i, y0 + h - t:y0 + h, x0:x0 + w] = g
+                overlay[i, y0:y0 + h, x0:x0 + t] = g
+                overlay[i, y0:y0 + h, x0 + w - t:x0 + w] = g
+        elif crop_ctx is not None and crop_ctx[0] == "static":
             x0, y0, w, h = crop_ctx[1]
             g = torch.tensor([0.1, 1.0, 0.2], device=overlay.device)
             t = 2
