@@ -313,15 +313,21 @@ class BFSHeadSwapMaskedSampler:
                     masks[a:b], vae, latent["samples"].shape[2], lat_h, lat_w
                 ).to(latent["samples"].device)
 
-            gd = guider.clone() if hasattr(guider, "clone") else guider
-            gd.set_conds(p, n) if hasattr(gd, "set_conds") else None
+            # CRITICAL: _sample_chunk samples through guider.model_patcher, so the
+            # patched clone from LTXMultipleControls has to replace it. Without the
+            # swap the reference specs live in transformer_options the forward never
+            # reads, and guide + identity are silently inert -- it samples happily
+            # and ignores both. _set_guider_conds does the conds and the swap.
+            gd = _Loop._set_guider_conds(guider, p, n, model_patcher=m)
             chunk = _Loop._sample_chunk(m, noise, sampler, sigmas, gd, latent, seed_offset=idx)
             out_latents.append(chunk["samples"])
 
         samples = out_latents[0] if len(out_latents) == 1 else torch.cat(out_latents, dim=2)
-        images = vae.decode({"samples": samples}) if hasattr(vae, "decode") else None
+        images = vae.decode(samples)  # the tensor, not a latent dict
         if isinstance(images, dict):
             images = images.get("samples")
+        if images.ndim == 5:  # (B,T,H,W,C) -> frames batch
+            images = images.reshape(-1, *images.shape[2:])
 
         final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather)
         debug = " | ".join(notes)
