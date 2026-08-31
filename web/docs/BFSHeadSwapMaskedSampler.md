@@ -48,6 +48,22 @@ That is what `mask_strength` below 1.0 buys, and it is a deliberate choice, not 
 way to get expressions. Soft edges are for hiding the seam; the middle of the
 mask should stay at 1.0.
 
+### Hard for the sampler, soft for the paste
+
+`mask_blur` exists for compositing, where a soft edge hides the seam. In the
+**denoise** mask a soft edge means *partial* denoising, which blends the original
+latent — and the original identity — back in right at the edge of the head, so
+the swap is weakest exactly where it is most visible. `mask_hard_for_inpaint`
+(on by default) binarises the mask before it becomes the denoise mask, leaving
+the soft version for the paste-back alone.
+
+`latent_mask_dilate` grows the mask by whole **latent cells** after the
+reduction. One cell is 32 px and one latent frame covers 8 video frames, so this
+is far coarser than `mask_grow` in pixels — and it is what guarantees the head
+sits inside editable blocks rather than clipping at a cell boundary. One cell
+took a test mask from 11% to 25% of the grid; two took it to 44%. Watch
+`latent_mask` and stop at the first value that covers the head.
+
 **Watch the `latent_mask` output.** It has one frame per *latent* frame, not per
 video frame, and that is the real resolution of the edit. A tight outline around
 a face can nearly vanish at that scale — and then nothing changes, no matter how

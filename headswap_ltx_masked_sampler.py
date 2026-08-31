@@ -115,6 +115,26 @@ def _grow_blur(masks, grow, blur):
     return m.squeeze(1).clamp(0, 1)
 
 
+def _dilate_latent(mask, cells, frames=0):
+    """Grow a latent-grid mask by whole cells (and latent frames).
+
+    Growing here is not the same as growing in pixels: the latent grid is coarse
+    (one cell per 32 px, one frame per 8), so this is the knob that guarantees the
+    head lands inside editable blocks instead of clipping at a cell boundary.
+    """
+    if cells > 0:
+        k = 2 * int(cells) + 1
+        m = mask.squeeze(0)                      # (1,t,h,w)
+        m = torch.nn.functional.max_pool3d(m.unsqueeze(0), (1, k, k), stride=1,
+                                           padding=(0, k // 2, k // 2))
+        mask = m
+    if frames > 0:
+        k = 2 * int(frames) + 1
+        mask = torch.nn.functional.max_pool3d(mask, (k, 1, 1), stride=1,
+                                              padding=(k // 2, 0, 0))
+    return mask
+
+
 def _mask_to_latent(masks, vae, latent_t, latent_h, latent_w):
     """Pixel masks -> a latent-grid mask, reduced with MAX.
 
@@ -234,6 +254,19 @@ class BFSHeadSwapMaskedSampler:
                     "Dilate the mask before use, in pixels. The new head can be bigger than the old one."}),
                 "mask_blur": ("INT", {"default": 4, "min": 0, "max": 256, "tooltip":
                     "Soften the mask edge, in pixels, to avoid a hard seam."}),
+                "mask_hard_for_inpaint": ("BOOLEAN", {"default": True, "tooltip":
+                    "Binarise the mask before it becomes the denoise mask. Blur belongs to the "
+                    "paste-back, where a soft edge hides the seam; in the DENOISE mask a soft edge "
+                    "means partial denoising, which blends the original latent -- and the original "
+                    "identity -- back in exactly at the edge of the head. Off passes the soft mask "
+                    "through to the sampler as well."}),
+                "latent_mask_dilate": ("INT", {"default": 0, "min": 0, "max": 16, "tooltip":
+                    "Grow the mask by whole LATENT cells after the reduction. One cell is 32 px, so "
+                    "this is much coarser than mask_grow -- and it is what guarantees the head sits "
+                    "inside editable blocks instead of clipping at a cell boundary. Check the "
+                    "latent_mask output to see the effect."}),
+                "latent_mask_dilate_frames": ("INT", {"default": 0, "min": 0, "max": 8, "tooltip":
+                    "Same, along time: grow by whole latent frames (one covers 8 video frames)."}),
                 "mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip":
                     "How completely the masked region is replaced. 1.0 = fully regenerated. Below that "
                     "the original latent is blended back, which keeps the original geometry and "
@@ -375,7 +408,9 @@ class BFSHeadSwapMaskedSampler:
     def execute(self, model, vae, noise, sampler, sigmas, guider, positive, negative,
                 guide_video, identity_image, latent=None, subject_mask=None,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
-                inpaint_with_mask=True, mask_grow=8, mask_blur=4, mask_strength=1.0,
+                inpaint_with_mask=True, mask_grow=8, mask_blur=4,
+                mask_hard_for_inpaint=True, latent_mask_dilate=0, latent_mask_dilate_frames=0,
+                mask_strength=1.0,
                 paste_back=True, paste_confine_to_mask=True,
                 decode="full", decode_tile_size=768, decode_overlap=64,
                 decode_temporal_size=32, decode_temporal_overlap=4,
@@ -473,8 +508,13 @@ class BFSHeadSwapMaskedSampler:
                 if debug_log:
                     print(f"[BFS HeadSwap] inpaint: latent seeded from the guide "
                           f"{tuple(g_lat.shape)}")
+                src_mask = masks[a:b]
+                if mask_hard_for_inpaint:
+                    # hard for the sampler, soft only for compositing
+                    src_mask = (src_mask > 0.5).float()
                 nm = _mask_to_latent(
-                    masks[a:b], vae, latent["samples"].shape[2], lat_h, lat_w)
+                    src_mask, vae, latent["samples"].shape[2], lat_h, lat_w)
+                nm = _dilate_latent(nm, latent_mask_dilate, latent_mask_dilate_frames)
                 if mask_strength < 1.0:
                     nm = nm * float(mask_strength)
                 latent["noise_mask"] = nm.to(latent["samples"].device)
@@ -522,7 +562,10 @@ class BFSHeadSwapMaskedSampler:
         h_px, w_px = guide.shape[1], guide.shape[2]
         if masks is not None:
             crop_mask_out = masks
-            lat_mask = _mask_to_latent(masks, vae, lat_t_total, lat_h, lat_w)[0, 0]
+            shown = (masks > 0.5).float() if mask_hard_for_inpaint else masks
+            lat_mask = _dilate_latent(
+                _mask_to_latent(shown, vae, lat_t_total, lat_h, lat_w),
+                latent_mask_dilate, latent_mask_dilate_frames)[0, 0]
             latent_mask_out = torch.nn.functional.interpolate(
                 lat_mask.unsqueeze(1), size=(h_px, w_px), mode="nearest"
             ).squeeze(1)
