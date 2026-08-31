@@ -224,8 +224,23 @@ class BFSHeadSwapMaskedSampler:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "LATENT", "STRING")
-    RETURN_NAMES = ("images", "latent", "debug")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "STRING")
+    RETURN_NAMES = ("images", "mask_over_source", "cropped_guide", "crop_mask",
+                    "latent_mask", "latent", "debug")
+    OUTPUT_TOOLTIPS = (
+        "Final frames, with the crop pasted back when cropping is on.",
+        "The mask painted over the ORIGINAL frames, plus the crop box outline. The "
+        "quickest way to see whether the mask is where you think it is, at the scale "
+        "you think it is, on the frames it belongs to.",
+        "Exactly what the model was fed as the guide: cropped and resized. If this "
+        "does not look like the region you meant to edit, nothing downstream will.",
+        "The mask after grow/blur (and cropping), in the crop's pixel space.",
+        "The mask as the sampler actually sees it: reduced to the latent grid with "
+        "max and upsampled back for viewing. One frame per latent frame -- this is "
+        "the real resolution of the edit, and where a too-thin mask disappears.",
+        "Sampled latent.",
+        "What the node decided: crop mode and box, mask ops, tiling.",
+    )
     FUNCTION = "execute"
     CATEGORY = CATEGORY
 
@@ -305,6 +320,7 @@ class BFSHeadSwapMaskedSampler:
                 masks = _grow_blur(masks, mask_grow, mask_blur)
                 notes.append(f"mask: grow {mask_grow}px, blur {mask_blur}px")
 
+        masks_full = masks
         guide, masks, crop_ctx, note = self._crop(
             guide_video, masks, crop_mode, crop_scale, crop_divisible_by)
         notes.append(note)
@@ -318,6 +334,7 @@ class BFSHeadSwapMaskedSampler:
         _, w_sf, h_sf = vae.downscale_index_formula
         lat_h, lat_w = guide.shape[1] // h_sf, guide.shape[2] // w_sf
 
+        lat_t_total = (n_frames - 1) // vae.downscale_index_formula[0] + 1
         chunks, pos = [], 0
         while pos < n_frames:
             end = min(n_frames, pos + tile)
@@ -390,10 +407,39 @@ class BFSHeadSwapMaskedSampler:
             images = images.reshape(-1, *images.shape[2:])
 
         final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather)
+
+        # --- inspection outputs ------------------------------------------
+        h_px, w_px = guide.shape[1], guide.shape[2]
+        if masks is not None:
+            crop_mask_out = masks
+            lat_mask = _mask_to_latent(masks, vae, lat_t_total, lat_h, lat_w)[0, 0]
+            latent_mask_out = torch.nn.functional.interpolate(
+                lat_mask.unsqueeze(1), size=(h_px, w_px), mode="nearest"
+            ).squeeze(1)
+        else:
+            crop_mask_out = torch.zeros(1, h_px, w_px)
+            latent_mask_out = torch.zeros(1, h_px, w_px)
+
+        overlay = guide_video.clone()
+        if masks_full is not None:
+            n = min(overlay.shape[0], masks_full.shape[0])
+            a = masks_full[:n].unsqueeze(-1).clamp(0, 1) * 0.45
+            tint = torch.tensor([1.0, 0.15, 0.15], device=overlay.device)
+            overlay[:n] = overlay[:n] * (1 - a) + tint * a
+        if crop_ctx is not None and crop_ctx[0] == "static":
+            x0, y0, w, h = crop_ctx[1]
+            g = torch.tensor([0.1, 1.0, 0.2], device=overlay.device)
+            t = 2
+            overlay[:, y0:y0 + t, x0:x0 + w] = g
+            overlay[:, y0 + h - t:y0 + h, x0:x0 + w] = g
+            overlay[:, y0:y0 + h, x0:x0 + t] = g
+            overlay[:, y0:y0 + h, x0 + w - t:x0 + w] = g
+
         debug = " | ".join(notes)
         if debug_log:
             print("[BFS Head Swap Masked Sampler]", debug)
-        return (final, {"samples": samples}, debug)
+        return (final, overlay, guide, crop_mask_out, latent_mask_out,
+                {"samples": samples}, debug)
 
 
 NODE_CLASS_MAPPINGS = {"BFSHeadSwapMaskedSampler": BFSHeadSwapMaskedSampler}
