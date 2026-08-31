@@ -74,6 +74,13 @@ except Exception as _e:  # noqa
 # gain came from the projector + LoRA, not the CAN). Kept the file but not registered.
 CAN_NODE_CLASS_MAPPINGS, CAN_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 
+try:
+    from .headswap_ltx_masked_sampler import NODE_CLASS_MAPPINGS as HSMS_NODE_CLASS_MAPPINGS
+    from .headswap_ltx_masked_sampler import NODE_DISPLAY_NAME_MAPPINGS as HSMS_NODE_DISPLAY_NAME_MAPPINGS
+except Exception as _e:  # noqa
+    print(f"[BFSNodes] Head Swap masked sampler not loaded: {_e!r}")
+    HSMS_NODE_CLASS_MAPPINGS, HSMS_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+
 NODE_CLASS_MAPPINGS = {
     **GV_NODE_CLASS_MAPPINGS,
     **CAN_NODE_CLASS_MAPPINGS,
@@ -94,6 +101,7 @@ NODE_CLASS_MAPPINGS = {
     **MMDD_NODE_CLASS_MAPPINGS,
     **SVH3_NODE_CLASS_MAPPINGS,
     **EPF_NODE_CLASS_MAPPINGS,
+    **HSMS_NODE_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -116,4 +124,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **MMDD_NODE_DISPLAY_NAME_MAPPINGS,
     **SVH3_NODE_DISPLAY_NAME_MAPPINGS,
     **EPF_NODE_DISPLAY_NAME_MAPPINGS,
+    **HSMS_NODE_DISPLAY_NAME_MAPPINGS,
 }
