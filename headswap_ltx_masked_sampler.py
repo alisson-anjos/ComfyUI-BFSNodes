@@ -134,6 +134,36 @@ def _mask_to_latent(masks, vae, latent_t, latent_h, latent_w):
 # node
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _inject_transformer_options(guider, model_patcher, debug=False):
+    """Copy the patched model's transformer_options INTO the guider's own dict.
+
+    CFGGuider captures `self.model_options = model_patcher.model_options` by
+    reference when it is constructed (comfy/samplers.py:937), so replacing
+    guider.model_patcher afterwards does not propagate: the guider keeps
+    sampling with the dict it captured, and the reference specs that
+    LTXMultipleControls wrote on the clone never reach the forward. The keys
+    have to be mutated into the existing dict in place.
+    """
+    src = (getattr(model_patcher, "model_options", None) or {}).get("transformer_options", {})
+    if not src:
+        return []
+    target = None
+    if isinstance(getattr(guider, "model_options", None), dict):
+        target = guider.model_options
+    else:
+        mp = getattr(guider, "model_patcher", None)
+        if mp is not None and isinstance(getattr(mp, "model_options", None), dict):
+            target = mp.model_options
+    if target is None:
+        return []
+    to = target.setdefault("transformer_options", {})
+    for k, v in src.items():
+        to[k] = v
+    if debug:
+        print(f"[BFS HeadSwap] injected into guider: {sorted(src.keys())}")
+    return sorted(src.keys())
+
+
 class BFSHeadSwapMaskedSampler:
     """Head swap with an optional stable crop, native mask inpainting and looping."""
 
@@ -343,11 +373,17 @@ class BFSHeadSwapMaskedSampler:
             # reads, and guide + identity are silently inert -- it samples happily
             # and ignores both. _set_guider_conds does the conds and the swap.
             gd = _Loop._set_guider_conds(guider, p, n, model_patcher=m)
+            _inject_transformer_options(gd, m, debug=debug_log)
             chunk = _Loop._sample_chunk(m, noise, sampler, sigmas, gd, latent, seed_offset=idx)
             out_latents.append(chunk["samples"])
 
         samples = out_latents[0] if len(out_latents) == 1 else torch.cat(out_latents, dim=2)
-        images = vae.decode(samples)  # the tensor, not a latent dict
+        video = samples
+        if getattr(video, "is_nested", False):
+            # AV latent: the video VAE only takes the video stream (this is what
+            # LTXVSeparateAVLatent does in the stock graphs)
+            video = video.tensors[0] if hasattr(video, "tensors") else video.unbind()[0]
+        images = vae.decode(video)  # the tensor, not a latent dict
         if isinstance(images, dict):
             images = images.get("samples")
         if images.ndim == 5:  # (B,T,H,W,C) -> frames batch
