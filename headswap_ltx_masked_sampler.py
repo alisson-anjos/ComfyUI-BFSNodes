@@ -253,6 +253,10 @@ class BFSHeadSwapMaskedSampler:
             },
         }
 
+    DESCRIPTION = ("Head swap with an optional stable crop around the subject, native mask "
+                   "inpainting and temporal chunking. Connect only what you need: guide + identity "
+                   "is a plain swap; add a mask to restrict the edit; add a crop mode to sample the "
+                   "subject full-frame when the face is too small to carry identity.")
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "BOUNDING_BOX", "STRING")
     RETURN_NAMES = ("images", "mask_over_source", "cropped_guide", "crop_mask",
                     "latent_mask", "latent", "crop_bboxes", "debug")
@@ -562,6 +566,9 @@ class BFSHeadSwapPasteBack:
             },
         }
 
+    DESCRIPTION = ("Composites processed crops back into the original frames, with edge-aware "
+                   "feathering and optional mask confinement. The other half of the sampler's "
+                   "paste_back: off, for refining a crop before it goes home.")
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
     FUNCTION = "execute"
