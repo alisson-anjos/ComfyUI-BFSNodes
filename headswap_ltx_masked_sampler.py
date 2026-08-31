@@ -557,7 +557,10 @@ class BFSHeadSwapPasteBack:
             "required": {
                 "cropped_images": ("IMAGE", {"tooltip": "Processed crops, at any resolution."}),
                 "original_images": ("IMAGE", {"tooltip": "The frames to paste into."}),
-                "crop_bboxes": ("BOUNDING_BOX", {"tooltip": "From the sampler's crop_bboxes output."}),
+                "crop_bboxes": ("BOUNDING_BOX", {"forceInput": True, "tooltip":
+                    "Connect the sampler's crop_bboxes output -- one box per frame. This is a "
+                    "socket, not something to fill in: typing a single box by hand would paste "
+                    "every frame into the same fixed rectangle."}),
                 "feather": ("INT", {"default": 16, "min": 0, "max": 256}),
             },
             "optional": {
