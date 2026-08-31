@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
 description = "Custom ComfyUI nodes including LTXV Edit Anything, Head-Swap/Anime2Real Bernini conditioning, the AMV Guide Builder, LTX Identity Transfer (IPT2V reference + source-phase RoPE), and MiniMax-H3 single-frame VAE loaders with tile control."
-version = "1.31.1"
+version = "1.32.0"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
@@ -13,6 +13,7 @@ dependencies = [
     "insightface==0.7.3",
     "onnxruntime",
     "transformers>=4.55.0",
+    "scipy",
 ]
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)

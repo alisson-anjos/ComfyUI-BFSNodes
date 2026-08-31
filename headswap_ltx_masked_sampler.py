@@ -21,11 +21,11 @@ about 25 px tall. No LoRA recovers identity from that. Cropping the head region
 and sampling it full-frame gives the same face 200-300 px, then the result is
 feathered back into the untouched frames.
 
-The crop planner comes from drozbay's MaskVidExperiments when that pack is
-installed (https://github.com/drozbay/MaskVidExperiments) — its boxes hold still
-through mask noise and occlusion, which naive per-frame crops do not, and a
-jittering crop reads to a video model as camera motion. Without the pack the node
-falls back to one static box around the subject's whole travel.
+The crop planner is vendored from drozbay's MaskVidExperiments (GPL-3.0, same as
+this pack) in `bfs_subject_crop.py`, so nothing here depends on that pack being
+installed. Its boxes hold still through mask noise and occlusion, which naive
+per-frame crops do not, and a jittering crop reads to a video model as camera
+motion.
 """
 
 import logging
@@ -41,31 +41,32 @@ CATEGORY = "BFS/video"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# optional dependency: drozbay/MaskVidExperiments crop planner
+# crop planning (vendored from drozbay/MaskVidExperiments, GPL-3.0)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _mvex_planner():
-    """`_plan_and_crop` from MaskVidExperiments, or None when it is not installed."""
-    import importlib
-    import os
-    import sys
+def _planner():
+    """The vendored crop planner (bfs_subject_crop), or None if it fails to import."""
+    try:
+        from .bfs_subject_crop import _plan_and_crop
+        return _plan_and_crop
+    except Exception as exc:  # pragma: no cover
+        log.warning("vendored crop planner unavailable (%s); using the static box", exc)
+        return None
 
-    import folder_paths
 
-    for root in folder_paths.get_folder_paths("custom_nodes"):
-        path = os.path.join(root, "MaskVidExperiments", "nodes_subject_crop.py")
-        if not os.path.isfile(path):
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location("_bfs_mvex_crop", path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["_bfs_mvex_crop"] = mod
-            spec.loader.exec_module(mod)
-            return mod._plan_and_crop
-        except Exception as exc:  # pragma: no cover - depends on their internals
-            log.warning("MaskVidExperiments found but not usable (%s); using the static box", exc)
-            return None
-    return None
+def _feather_ramp(h, w, feather, device):
+    """Blend weights that fade in from the crop border, as (1,h,w,1)."""
+    if feather <= 0:
+        return torch.ones(1, h, w, 1, device=device)
+    ramp = torch.ones(h, w, device=device)
+    f = min(int(feather), h // 2, w // 2)
+    if f > 0:
+        edge = torch.linspace(0, 1, f, device=device)
+        ramp[:f, :] *= edge[:, None]
+        ramp[-f:, :] *= edge.flip(0)[:, None]
+        ramp[:, :f] *= edge[None, :]
+        ramp[:, -f:] *= edge.flip(0)[None, :]
+    return ramp[None, :, :, None]
 
 
 def _static_box(masks, images, crop_scale, divisible_by, thresh=0.1):
@@ -109,7 +110,7 @@ def _mask_to_latent(masks, vae, latent_t, latent_h, latent_w):
 
     ComfyUI would trilinearly resize the pixel mask instead, which blurs it
     across frames and lets the original content bleed through the edit -- the
-    failure MaskVidExperiments' Mask To Latent Space node was written to fix.
+    failure drozbay's Mask To Latent Space node was written to fix.
     Max keeps a latent cell that any masked pixel touches fully editable.
     """
     m = masks.unsqueeze(1).float()  # (N,1,H,W)
@@ -195,8 +196,8 @@ class BFSHeadSwapMaskedSampler:
                 "crop_mode": (["off", "combined", "tracked", "zoomed"], {"default": "off", "tooltip":
                     "Sample inside a box around the subject instead of the whole frame -- the fix for faces "
                     "that are too small to carry identity. combined: one static box for the clip. "
-                    "tracked/zoomed: MaskVidExperiments' planner (installed separately); without it these "
-                    "fall back to combined."}),
+                    "tracked: a constant-size box that stays still until the subject would leave it. "
+                    "zoomed: the box follows the subject's size too, planned over the whole clip."}),
                 "crop_scale": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05, "tooltip":
                     "Box size as a multiple of the subject. 1.5 leaves a third as margin. Keep neck and "
                     "shoulders in: a face-tight crop is a framing the LoRA never saw in training."}),
@@ -251,7 +252,7 @@ class BFSHeadSwapMaskedSampler:
         if mode == "off" or masks is None:
             return guide, masks, None, "crop: off"
 
-        planner = _mvex_planner() if mode in ("tracked", "zoomed") else None
+        planner = _planner() if mode in ("tracked", "zoomed") else None
         if planner is not None:
             try:
                 p = {"crop_scale": scale, "aspect_ratio": 0.0, "padding": "firm",
@@ -259,9 +260,9 @@ class BFSHeadSwapMaskedSampler:
                      "pad_surplus_tol": 16, "zoom_step": 1.0}
                 out = planner(guide, masks, mode, p, div, 0.1, 0.0)
                 cropped, cropped_masks, bboxes = out[0], out[1], out[2]
-                return cropped, cropped_masks, ("mvex", bboxes), f"crop: mvex/{mode}"
+                return cropped, cropped_masks, ("planned", bboxes), f"crop: planned/{mode}"
             except Exception as exc:
-                log.warning("MaskVidExperiments planner failed (%s); using the static box", exc)
+                log.warning("crop planner failed (%s); using the static box", exc)
 
         x0, y0, w, h = _static_box(masks, guide, scale, div)
         cropped = guide[:, y0:y0 + h, x0:x0 + w, :]
@@ -272,37 +273,33 @@ class BFSHeadSwapMaskedSampler:
         if ctx is None:
             return result
         kind, box = ctx
-        if kind == "mvex":
-            try:
-                import importlib
-                mod = importlib.import_module("_bfs_mvex_crop")
-                return mod.MVEx_SubjectUncropNode.execute(result, original, box, feather).result[0]
-            except Exception as exc:
-                log.warning("MaskVidExperiments uncrop failed (%s); pasting the static way", exc)
-                return result
+        if kind == "planned":
+            # one box per frame: paste each crop into its own box
+            out = original.clone()
+            n = min(result.shape[0], out.shape[0], len(box))
+            for i in range(n):
+                b = box[i][0] if isinstance(box[i], list) else box[i]
+                x0, y0, w, h = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                patch = result[i:i + 1]
+                if patch.shape[1] != h or patch.shape[2] != w:
+                    patch = comfy.utils.common_upscale(
+                        patch.movedim(-1, 1), w, h, "lanczos", "disabled").movedim(1, -1)
+                a = _feather_ramp(h, w, feather, patch.device)
+                out[i:i + 1, y0:y0 + h, x0:x0 + w, :] = (
+                    a * patch + (1 - a) * out[i:i + 1, y0:y0 + h, x0:x0 + w, :])
+            return out
         x0, y0, w, h = box
         out = original.clone()[: result.shape[0]]
         patch = result[: out.shape[0]]
         # The sampled crop does not have to match the box: the connected latent
-        # sets the sampled size, and MaskVidExperiments' zoomed mode rescales
+        # sets the sampled size, and the zoomed crop mode rescales
         # crops by design. Bring it back to the box before blending.
         if patch.shape[1] != h or patch.shape[2] != w:
             log.info("paste-back: resizing the sampled crop %dx%d -> box %dx%d",
                      patch.shape[2], patch.shape[1], w, h)
             patch = comfy.utils.common_upscale(
                 patch.movedim(-1, 1), w, h, "lanczos", "disabled").movedim(1, -1)
-        if feather > 0:
-            ramp = torch.ones(h, w, device=patch.device)
-            f = min(feather, h // 2, w // 2)
-            if f > 0:
-                edge = torch.linspace(0, 1, f, device=patch.device)
-                ramp[:f, :] *= edge[:, None]
-                ramp[-f:, :] *= edge.flip(0)[:, None]
-                ramp[:, :f] *= edge[None, :]
-                ramp[:, -f:] *= edge.flip(0)[None, :]
-            a = ramp[None, :, :, None]
-        else:
-            a = 1.0
+        a = _feather_ramp(h, w, feather, patch.device)
         out[:, y0:y0 + h, x0:x0 + w, :] = (
             a * patch + (1 - a) * out[:, y0:y0 + h, x0:x0 + w, :]
         )
