@@ -54,18 +54,28 @@ def _planner():
         return None
 
 
-def _feather_ramp(h, w, feather, device):
-    """Blend weights that fade in from the crop border, as (1,h,w,1)."""
+def _feather_ramp(h, w, feather, device, touches=(False, False, False, False)):
+    """Blend weights fading in from the crop border, as (1,h,w,1).
+
+    ``touches`` marks the (top, bottom, left, right) sides that sit on the image
+    edge. Those are NOT feathered: there is nothing outside to blend into, and
+    fading there leaves a visible washed band along the frame border.
+    """
     if feather <= 0:
         return torch.ones(1, h, w, 1, device=device)
     ramp = torch.ones(h, w, device=device)
     f = min(int(feather), h // 2, w // 2)
     if f > 0:
         edge = torch.linspace(0, 1, f, device=device)
-        ramp[:f, :] *= edge[:, None]
-        ramp[-f:, :] *= edge.flip(0)[:, None]
-        ramp[:, :f] *= edge[None, :]
-        ramp[:, -f:] *= edge.flip(0)[None, :]
+        top, bottom, left, right = touches
+        if not top:
+            ramp[:f, :] *= edge[:, None]
+        if not bottom:
+            ramp[-f:, :] *= edge.flip(0)[:, None]
+        if not left:
+            ramp[:, :f] *= edge[None, :]
+        if not right:
+            ramp[:, -f:] *= edge.flip(0)[None, :]
     return ramp[None, :, :, None]
 
 
@@ -203,7 +213,12 @@ class BFSHeadSwapMaskedSampler:
                     "shoulders in: a face-tight crop is a framing the LoRA never saw in training."}),
                 "crop_divisible_by": ("INT", {"default": 32, "min": 8, "max": 128, "step": 8}),
                 "uncrop_feather": ("INT", {"default": 16, "min": 0, "max": 256, "tooltip":
-                    "Blend width when pasting the crop back, in pixels."}),
+                    "Blend width when pasting the crop back, in pixels. Sides sitting on the image "
+                    "edge are never feathered -- there is nothing outside to blend into."}),
+                "paste_confine_to_mask": ("BOOLEAN", {"default": True, "tooltip":
+                    "Paste only inside the mask instead of the whole crop rectangle, so anything the "
+                    "model changed in the crop's background never reaches the frame. Off pastes the "
+                    "full box."}),
 
                 "inpaint_with_mask": ("BOOLEAN", {"default": True, "tooltip":
                     "Send the mask to the sampler as a denoise mask, so only the masked region changes and "
@@ -276,7 +291,7 @@ class BFSHeadSwapMaskedSampler:
         cropped_masks = masks[:, y0:y0 + h, x0:x0 + w]
         return cropped, cropped_masks, ("static", (x0, y0, w, h)), f"crop: static {w}x{h} @({x0},{y0})"
 
-    def _paste_back(self, result, original, ctx, feather):
+    def _paste_back(self, result, original, ctx, feather, confine=None):
         if ctx is None:
             return result
         kind, box = ctx
@@ -294,7 +309,15 @@ class BFSHeadSwapMaskedSampler:
                 if patch.shape[1] != h or patch.shape[2] != w:
                     patch = comfy.utils.common_upscale(
                         patch.movedim(-1, 1), w, h, "lanczos", "disabled").movedim(1, -1)
-                a = _feather_ramp(h, w, feather, patch.device)
+                H, W = out.shape[1], out.shape[2]
+                a = _feather_ramp(h, w, feather, patch.device,
+                                  (y0 <= 0, y0 + h >= H, x0 <= 0, x0 + w >= W))
+                if confine is not None:
+                    cm = confine[min(i, confine.shape[0] - 1)]
+                    if cm.shape != (h, w):
+                        cm = torch.nn.functional.interpolate(
+                            cm[None, None], size=(h, w), mode="bilinear")[0, 0]
+                    a = a * cm[None, :, :, None].to(a.device)
                 out[i:i + 1, y0:y0 + h, x0:x0 + w, :] = (
                     a * patch + (1 - a) * out[i:i + 1, y0:y0 + h, x0:x0 + w, :])
             return out
@@ -309,7 +332,15 @@ class BFSHeadSwapMaskedSampler:
                      patch.shape[2], patch.shape[1], w, h)
             patch = comfy.utils.common_upscale(
                 patch.movedim(-1, 1), w, h, "lanczos", "disabled").movedim(1, -1)
-        a = _feather_ramp(h, w, feather, patch.device)
+        H, W = out.shape[1], out.shape[2]
+        a = _feather_ramp(h, w, feather, patch.device,
+                          (y0 <= 0, y0 + h >= H, x0 <= 0, x0 + w >= W))
+        if confine is not None:
+            cm = confine[:1] if confine.shape[0] == 1 else confine[: out.shape[0]]
+            if cm.shape[-2:] != (h, w):
+                cm = torch.nn.functional.interpolate(
+                    cm.unsqueeze(1), size=(h, w), mode="bilinear").squeeze(1)
+            a = a * cm.unsqueeze(-1).to(a.device)
         out[:, y0:y0 + h, x0:x0 + w, :] = (
             a * patch + (1 - a) * out[:, y0:y0 + h, x0:x0 + w, :]
         )
@@ -321,6 +352,7 @@ class BFSHeadSwapMaskedSampler:
                 guide_video, identity_image, latent=None, subject_mask=None,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4, mask_strength=1.0,
+                paste_confine_to_mask=True,
                 temporal_tile_size=0, temporal_overlap=16,
                 guide_source_id=1.0, identity_source_id=2.0, debug_log=False):
         from .ltx_multiple_controls import LTXMultipleControls
@@ -443,7 +475,8 @@ class BFSHeadSwapMaskedSampler:
         if images.ndim == 5:  # (B,T,H,W,C) -> frames batch
             images = images.reshape(-1, *images.shape[2:])
 
-        final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather)
+        confine = masks if (paste_confine_to_mask and masks is not None) else None
+        final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather, confine)
 
         # --- inspection outputs ------------------------------------------
         h_px, w_px = guide.shape[1], guide.shape[2]
