@@ -213,6 +213,13 @@ class BFSHeadSwapMaskedSampler:
                     "Dilate the mask before use, in pixels. The new head can be bigger than the old one."}),
                 "mask_blur": ("INT", {"default": 4, "min": 0, "max": 256, "tooltip":
                     "Soften the mask edge, in pixels, to avoid a hard seam."}),
+                "mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip":
+                    "How completely the masked region is replaced. 1.0 = fully regenerated. Below that "
+                    "the original latent is blended back, which keeps the original geometry and "
+                    "expression in pixels -- and drags the original identity back with them, so the "
+                    "result becomes an average of both faces. Expression does NOT need this: it "
+                    "reaches the model through the aligned guide, which carries the whole source "
+                    "performance regardless of the mask."}),
 
                 "temporal_tile_size": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 8, "tooltip":
                     "Frames per chunk. 0 samples the whole clip in one pass. Use the length the LoRA trained "
@@ -310,7 +317,7 @@ class BFSHeadSwapMaskedSampler:
     def execute(self, model, vae, noise, sampler, sigmas, guider, positive, negative,
                 guide_video, identity_image, latent=None, subject_mask=None,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
-                inpaint_with_mask=True, mask_grow=8, mask_blur=4,
+                inpaint_with_mask=True, mask_grow=8, mask_blur=4, mask_strength=1.0,
                 temporal_tile_size=0, temporal_overlap=16,
                 guide_source_id=1.0, identity_source_id=2.0, debug_log=False):
         from .ltx_multiple_controls import LTXMultipleControls
@@ -323,7 +330,8 @@ class BFSHeadSwapMaskedSampler:
                 masks = masks.squeeze(-1)
             if mask_grow or mask_blur:
                 masks = _grow_blur(masks, mask_grow, mask_blur)
-                notes.append(f"mask: grow {mask_grow}px, blur {mask_blur}px")
+                notes.append(f"mask: grow {mask_grow}px, blur {mask_blur}px, "
+                             f"strength {mask_strength}")
 
         masks_full = masks
         guide, masks, crop_ctx, note = self._crop(
@@ -387,9 +395,11 @@ class BFSHeadSwapMaskedSampler:
 
             if inpaint_with_mask and masks is not None:
                 latent = dict(latent)
-                latent["noise_mask"] = _mask_to_latent(
-                    masks[a:b], vae, latent["samples"].shape[2], lat_h, lat_w
-                ).to(latent["samples"].device)
+                nm = _mask_to_latent(
+                    masks[a:b], vae, latent["samples"].shape[2], lat_h, lat_w)
+                if mask_strength < 1.0:
+                    nm = nm * float(mask_strength)
+                latent["noise_mask"] = nm.to(latent["samples"].device)
 
             # CRITICAL: _sample_chunk samples through guider.model_patcher, so the
             # patched clone from LTXMultipleControls has to replace it. Without the

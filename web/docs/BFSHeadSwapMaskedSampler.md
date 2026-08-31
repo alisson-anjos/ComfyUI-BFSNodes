@@ -27,6 +27,21 @@ resize. Trilinear blurs a mask across frames and lets the original content bleed
 through the edit. Max keeps a latent cell that any masked pixel touches fully
 editable.
 
+### Does the mask need to be semi-transparent so the LoRA can see the expression?
+
+No — and it would cost you the swap. The expression does not travel under the
+mask: the whole source clip, original face included, is in the conditioning as an
+aligned reference on `source_id 1`, frame by frame. The model reads the
+performance from there whatever the mask does. That is what the LoRA was trained
+on: the new head follows the old head's acting.
+
+Partial mask values do something else. In ComfyUI's inpaint path they blend the
+original latent back in, so you keep the original geometry in pixels **and the
+original identity with it** — the result drifts toward an average of both faces.
+That is what `mask_strength` below 1.0 buys, and it is a deliberate choice, not a
+way to get expressions. Soft edges are for hiding the seam; the middle of the
+mask should stay at 1.0.
+
 **Watch the `latent_mask` output.** It has one frame per *latent* frame, not per
 video frame, and that is the real resolution of the edit. A tight outline around
 a face can nearly vanish at that scale — and then nothing changes, no matter how
