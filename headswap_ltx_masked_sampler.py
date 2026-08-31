@@ -398,6 +398,23 @@ class BFSHeadSwapMaskedSampler:
 
             if inpaint_with_mask and masks is not None:
                 latent = dict(latent)
+                # Inpainting keeps the INITIAL latent outside the mask, so it has to be
+                # the guide -- not the empty latent, which would leave grey where the
+                # video should be. This is the encode a normal inpaint graph does before
+                # Set Latent Noise Mask.
+                g_lat = vae.encode(g)
+                base = latent["samples"]
+                if getattr(base, "is_nested", False):
+                    # keep the audio stream from the connected AV latent, swap the video
+                    import comfy.nested_tensor
+                    streams = list(base.tensors) if hasattr(base, "tensors") else list(base.unbind())
+                    streams[0] = g_lat.to(streams[0].device, streams[0].dtype)
+                    latent["samples"] = comfy.nested_tensor.NestedTensor(tuple(streams))
+                else:
+                    latent["samples"] = g_lat.to(base.device, base.dtype)
+                if debug_log:
+                    print(f"[BFS HeadSwap] inpaint: latent seeded from the guide "
+                          f"{tuple(g_lat.shape)}")
                 nm = _mask_to_latent(
                     masks[a:b], vae, latent["samples"].shape[2], lat_h, lat_w)
                 if mask_strength < 1.0:

@@ -22,6 +22,12 @@ guide's own content, so **the original face stays visible to the model**. This i
 deliberately different from a masked-hole recipe, where the region is painted out
 before the model sees it.
 
+When a mask is connected the node seeds the sampling latent with the
+**VAE-encoded guide**, not with the empty latent you wired in — inpainting keeps
+the initial latent outside the mask, and an empty one leaves grey where the video
+should be. The connected latent still sets the size (and carries the audio
+stream); its video content is replaced.
+
 Masks are reduced to the latent grid with **max**, not with ComfyUI's trilinear
 resize. Trilinear blurs a mask across frames and lets the original content bleed
 through the edit. Max keeps a latent cell that any masked pixel touches fully
