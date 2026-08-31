@@ -153,6 +153,11 @@ class BFSHeadSwapMaskedSampler:
                 "identity_image": ("IMAGE", {"tooltip": "Head/face reference. Crop to the head."}),
             },
             "optional": {
+                "latent": ("LATENT", {"tooltip":
+                    "Empty latent from EmptyLTXVLatentVideo, sized to the CROP when cropping is on. "
+                    "Strongly recommended: LTX-2.5 latents are AV (video+audio) and this node cannot "
+                    "fabricate that structure -- without it a plain video latent is built and the model "
+                    "may ignore the guide entirely."}),
                 "subject_mask": ("MASK", {"tooltip":
                     "Per-frame mask of the region to edit (head, with margin). Drives the crop box and, "
                     "with inpaint_with_mask on, restricts denoising to it. Leave unconnected for a plain swap."}),
@@ -253,7 +258,7 @@ class BFSHeadSwapMaskedSampler:
     # -- entry point --------------------------------------------------------
 
     def execute(self, model, vae, noise, sampler, sigmas, guider, positive, negative,
-                guide_video, identity_image, subject_mask=None,
+                guide_video, identity_image, latent=None, subject_mask=None,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4,
                 temporal_tile_size=0, temporal_overlap=16,
@@ -296,9 +301,28 @@ class BFSHeadSwapMaskedSampler:
         for idx, (a, b) in enumerate(chunks):
             g = guide[a:b]
             lat_t = (g.shape[0] - 1) // vae.downscale_index_formula[0] + 1
-            empty = {"samples": torch.zeros(
-                [1, 128, lat_t, lat_h, lat_w],
-                device=comfy.model_management.intermediate_device())}
+            if latent is not None:
+                empty = dict(latent)
+                sm = empty["samples"]
+                if getattr(sm, "is_nested", False):
+                    if len(chunks) > 1:
+                        raise ValueError(
+                            "chunked sampling with an AV (nested) latent is not supported yet: "
+                            "set temporal_tile_size to 0, or feed a video-only latent")
+                elif sm.shape[2] != lat_t:
+                    empty["samples"] = sm[:, :, :lat_t]
+            else:
+                # last resort: a plain video latent. On LTX-2.5 the real thing is an
+                # AV (video+audio) latent, so connect EmptyLTXVLatentVideo instead.
+                log.warning("no latent connected: building a plain video latent, "
+                            "which is wrong for AV models like LTX-2.5")
+                empty = {"samples": torch.zeros(
+                    [1, 128, lat_t, lat_h, lat_w],
+                    device=comfy.model_management.intermediate_device())}
+            if debug_log:
+                _s = empty["samples"]
+                print(f"[BFS HeadSwap] chunk {idx}: guide {tuple(g.shape)} -> latent "
+                      f"{'nested AV' if getattr(_s,'is_nested',False) else tuple(_s.shape)}")
 
             m, p, n, latent, _dbg = mc.apply(
                 model, positive, negative, vae, empty,
