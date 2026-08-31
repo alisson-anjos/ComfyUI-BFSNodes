@@ -283,6 +283,14 @@ class BFSHeadSwapMaskedSampler:
         x0, y0, w, h = box
         out = original.clone()[: result.shape[0]]
         patch = result[: out.shape[0]]
+        # The sampled crop does not have to match the box: the connected latent
+        # sets the sampled size, and MaskVidExperiments' zoomed mode rescales
+        # crops by design. Bring it back to the box before blending.
+        if patch.shape[1] != h or patch.shape[2] != w:
+            log.info("paste-back: resizing the sampled crop %dx%d -> box %dx%d",
+                     patch.shape[2], patch.shape[1], w, h)
+            patch = comfy.utils.common_upscale(
+                patch.movedim(-1, 1), w, h, "lanczos", "disabled").movedim(1, -1)
         if feather > 0:
             ramp = torch.ones(h, w, device=patch.device)
             f = min(feather, h // 2, w // 2)
@@ -330,6 +338,8 @@ class BFSHeadSwapMaskedSampler:
         overlap = min(temporal_overlap, max(0, tile - 8)) if tile < n_frames else 0
         stride = max(1, tile - overlap)
         notes.append(f"frames {n_frames}, tile {tile}, overlap {overlap}")
+        notes.append(f"sample size {guide.shape[2]}x{guide.shape[1]} "
+                     f"(connect EmptyLTXVLatentVideo at this size to avoid a resize)")
 
         _, w_sf, h_sf = vae.downscale_index_formula
         lat_h, lat_w = guide.shape[1] // h_sf, guide.shape[2] // w_sf
