@@ -242,6 +242,18 @@ class BFSHeadSwapMaskedSampler:
                     "reaches the model through the aligned guide, which carries the whole source "
                     "performance regardless of the mask."}),
 
+                "decode": (["full", "tiled", "none"], {"default": "full", "tooltip":
+                    "How to turn the sampled latent into frames. full: one shot, fine at the size "
+                    "the sampler ran at. tiled: for a big latent (a second pass after a 2x "
+                    "upscaler), where a full decode thrashes VRAM and looks like a hang. none: "
+                    "skip decoding and return the latent only -- use your own VAE Decode (Tiled) "
+                    "downstream. With none there is nothing to paste back, so images comes out empty."}),
+                "decode_tile_size": ("INT", {"default": 768, "min": 64, "max": 4096, "step": 32}),
+                "decode_overlap": ("INT", {"default": 64, "min": 0, "max": 1024, "step": 16}),
+                "decode_temporal_size": ("INT", {"default": 32, "min": 4, "max": 4096, "step": 4, "tooltip":
+                    "Frames decoded at once in tiled mode."}),
+                "decode_temporal_overlap": ("INT", {"default": 4, "min": 0, "max": 256, "step": 1}),
+
                 "temporal_tile_size": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 8, "tooltip":
                     "Frames per chunk. 0 samples the whole clip in one pass. Use the length the LoRA trained "
                     "at (73 for the LTX head-swap recipe) for clips longer than that."}),
@@ -365,6 +377,8 @@ class BFSHeadSwapMaskedSampler:
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4, mask_strength=1.0,
                 paste_back=True, paste_confine_to_mask=True,
+                decode="full", decode_tile_size=768, decode_overlap=64,
+                decode_temporal_size=32, decode_temporal_overlap=4,
                 temporal_tile_size=0, temporal_overlap=16,
                 guide_source_id=1.0, identity_source_id=2.0, debug_log=False):
         from .ltx_multiple_controls import LTXMultipleControls
@@ -481,14 +495,24 @@ class BFSHeadSwapMaskedSampler:
             # AV latent: the video VAE only takes the video stream (this is what
             # LTXVSeparateAVLatent does in the stock graphs)
             video = video.tensors[0] if hasattr(video, "tensors") else video.unbind()[0]
-        images = vae.decode(video)  # the tensor, not a latent dict
-        if isinstance(images, dict):
-            images = images.get("samples")
-        if images.ndim == 5:  # (B,T,H,W,C) -> frames batch
-            images = images.reshape(-1, *images.shape[2:])
+        if decode == "none":
+            images = torch.zeros(1, 64, 64, 3)
+            notes.append("decode skipped: use your own VAE Decode on the latent output")
+        else:
+            if decode == "tiled":
+                images = vae.decode_tiled(
+                    video, tile_x=decode_tile_size, tile_y=decode_tile_size,
+                    overlap=decode_overlap, tile_t=decode_temporal_size,
+                    overlap_t=decode_temporal_overlap)
+            else:
+                images = vae.decode(video)  # the tensor, not a latent dict
+            if isinstance(images, dict):
+                images = images.get("samples")
+            if images.ndim == 5:  # (B,T,H,W,C) -> frames batch
+                images = images.reshape(-1, *images.shape[2:])
 
         confine = masks if (paste_confine_to_mask and masks is not None) else None
-        if paste_back:
+        if paste_back and decode != "none":
             final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather, confine)
         else:
             final = images
