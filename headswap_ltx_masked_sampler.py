@@ -215,6 +215,12 @@ class BFSHeadSwapMaskedSampler:
                 "uncrop_feather": ("INT", {"default": 16, "min": 0, "max": 256, "tooltip":
                     "Blend width when pasting the crop back, in pixels. Sides sitting on the image "
                     "edge are never feathered -- there is nothing outside to blend into."}),
+                "paste_back": ("BOOLEAN", {"default": True, "tooltip":
+                    "Composite the crop into the original frames before returning. Turn OFF for a "
+                    "second pass: images/latent then stay in the crop's own space, so you can "
+                    "upscale and refine the crop -- where the face actually has pixels -- and "
+                    "composite at the end with the Head Swap Paste Back node, feeding it the "
+                    "crop_bboxes output."}),
                 "paste_confine_to_mask": ("BOOLEAN", {"default": True, "tooltip":
                     "Paste only inside the mask instead of the whole crop rectangle, so anything the "
                     "model changed in the crop's background never reaches the frame. Off pastes the "
@@ -247,9 +253,9 @@ class BFSHeadSwapMaskedSampler:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "STRING")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "BOUNDING_BOX", "STRING")
     RETURN_NAMES = ("images", "mask_over_source", "cropped_guide", "crop_mask",
-                    "latent_mask", "latent", "debug")
+                    "latent_mask", "latent", "crop_bboxes", "debug")
     OUTPUT_TOOLTIPS = (
         "Final frames, with the crop pasted back when cropping is on.",
         "The mask painted over the ORIGINAL frames, plus the crop box outline. The "
@@ -261,7 +267,9 @@ class BFSHeadSwapMaskedSampler:
         "The mask as the sampler actually sees it: reduced to the latent grid with "
         "max and upsampled back for viewing. One frame per latent frame -- this is "
         "the real resolution of the edit, and where a too-thin mask disappears.",
-        "Sampled latent.",
+        "Sampled latent. With cropping on this is the CROP's latent, which is what you "
+        "want to upscale and refine in a second pass.",
+        "The crop boxes, one per frame. Feed to Head Swap Paste Back after a second pass.",
         "What the node decided: crop mode and box, mask ops, tiling.",
     )
     FUNCTION = "execute"
@@ -352,7 +360,7 @@ class BFSHeadSwapMaskedSampler:
                 guide_video, identity_image, latent=None, subject_mask=None,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4, mask_strength=1.0,
-                paste_confine_to_mask=True,
+                paste_back=True, paste_confine_to_mask=True,
                 temporal_tile_size=0, temporal_overlap=16,
                 guide_source_id=1.0, identity_source_id=2.0, debug_log=False):
         from .ltx_multiple_controls import LTXMultipleControls
@@ -476,7 +484,11 @@ class BFSHeadSwapMaskedSampler:
             images = images.reshape(-1, *images.shape[2:])
 
         confine = masks if (paste_confine_to_mask and masks is not None) else None
-        final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather, confine)
+        if paste_back:
+            final = self._paste_back(images, guide_video, crop_ctx, uncrop_feather, confine)
+        else:
+            final = images
+            notes.append("paste_back off: images/latent stay in crop space")
 
         # --- inspection outputs ------------------------------------------
         h_px, w_px = guide.shape[1], guide.shape[2]
@@ -518,11 +530,53 @@ class BFSHeadSwapMaskedSampler:
         debug = " | ".join(notes)
         if debug_log:
             print("[BFS Head Swap Masked Sampler]", debug)
+        boxes_out = crop_ctx[1] if crop_ctx is not None else []
+        if crop_ctx is not None and crop_ctx[0] == "static":
+            x0, y0, w, h = crop_ctx[1]
+            boxes_out = [[{"x": x0, "y": y0, "width": w, "height": h}]] * guide_video.shape[0]
         return (final, overlay, guide, crop_mask_out, latent_mask_out,
-                {"samples": samples}, debug)
+                {"samples": samples}, boxes_out, debug)
 
 
-NODE_CLASS_MAPPINGS = {"BFSHeadSwapMaskedSampler": BFSHeadSwapMaskedSampler}
+class BFSHeadSwapPasteBack:
+    """Composite processed crops back into the original frames.
+
+    The other half of `paste_back: off`: run the sampler in crop space, upscale
+    and refine there, then bring the result home. Sides of a crop that sit on the
+    image edge are not feathered, and the paste can be confined to a mask so only
+    the subject travels back.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "cropped_images": ("IMAGE", {"tooltip": "Processed crops, at any resolution."}),
+                "original_images": ("IMAGE", {"tooltip": "The frames to paste into."}),
+                "crop_bboxes": ("BOUNDING_BOX", {"tooltip": "From the sampler's crop_bboxes output."}),
+                "feather": ("INT", {"default": 16, "min": 0, "max": 256}),
+            },
+            "optional": {
+                "confine_mask": ("MASK", {"tooltip":
+                    "Confines the paste to the mask instead of the whole box, in the crop's space."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "execute"
+    CATEGORY = CATEGORY
+
+    def execute(self, cropped_images, original_images, crop_bboxes, feather, confine_mask=None):
+        return (BFSHeadSwapMaskedSampler()._paste_back(
+            cropped_images, original_images, ("planned", crop_bboxes), feather, confine_mask),)
+
+
+NODE_CLASS_MAPPINGS = {
+    "BFSHeadSwapMaskedSampler": BFSHeadSwapMaskedSampler,
+    "BFSHeadSwapPasteBack": BFSHeadSwapPasteBack,
+}
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BFSHeadSwapMaskedSampler": "BFS Head Swap Sampler (crop · mask · loop)"
+    "BFSHeadSwapMaskedSampler": "BFS Head Swap Sampler (crop · mask · loop)",
+    "BFSHeadSwapPasteBack": "BFS Head Swap Paste Back",
 }

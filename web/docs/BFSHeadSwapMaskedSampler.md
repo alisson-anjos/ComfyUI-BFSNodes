@@ -105,6 +105,30 @@ slices the guide, the mask and the overlap together per chunk.
 Chunked sampling with an AV latent is refused rather than silently corrupted —
 slicing a nested latent in time is not a thing the node does yet.
 
+## Second pass at higher resolution
+
+With cropping on, `latent` is the **crop's** latent, not the frame's — which is
+what you want to refine, because that is where the face has pixels. To chain a
+second pass:
+
+```
+Head Swap Sampler (paste_back: off)
+   ├─ latent      → LTXV upscaler / second sampler → VAE Decode ─┐
+   └─ crop_bboxes ───────────────────────────────────────────────┤
+guide_video (original frames) ────────────────────────────────────┤
+                                                                  ▼
+                                              BFS Head Swap Paste Back → frames
+```
+
+With `paste_back: off` the node stops compositing, so `images` and `latent` stay
+in the crop's own space. Refine there, then bring the result home with **BFS Head
+Swap Paste Back**, which takes the crops, the original frames and `crop_bboxes`.
+It does the same edge-aware feather and optional mask confinement the sampler
+would have done.
+
+Refining before compositing is the right order: upscaling the crop puts the
+pixels where the identity is, and the frame around it never needed a second pass.
+
 ## Reading the outputs
 
 | output | what it answers |
@@ -114,7 +138,8 @@ slicing a nested latent in time is not a thing the node does yet.
 | `cropped_guide` | exactly what the model was fed. If this is wrong, nothing downstream can be right |
 | `crop_mask` | the mask after grow/blur, in the crop's pixel space |
 | `latent_mask` | the mask as the sampler sees it — where a thin mask disappears |
-| `latent` | the sampled latent |
+| `latent` | the sampled latent — the CROP's, when cropping is on |
+| `crop_bboxes` | the boxes, for Head Swap Paste Back after a second pass |
 | `debug` | crop mode and box, mask ops, tiling, the size to build the latent at |
 
 ## Suggested order when something looks wrong
