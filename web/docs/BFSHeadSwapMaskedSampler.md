@@ -105,6 +105,22 @@ slices the guide, the mask and the overlap together per chunk.
 Chunked sampling with an AV latent is refused rather than silently corrupted —
 slicing a nested latent in time is not a thing the node does yet.
 
+## Decoding
+
+`decode` chooses how the sampled latent becomes frames:
+
+- **full** — one shot. Right for a single pass at the size the sampler ran at.
+- **tiled** — for a latent too large to decode whole, e.g. after a 2x upscaler.
+  A full decode there pins VRAM at 99% and shuttles tensors until it looks like
+  a hang.
+- **none** — skip it and return the latent alone.
+
+**For anything beyond a single pass, prefer `none` and decode outside.** Your own
+VAE Decode (Tiled) is tunable, visible in the graph, and reused by the rest of
+the workflow. The only reason decoding lives in this node at all is the
+paste-back, which needs pixels — so with `none` the compositing is skipped too,
+and **BFS Head Swap Paste Back** does it after your decode.
+
 ## Second pass at higher resolution
 
 With cropping on, `latent` is the **crop's** latent, not the frame's — which is
