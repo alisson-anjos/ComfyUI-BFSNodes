@@ -185,9 +185,13 @@ def _auto_config(st, cell, ref_aspect=None, headroom=1.15):
     tilt = min(1.6, max(0.6, ref / src_aspect))
     delta = headroom - 1.0
 
+    # every slack is a fraction of the head's WIDTH, capped. Width is the stable
+    # dimension of a head mask -- height swings with how much neck the mask took,
+    # and scaling the upward slack by it once produced holes far larger than the
+    # head, with the new head floating inside the regenerated area.
     base = 0.06 * hw
-    want_x = base + 0.5 * hw * delta * tilt             # half the extra width per side
-    want_up = 2.0 * base + hh * delta / tilt            # hair goes up
+    want_x = base + min(0.25 * hw, 0.5 * hw * delta * tilt)
+    want_up = 1.5 * base + min(0.30 * hw, hw * delta / tilt)  # hair goes up
     want_down = base                                     # never eat into the neck
 
     # ── the box has to be big enough to hold all of that plus a ramp ─────────
@@ -215,7 +219,11 @@ def _auto_config(st, cell, ref_aspect=None, headroom=1.15):
     # floor, never round: a cap that rounds up is a ramp that reaches past the margin
     feather = int(min(64, max(4, int(0.5 * min(left_x, left_y)))))
     blur = int(min(48, max(2, round(0.03 * hw))))       # paste-back softness, not denoise
-    cells = int(max(1, round(max(grow_x, grow_up) / max(1, cell))))
+    # NOT derived from the grow: the pixel grow above already carries the slack,
+    # and _mask_to_latent reduces with MAX, so any cell the mask touches is
+    # already fully editable. Dilating here on top of that added a whole 32 px
+    # cell on every side for nothing.
+    cells = 0
     frames = 1 if st["step"] > 0.15 * hw else 0         # a fast head needs slack along time
 
     ref_note = (f"reference aspect {ref:.2f} vs mask {src_aspect:.2f} (tilt {tilt:.2f}), "
@@ -757,7 +765,10 @@ class BFSHeadSwapMaskedSampler:
         finally:
             # hand the guider back the way it was found, whatever happened above:
             # an exception here is exactly the case that would poison the next run
-            for inj in injections:
+            # reverse order: with several chunks each injection captured the state
+            # the previous one left, so undoing forwards would restore chunk 1's
+            # specs onto the guider instead of clearing them
+            for inj in reversed(injections):
                 inj.undo()
 
         samples = out_latents[0] if len(out_latents) == 1 else torch.cat(out_latents, dim=2)

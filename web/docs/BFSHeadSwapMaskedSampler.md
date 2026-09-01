@@ -33,10 +33,10 @@ moves between frames — and sets all of it from those numbers:
 |---|---|---|
 | `crop_mode` | `off` when the head is ≥45% of the frame width; `zoomed` when its size changes >35%; `tracked` when it travels more than a quarter of the box; else `combined` | a crop buys resolution the head does not already have, and nothing else |
 | `crop_scale` | 1.8, clamped so the box still fits in the frame | head plus neck and shoulders — a face-tight crop is a framing the LoRA never saw |
-| `mask_grow` | 6% of the head's width, plus the headroom slack — **per side**: up ≫ sideways ≫ down | hair overflows upward and sideways; growing down only eats the neck and collar, which stay the guide's |
+| `mask_grow` | 6% of the head's **width**, plus the capped headroom slack — **per side**: up ≫ sideways ≫ down | hair overflows upward and sideways; growing down only eats the neck and collar, which stay the guide's |
 | `mask_blur` | 3% of the head's width | paste-back softness (the denoise mask is binarised anyway) |
 | `uncrop_feather` | half the margin between mask and crop border, floored | **the seam fix**: a ramp wider than that margin fades the head itself |
-| `latent_mask_dilate` | `mask_grow` expressed in whole latent cells, at least 1 | guarantees the head sits inside editable cells instead of clipping at a boundary |
+| `latent_mask_dilate` | left at 0 | the pixel grow already carries the slack, and the pixel→latent reduction is a MAX, so any cell the mask touches is editable already — adding cells here stacks a whole 32 px on every side |
 | `latent_mask_dilate_frames` | 1 when the head moves more than 15% of its width between frames | a fast head needs slack along time too |
 
 ### The mask is the old head, not the new one
@@ -58,6 +58,12 @@ visibly larger head, drop it to 1.0 when the two heads match.
 
 Growth is never symmetric: down is held at the base 6% no matter what, because
 the neck and collar below the jaw have to stay the guide's own pixels.
+
+Every slack is a fraction of the head's **width** and capped there (25% sideways,
+30% up). Width is the stable dimension of a head mask — height swings with how
+much neck the mask happened to take — and scaling the upward slack by height,
+as 1.37.0 did, produced holes far larger than the head, with the new head
+generated floating inside the regenerated area. Fixed in 1.37.1.
 
 It needs `subject_mask`; without one there is nothing to measure and the widget
 values are kept. The widgets it overrides stay visible but are ignored, and the

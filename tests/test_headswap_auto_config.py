@@ -113,19 +113,40 @@ class AutoConfigTest(unittest.TestCase):
             self.assertLessEqual(down, left + 1)
 
     def test_a_wider_reference_pushes_the_slack_sideways(self):
-        wide = auto([(900, 300, 120, 160)] * 8, ref_aspect=1.4, headroom=1.5)
-        tall = auto([(900, 300, 120, 160)] * 8, ref_aspect=0.5, headroom=1.5)
+        # below the caps, where the tilt still has room to act
+        wide = auto([(900, 300, 120, 160)] * 8, ref_aspect=1.4, headroom=1.15)
+        tall = auto([(900, 300, 120, 160)] * 8, ref_aspect=0.5, headroom=1.15)
         self.assertGreater(sides(wide)[2], sides(tall)[2])
         self.assertGreater(sides(tall)[0], sides(wide)[0])
 
-    def test_the_box_grows_to_hold_what_the_mask_needs(self):
-        tight = auto([(900, 300, 120, 160)] * 8, headroom=1.0)
-        roomy = auto([(900, 300, 120, 160)] * 8, headroom=1.6)
-        self.assertGreater(roomy["crop_scale"], tight["crop_scale"])
+    def test_the_box_always_holds_the_grow_plus_the_ramp(self):
+        # the real invariant: whatever the mask grew by, the crop still has room
+        # for it AND for the feather, or the paste fades the head
+        for hr in (1.0, 1.15, 1.5, 2.0):
+            for ref in (0.5, 1.0, 1.6):
+                a = auto([(900, 300, 120, 160)] * 8, ref_aspect=ref, headroom=hr)
+                up, down, left, _ = sides(a)
+                margin_x = 120 * (a["crop_scale"] - 1.0) / 2.0
+                margin_y = 160 * (a["crop_scale"] - 1.0) / 2.0
+                self.assertLessEqual(left + a["uncrop_feather"], margin_x + 1)
+                self.assertLessEqual(max(up, down) + a["uncrop_feather"], margin_y + 1)
 
-    def test_latent_dilation_is_at_least_one_cell(self):
+    def test_latent_dilation_is_not_added_on_top_of_the_pixel_grow(self):
+        # _mask_to_latent reduces with MAX, so a cell the mask touches is already
+        # editable; dilating here too added a whole 32 px cell on every side and
+        # blew the hole up far past the head
         for w in (40, 100, 600):
-            self.assertGreaterEqual(auto([(400, 200, w, w)] * 8)["latent_mask_dilate"], 1)
+            self.assertEqual(auto([(400, 200, w, w)] * 8)["latent_mask_dilate"], 0)
+
+    def test_growth_stays_a_sane_fraction_of_the_head(self):
+        # the failure this pins: slack scaled by the mask's HEIGHT produced a
+        # hole much larger than the head, with the new head floating inside it
+        for hw, hh in ((120, 160), (300, 400), (600, 900)):
+            for ref, hr in ((0.5, 1.15), (1.0, 1.15), (0.75, 1.5), (1.4, 2.0)):
+                up, down, left, _ = sides(auto([(300, 100, hw, hh)] * 8,
+                                               ref_aspect=ref, headroom=hr))
+                self.assertLessEqual(up, 0.45 * hw, f"up runs away at {hw}x{hh} ref {ref} hr {hr}")
+                self.assertLessEqual(left, 0.40 * hw, f"sides run away at {hw}x{hh} ref {ref} hr {hr}")
 
     def test_a_fast_head_gets_slack_along_time(self):
         still = auto([(800, 300, 100, 130)] * 20)
