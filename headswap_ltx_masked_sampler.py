@@ -99,19 +99,169 @@ def _static_box(masks, images, crop_scale, divisible_by, thresh=0.1):
     return x0, y0, int(w), int(h)
 
 
+def _subject_stats(masks, thresh=0.1):
+    """Measure the subject in the mask: size, travel, size change, per-frame step.
+
+    Everything the auto config decides is derived from these, because they are
+    the only numbers that make a pixel amount meaningful. ``mask_grow: 8`` is
+    generous on a 90 px head and invisible on a 900 px one; six percent of the
+    head's width is the same amount of slack in both.
+    """
+    m = masks if masks.ndim == 3 else masks.squeeze(-1)
+    n, H, W = m.shape[0], m.shape[-2], m.shape[-1]
+    hit = m > thresh
+    boxes = []
+    for i in range(n):
+        ys, xs = torch.where(hit[i])
+        if ys.numel() == 0:
+            boxes.append(None)
+            continue
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        boxes.append((x0, y0, x1 - x0, y1 - y0))
+    seen = [b for b in boxes if b is not None]
+    if not seen:
+        return None
+
+    def pct(vals, q):
+        v = sorted(vals)
+        return float(v[min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))])
+
+    ws = [b[2] for b in seen]
+    hs = [b[3] for b in seen]
+    head_w, head_h = pct(ws, 0.5), pct(hs, 0.5)          # median: one bad frame cannot move it
+    cx = [b[0] + b[2] / 2.0 for b in seen]
+    cy = [b[1] + b[3] / 2.0 for b in seen]
+    travel = max(max(cx) - min(cx), max(cy) - min(cy))
+    size_var = (pct(ws, 0.9) - pct(ws, 0.1)) / max(1.0, head_w)
+    step, prev = 0.0, None
+    for b in boxes:
+        if b is None:
+            prev = None
+            continue
+        c = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0)
+        if prev is not None:
+            step = max(step, abs(c[0] - prev[0]), abs(c[1] - prev[1]))
+        prev = c
+    return {"head_w": head_w, "head_h": head_h, "travel": travel, "size_var": size_var,
+            "step": step, "seen": len(seen), "frames": n, "H": H, "W": W}
+
+
+def _auto_config(st, cell, ref_aspect=None, headroom=1.15):
+    """Turn the subject stats into every pixel-space knob, in one place.
+
+    Two rules behind all of it.
+
+    **A pixel amount only means something relative to the head it acts on.** The
+    same 8 px of grow is generous on a 90 px head and invisible on a 900 px one,
+    so every amount here is a fraction of the measured head.
+
+    **The mask is the OLD head; the new one does not have to fit inside it.** A
+    wider face, more hair, a taller cut -- if the mask does not cover where the
+    new head lands, the swap is clipped at the mask edge, which is the seam this
+    mode exists to remove. Absolute size cannot be recovered from a cropped
+    reference (a head crop carries no scale), but the reference's *proportions*
+    can: ``ref_aspect`` against the mask's own aspect says whether the new head
+    is relatively wider or taller, and ``headroom`` covers the part that cannot
+    be measured. Growth is anisotropic on purpose -- hair overflows upward and
+    sideways, never down into the neck and collar, which must stay the guide's.
+
+    The margin between the mask and the crop border is then a budget spent in
+    order: the grow takes what it needs, the paste feather gets half of what is
+    left. A ramp wider than its share fades the head itself.
+    """
+    hw, hh, W, H = st["head_w"], st["head_h"], st["W"], st["H"]
+    occ = hw / max(1.0, W)
+    fit = min(W / max(1.0, hw), H / max(1.0, hh))       # largest box the frame still holds
+
+    # ── how much bigger the new head may be, per axis ────────────────────────
+    src_aspect = hw / max(1.0, hh)
+    ref = float(ref_aspect) if ref_aspect else src_aspect
+    headroom = max(1.0, float(headroom))
+    # headroom carries the MAGNITUDE -- it is the part no measurement can give,
+    # since a cropped reference head has no scale. The aspect only tilts how
+    # that slack is split between sideways and up: a relatively wider reference
+    # needs it at the sides, a taller one above.
+    tilt = min(1.6, max(0.6, ref / src_aspect))
+    delta = headroom - 1.0
+
+    base = 0.06 * hw
+    want_x = base + 0.5 * hw * delta * tilt             # half the extra width per side
+    want_up = 2.0 * base + hh * delta / tilt            # hair goes up
+    want_down = base                                     # never eat into the neck
+
+    # ── the box has to be big enough to hold all of that plus a ramp ─────────
+    need_x = 1.0 + 2.0 * (want_x + 4.0) / hw
+    need_y = 1.0 + 2.0 * (max(want_up, want_down) + 4.0) / hh
+    scale = round(min(fit, max(1.2, 1.8, need_x, need_y)), 2)
+
+    if occ >= 0.45 or fit < 1.15:
+        mode, why = "off", f"head is {occ:.0%} of the frame width, a crop would gain nothing"
+    elif st["size_var"] > 0.35:
+        mode, why = "zoomed", f"the subject's size changes {st['size_var']:.0%} across the clip"
+    elif st["travel"] > 0.25 * hw * scale:
+        mode, why = "tracked", f"the subject travels {st['travel']:.0f}px, more than a quarter of the box"
+    else:
+        mode, why = "combined", f"the subject travels {st['travel']:.0f}px, it fits one static box"
+
+    # ── spend the margin: grow first, then what is left is the ramp's ────────
+    margin_x = hw * (scale - 1.0) / 2.0
+    margin_y = hh * (scale - 1.0) / 2.0
+    grow_x = int(min(96, max(2, int(min(want_x, 0.7 * margin_x)))))
+    grow_up = int(min(160, max(2, int(min(want_up, 0.7 * margin_y)))))
+    grow_down = int(min(96, max(2, int(min(want_down, 0.7 * margin_y)))))
+    left_x = margin_x - grow_x
+    left_y = margin_y - max(grow_up, grow_down)
+    # floor, never round: a cap that rounds up is a ramp that reaches past the margin
+    feather = int(min(64, max(4, int(0.5 * min(left_x, left_y)))))
+    blur = int(min(48, max(2, round(0.03 * hw))))       # paste-back softness, not denoise
+    cells = int(max(1, round(max(grow_x, grow_up) / max(1, cell))))
+    frames = 1 if st["step"] > 0.15 * hw else 0         # a fast head needs slack along time
+
+    ref_note = (f"reference aspect {ref:.2f} vs mask {src_aspect:.2f} (tilt {tilt:.2f}), "
+                f"headroom {headroom:.2f}")
+    note = (f"auto: head {hw:.0f}x{hh:.0f}px in {W}x{H} ({occ:.0%} of the width), "
+            f"seen in {st['seen']}/{st['frames']} frames; {ref_note} -> "
+            f"crop {mode} @ {scale} ({why}); grow {grow_x}px sideways, {grow_up}px up, "
+            f"{grow_down}px down, blur {blur}px, feather {feather}px, "
+            f"latent dilate {cells} cell(s), {frames} frame(s)")
+    return {"crop_mode": mode, "crop_scale": scale,
+            "mask_grow": (grow_up, grow_down, grow_x, grow_x), "mask_blur": blur,
+            "uncrop_feather": feather, "latent_mask_dilate": cells,
+            "latent_mask_dilate_frames": frames, "note": note}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # mask helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _grow_blur(masks, grow, blur):
-    """Dilate then soften a mask stack, in pixels."""
+    """Dilate then soften a mask stack, in pixels.
+
+    ``grow`` is either one amount for every side, or ``(up, down, left, right)``.
+    The sides matter: a new head overflows the old one upward and sideways --
+    hair, a wider face -- while growing downward only eats into the neck and
+    collar, which have to stay the guide's own pixels.
+    """
+    F = torch.nn.functional
     m = masks.unsqueeze(1).float()  # (N,1,H,W)
-    if grow > 0:
+    if isinstance(grow, (tuple, list)):
+        up, down, left, right = (max(0, int(g)) for g in grow)
+        if up or down or left or right:
+            # pad by what each side grows, then pool the padding away. The pad
+            # is mirrored on purpose: padding the TOP shifts the window down, so
+            # the top pad is what the mask grows DOWNWARD by.
+            m = F.pad(m, (right, left, down, up), mode="replicate")
+            if up or down:
+                m = F.max_pool2d(m, (up + down + 1, 1), stride=1)
+            if left or right:
+                m = F.max_pool2d(m, (1, left + right + 1), stride=1)
+    elif grow > 0:
         k = 2 * int(grow) + 1
-        m = torch.nn.functional.max_pool2d(m, k, stride=1, padding=k // 2)
+        m = F.max_pool2d(m, k, stride=1, padding=k // 2)
     if blur > 0:
         k = 2 * int(blur) + 1
-        m = torch.nn.functional.avg_pool2d(m, k, stride=1, padding=k // 2, count_include_pad=False)
+        m = F.avg_pool2d(m, k, stride=1, padding=k // 2, count_include_pad=False)
     return m.squeeze(1).clamp(0, 1)
 
 
@@ -177,7 +327,7 @@ def _inject_transformer_options(guider, model_patcher, debug=False):
     """
     src = (getattr(model_patcher, "model_options", None) or {}).get("transformer_options", {})
     if not src:
-        return []
+        return _Injection({}, [], [])
     target = None
     if isinstance(getattr(guider, "model_options", None), dict):
         target = guider.model_options
@@ -186,13 +336,39 @@ def _inject_transformer_options(guider, model_patcher, debug=False):
         if mp is not None and isinstance(getattr(mp, "model_options", None), dict):
             target = mp.model_options
     if target is None:
-        return []
+        return _Injection({}, [], [])
     to = target.setdefault("transformer_options", {})
+    undo = [(k, k in to, to.get(k)) for k in src]
     for k, v in src.items():
         to[k] = v
     if debug:
         print(f"[BFS HeadSwap] injected into guider: {sorted(src.keys())}")
-    return sorted(src.keys())
+    return _Injection(to, undo, sorted(src.keys()))
+
+
+class _Injection:
+    """What was written into the guider, and how to take it back out.
+
+    The guider is an object ComfyUI hands us from another node, and it survives
+    between runs in the execution cache. Writing reference specs into its dict
+    and leaving them there does two bad things: the reference LATENTS stay
+    reachable, so the VRAM they occupy is never freed while that guider is
+    cached, and the next run that does not overwrite the same keys -- a graph
+    with no references, an aborted run, another sampler sharing the guider --
+    samples with the previous clip's specs, whose shapes no longer fit. Undoing
+    the write leaves the guider exactly as it was found.
+    """
+
+    def __init__(self, options, undo, keys):
+        self.options, self._undo, self.keys = options, undo, keys
+
+    def undo(self):
+        for k, had, old in self._undo:
+            if had:
+                self.options[k] = old
+            else:
+                self.options.pop(k, None)
+        self._undo = []
 
 
 class BFSHeadSwapMaskedSampler:
@@ -222,6 +398,23 @@ class BFSHeadSwapMaskedSampler:
                 "subject_mask": ("MASK", {"tooltip":
                     "Per-frame mask of the region to edit (head, with margin). Drives the crop box and, "
                     "with inpaint_with_mask on, restricts denoising to it. Leave unconnected for a plain swap."}),
+
+                "auto_config": ("BOOLEAN", {"default": False, "tooltip":
+                    "Measure the subject in the mask and set crop mode, crop scale, mask grow "
+                    "and blur, paste feather and latent dilation from its size -- ignoring those "
+                    "widgets. Needs subject_mask. Every amount below is in pixels, which only "
+                    "means something relative to how big the head is in frame: the same 8 px is "
+                    "generous on a distant head and invisible on a close one, and that mismatch "
+                    "is what leaves a seam. The debug output prints what it chose."}),
+
+                "identity_headroom": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05,
+                    "tooltip":
+                    "auto_config only. How much bigger the reference head may be than the head in "
+                    "the guide. The mask is the OLD head, so a wider face or more hair lands "
+                    "outside it and gets clipped -- the seam. The reference's PROPORTIONS are "
+                    "measured from identity_image against the mask; its absolute size cannot be, "
+                    "because a cropped head carries no scale. Raise it for big hair or a visibly "
+                    "larger head; 1.0 assumes the two heads match."}),
 
                 "crop_mode": (["off", "combined", "tracked", "zoomed"], {"default": "off", "tooltip":
                     "Sample inside a box around the subject instead of the whole frame -- the fix for faces "
@@ -301,7 +494,8 @@ class BFSHeadSwapMaskedSampler:
     DESCRIPTION = ("Head swap with an optional stable crop around the subject, native mask "
                    "inpainting and temporal chunking. Connect only what you need: guide + identity "
                    "is a plain swap; add a mask to restrict the edit; add a crop mode to sample the "
-                   "subject full-frame when the face is too small to carry identity.")
+                   "subject full-frame when the face is too small to carry identity. auto_config "
+                   "measures the subject in the mask and derives every pixel amount from its size.")
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "BOUNDING_BOX", "STRING")
     RETURN_NAMES = ("images", "mask_over_source", "cropped_guide", "crop_mask",
                     "latent_mask", "latent", "crop_bboxes", "debug")
@@ -407,6 +601,7 @@ class BFSHeadSwapMaskedSampler:
 
     def execute(self, model, vae, noise, sampler, sigmas, guider, positive, negative,
                 guide_video, identity_image, latent=None, subject_mask=None,
+                auto_config=False, identity_headroom=1.15,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4,
                 mask_hard_for_inpaint=True, latent_mask_dilate=0, latent_mask_dilate_frames=0,
@@ -424,10 +619,33 @@ class BFSHeadSwapMaskedSampler:
         if masks is not None:
             if masks.ndim == 4:
                 masks = masks.squeeze(-1)
+            if auto_config:
+                # measure the RAW mask: grow/blur below would inflate the head we measure
+                st = _subject_stats(masks)
+                if st is None:
+                    notes.append("auto: the mask is empty, keeping the widget values")
+                else:
+                    try:
+                        cell = int(vae.downscale_index_formula[1])
+                    except Exception:
+                        cell = 32
+                    ref_aspect = None
+                    if identity_image is not None and identity_image.ndim == 4:
+                        ref_aspect = float(identity_image.shape[2]) / max(1.0, float(identity_image.shape[1]))
+                    auto = _auto_config(st, cell, ref_aspect, identity_headroom)
+                    crop_mode = auto["crop_mode"]
+                    crop_scale = auto["crop_scale"]
+                    mask_grow = auto["mask_grow"]
+                    mask_blur = auto["mask_blur"]
+                    uncrop_feather = auto["uncrop_feather"]
+                    latent_mask_dilate = auto["latent_mask_dilate"]
+                    latent_mask_dilate_frames = auto["latent_mask_dilate_frames"]
+                    notes.append(auto["note"])
             if mask_grow or mask_blur:
                 masks = _grow_blur(masks, mask_grow, mask_blur)
-                notes.append(f"mask: grow {mask_grow}px, blur {mask_blur}px, "
-                             f"strength {mask_strength}")
+                g = (f"{mask_grow[0]}/{mask_grow[1]}/{mask_grow[2]}px up/down/side"
+                     if isinstance(mask_grow, (tuple, list)) else f"{mask_grow}px")
+                notes.append(f"mask: grow {g}, blur {mask_blur}px, strength {mask_strength}")
 
         masks_full = masks
         guide, masks, crop_ctx, note = self._crop(
@@ -456,78 +674,91 @@ class BFSHeadSwapMaskedSampler:
 
         mc = LTXMultipleControls()
         out_latents = []
-        for idx, (a, b) in enumerate(chunks):
-            g = guide[a:b]
-            lat_t = (g.shape[0] - 1) // vae.downscale_index_formula[0] + 1
-            if latent is not None:
-                empty = dict(latent)
-                sm = empty["samples"]
-                if getattr(sm, "is_nested", False):
-                    if len(chunks) > 1:
-                        raise ValueError(
-                            "chunked sampling with an AV (nested) latent is not supported yet: "
-                            "set temporal_tile_size to 0, or feed a video-only latent")
-                elif sm.shape[2] != lat_t:
-                    empty["samples"] = sm[:, :, :lat_t]
-            else:
-                # last resort: a plain video latent. On LTX-2.5 the real thing is an
-                # AV (video+audio) latent, so connect EmptyLTXVLatentVideo instead.
-                log.warning("no latent connected: building a plain video latent, "
-                            "which is wrong for AV models like LTX-2.5")
-                empty = {"samples": torch.zeros(
-                    [1, 128, lat_t, lat_h, lat_w],
-                    device=comfy.model_management.intermediate_device())}
-            if debug_log:
-                _s = empty["samples"]
-                print(f"[BFS HeadSwap] chunk {idx}: guide {tuple(g.shape)} -> latent "
-                      f"{'nested AV' if getattr(_s,'is_nested',False) else tuple(_s.shape)}")
-
-            m, p, n, latent, _dbg = mc.apply(
-                model, positive, negative, vae, empty,
-                guide_video=g, guide_source_id=guide_source_id,
-                identity_image=identity_image, identity_source_id=identity_source_id,
-                auto_mask_guide=False, debug_log=debug_log,
-            )
-
-            if inpaint_with_mask and masks is not None:
-                latent = dict(latent)
-                # Inpainting keeps the INITIAL latent outside the mask, so it has to be
-                # the guide -- not the empty latent, which would leave grey where the
-                # video should be. This is the encode a normal inpaint graph does before
-                # Set Latent Noise Mask.
-                g_lat = vae.encode(g)
-                base = latent["samples"]
-                if getattr(base, "is_nested", False):
-                    # keep the audio stream from the connected AV latent, swap the video
-                    import comfy.nested_tensor
-                    streams = list(base.tensors) if hasattr(base, "tensors") else list(base.unbind())
-                    streams[0] = g_lat.to(streams[0].device, streams[0].dtype)
-                    latent["samples"] = comfy.nested_tensor.NestedTensor(tuple(streams))
+        injections = []
+        try:
+            for idx, (a, b) in enumerate(chunks):
+                g = guide[a:b]
+                lat_t = (g.shape[0] - 1) // vae.downscale_index_formula[0] + 1
+                if latent is not None:
+                    empty = dict(latent)
+                    sm = empty["samples"]
+                    if getattr(sm, "is_nested", False):
+                        if len(chunks) > 1:
+                            raise ValueError(
+                                "chunked sampling with an AV (nested) latent is not supported yet: "
+                                "set temporal_tile_size to 0, or feed a video-only latent")
+                    elif sm.shape[2] != lat_t:
+                        empty["samples"] = sm[:, :, :lat_t]
                 else:
-                    latent["samples"] = g_lat.to(base.device, base.dtype)
+                    # last resort: a plain video latent. On LTX-2.5 the real thing is an
+                    # AV (video+audio) latent, so connect EmptyLTXVLatentVideo instead.
+                    log.warning("no latent connected: building a plain video latent, "
+                                "which is wrong for AV models like LTX-2.5")
+                    empty = {"samples": torch.zeros(
+                        [1, 128, lat_t, lat_h, lat_w],
+                        device=comfy.model_management.intermediate_device())}
                 if debug_log:
-                    print(f"[BFS HeadSwap] inpaint: latent seeded from the guide "
-                          f"{tuple(g_lat.shape)}")
-                src_mask = masks[a:b]
-                if mask_hard_for_inpaint:
-                    # hard for the sampler, soft only for compositing
-                    src_mask = (src_mask > 0.5).float()
-                nm = _mask_to_latent(
-                    src_mask, vae, latent["samples"].shape[2], lat_h, lat_w)
-                nm = _dilate_latent(nm, latent_mask_dilate, latent_mask_dilate_frames)
-                if mask_strength < 1.0:
-                    nm = nm * float(mask_strength)
-                latent["noise_mask"] = nm.to(latent["samples"].device)
+                    _s = empty["samples"]
+                    print(f"[BFS HeadSwap] chunk {idx}: guide {tuple(g.shape)} -> latent "
+                          f"{'nested AV' if getattr(_s,'is_nested',False) else tuple(_s.shape)}")
 
-            # CRITICAL: _sample_chunk samples through guider.model_patcher, so the
-            # patched clone from LTXMultipleControls has to replace it. Without the
-            # swap the reference specs live in transformer_options the forward never
-            # reads, and guide + identity are silently inert -- it samples happily
-            # and ignores both. _set_guider_conds does the conds and the swap.
-            gd = _Loop._set_guider_conds(guider, p, n, model_patcher=m)
-            _inject_transformer_options(gd, m, debug=debug_log)
-            chunk = _Loop._sample_chunk(m, noise, sampler, sigmas, gd, latent, seed_offset=idx)
-            out_latents.append(chunk["samples"])
+                m, p, n, latent, _dbg = mc.apply(
+                    model, positive, negative, vae, empty,
+                    guide_video=g, guide_source_id=guide_source_id,
+                    identity_image=identity_image, identity_source_id=identity_source_id,
+                    auto_mask_guide=False, debug_log=debug_log,
+                )
+
+                if inpaint_with_mask and masks is not None:
+                    latent = dict(latent)
+                    # Inpainting keeps the INITIAL latent outside the mask, so it has to be
+                    # the guide -- not the empty latent, which would leave grey where the
+                    # video should be. This is the encode a normal inpaint graph does before
+                    # Set Latent Noise Mask.
+                    g_lat = vae.encode(g)
+                    base = latent["samples"]
+                    if getattr(base, "is_nested", False):
+                        # keep the audio stream from the connected AV latent, swap the video
+                        import comfy.nested_tensor
+                        streams = list(base.tensors) if hasattr(base, "tensors") else list(base.unbind())
+                        streams[0] = g_lat.to(streams[0].device, streams[0].dtype)
+                        latent["samples"] = comfy.nested_tensor.NestedTensor(tuple(streams))
+                    else:
+                        latent["samples"] = g_lat.to(base.device, base.dtype)
+                    if debug_log:
+                        print(f"[BFS HeadSwap] inpaint: latent seeded from the guide "
+                              f"{tuple(g_lat.shape)}")
+                    src_mask = masks[a:b]
+                    if mask_hard_for_inpaint:
+                        # hard for the sampler, soft only for compositing
+                        src_mask = (src_mask > 0.5).float()
+                    nm = _mask_to_latent(
+                        src_mask, vae, latent["samples"].shape[2], lat_h, lat_w)
+                    nm = _dilate_latent(nm, latent_mask_dilate, latent_mask_dilate_frames)
+                    if mask_strength < 1.0:
+                        nm = nm * float(mask_strength)
+                    latent["noise_mask"] = nm.to(latent["samples"].device)
+
+                # CRITICAL: _sample_chunk samples through guider.model_patcher, so the
+                # patched clone from LTXMultipleControls has to replace it. Without the
+                # swap the reference specs live in transformer_options the forward never
+                # reads, and guide + identity are silently inert -- it samples happily
+                # and ignores both. _set_guider_conds does the conds and the swap.
+                gd = _Loop._set_guider_conds(guider, p, n, model_patcher=m)
+                injections.append(_inject_transformer_options(gd, m, debug=debug_log))
+                chunk = _Loop._sample_chunk(m, noise, sampler, sigmas, gd, latent, seed_offset=idx)
+                got = chunk["samples"]
+                if len(chunks) > 1 and not getattr(got, "is_nested", False):
+                    # a long clip is many chunks: holding them all on the sampling
+                    # device grows VRAM with the clip while the model is still loaded
+                    got = got.to(comfy.model_management.intermediate_device())
+                out_latents.append(got)
+
+        finally:
+            # hand the guider back the way it was found, whatever happened above:
+            # an exception here is exactly the case that would poison the next run
+            for inj in injections:
+                inj.undo()
 
         samples = out_latents[0] if len(out_latents) == 1 else torch.cat(out_latents, dim=2)
         video = samples
