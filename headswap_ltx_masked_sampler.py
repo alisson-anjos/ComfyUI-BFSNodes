@@ -758,11 +758,14 @@ class BFSHeadSwapMaskedSampler:
                     g_lat = vae.encode(g)
                     base = latent["samples"]
                     if getattr(base, "is_nested", False):
-                        # keep the audio stream from the connected AV latent, swap the video
-                        import comfy.nested_tensor
+                        # keep the audio stream from the connected AV latent, swap the video.
+                        # Bound to its own name on purpose: `import comfy.nested_tensor`
+                        # here would make `comfy` a LOCAL of this whole function, and
+                        # every other comfy.* use in it would raise UnboundLocalError.
+                        from comfy import nested_tensor as _nested
                         streams = list(base.tensors) if hasattr(base, "tensors") else list(base.unbind())
                         streams[0] = g_lat.to(streams[0].device, streams[0].dtype)
-                        latent["samples"] = comfy.nested_tensor.NestedTensor(tuple(streams))
+                        latent["samples"] = _nested.NestedTensor(tuple(streams))
                     else:
                         latent["samples"] = g_lat.to(base.device, base.dtype)
                     if debug_log:

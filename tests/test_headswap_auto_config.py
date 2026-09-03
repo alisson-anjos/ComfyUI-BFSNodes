@@ -249,6 +249,18 @@ class PasteBackWithoutCropTest(unittest.TestCase):
         self.assertEqual(out.shape, self.original.shape)
 
 
+class NoShadowedModulesTest(unittest.TestCase):
+    """`import comfy.x` inside a function binds `comfy` as a LOCAL for the whole
+    function, so every earlier comfy.* use in it raises UnboundLocalError. It
+    shipped in 1.37.0 and only fired on multi-chunk clips, where the offload
+    line runs and the nested-latent import never had."""
+
+    def test_execute_does_not_shadow_the_comfy_module(self):
+        for cls in (NODE.BFSHeadSwapMaskedSampler, NODE.BFSHeadSwapPasteBack):
+            self.assertNotIn("comfy", cls.execute.__code__.co_varnames,
+                             f"{cls.__name__}.execute binds `comfy` locally")
+
+
 class WidgetOrderTest(unittest.TestCase):
     """ComfyUI stores widgets_values POSITIONALLY.
 
