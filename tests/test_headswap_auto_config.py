@@ -183,6 +183,66 @@ class DirectionalGrowTest(unittest.TestCase):
         self.assertTrue(torch.equal(NODE._grow_blur(m, (0, 0, 0, 0), 0), m))
 
 
+class GenericIcLoraTest(unittest.TestCase):
+    """The node is not head-swap specific: a LoRA that works from the guide
+    alone must be able to run with the reference slot empty."""
+
+    def test_identity_image_is_optional(self):
+        types = NODE.BFSHeadSwapMaskedSampler.INPUT_TYPES()
+        self.assertNotIn("identity_image", types["required"])
+        self.assertIn("identity_image", types["optional"])
+
+    def test_execute_defaults_it_to_none(self):
+        import inspect
+        sig = inspect.signature(NODE.BFSHeadSwapMaskedSampler.execute)
+        self.assertIsNone(sig.parameters["identity_image"].default)
+
+    def test_the_guide_is_still_required(self):
+        self.assertIn("guide_video", NODE.BFSHeadSwapMaskedSampler.INPUT_TYPES()["required"])
+
+    def test_registration_keys_are_unchanged(self):
+        # saved workflows reference these, the display name is free to change
+        self.assertIn("BFSHeadSwapMaskedSampler", NODE.NODE_CLASS_MAPPINGS)
+        self.assertIn("BFSHeadSwapPasteBack", NODE.NODE_CLASS_MAPPINGS)
+
+    def test_the_display_name_no_longer_claims_head_swap(self):
+        for name in NODE.NODE_DISPLAY_NAME_MAPPINGS.values():
+            self.assertNotIn("Head Swap", name)
+
+
+class WidgetOrderTest(unittest.TestCase):
+    """ComfyUI stores widgets_values POSITIONALLY.
+
+    A widget added anywhere but the end shifts every later value in every saved
+    workflow — 1.37.0 inserted two before crop_mode and existing graphs failed
+    validation with "input out of range" on crop_scale and crop_divisible_by.
+    This pins the historical order; new widgets go after it, never inside it.
+    """
+
+    HISTORICAL = [
+        "crop_mode", "crop_scale", "crop_divisible_by", "uncrop_feather",
+        "paste_back", "paste_confine_to_mask", "inpaint_with_mask", "mask_grow",
+        "mask_blur", "mask_hard_for_inpaint", "latent_mask_dilate",
+        "latent_mask_dilate_frames", "mask_strength", "decode",
+        "decode_tile_size", "decode_overlap", "decode_temporal_size",
+        "decode_temporal_overlap", "temporal_tile_size", "temporal_overlap",
+        "guide_source_id", "identity_source_id", "debug_log",
+    ]
+
+    @staticmethod
+    def widgets():
+        opt = NODE.BFSHeadSwapMaskedSampler.INPUT_TYPES()["optional"]
+        kinds = ("BOOLEAN", "INT", "FLOAT", "STRING")
+        return [k for k, v in opt.items() if isinstance(v[0], list) or v[0] in kinds]
+
+    def test_the_historical_widgets_keep_their_positions(self):
+        self.assertEqual(self.widgets()[: len(self.HISTORICAL)], self.HISTORICAL)
+
+    def test_new_widgets_are_appended_after_them(self):
+        self.assertEqual(self.widgets()[len(self.HISTORICAL):],
+                         ["auto_config", "identity_headroom"])
+
+
 class WiringTest(unittest.TestCase):
     def test_the_widget_exists_and_defaults_to_off(self):
         opt = NODE.BFSHeadSwapMaskedSampler.INPUT_TYPES()["optional"]

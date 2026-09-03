@@ -78,7 +78,7 @@ try:
     from .headswap_ltx_masked_sampler import NODE_CLASS_MAPPINGS as HSMS_NODE_CLASS_MAPPINGS
     from .headswap_ltx_masked_sampler import NODE_DISPLAY_NAME_MAPPINGS as HSMS_NODE_DISPLAY_NAME_MAPPINGS
 except Exception as _e:  # noqa
-    print(f"[BFSNodes] Head Swap masked sampler not loaded: {_e!r}")
+    print(f"[BFSNodes] BFS Sampler not loaded: {_e!r}")
     HSMS_NODE_CLASS_MAPPINGS, HSMS_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 
 NODE_CLASS_MAPPINGS = {

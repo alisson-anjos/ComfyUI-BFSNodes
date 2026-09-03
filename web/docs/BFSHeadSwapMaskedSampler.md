@@ -1,15 +1,21 @@
-# BFS Head Swap Sampler (crop · mask · loop)
+# BFS Sampler (crop · mask · loop)
 
-Runs an LTX head-swap LoRA and adds three things around it, each optional.
+Runs a guide-driven LTX IC-LoRA and adds three things around it, each optional.
 Connect only what you need — the node degrades to whatever is wired.
 
 | what you connect | what you get |
 |---|---|
-| `guide_video` + `identity_image` | plain head swap, one pass |
+| `guide_video` | the LoRA over the whole clip, one pass |
+| `+ identity_image` | for a LoRA that takes a reference (head swap, identity transfer) |
 | `+ subject_mask` | only the masked region is denoised |
-| `+ crop_mode` | the swap runs inside a box around the subject, then is pasted back |
+| `+ crop_mode` | the edit runs inside a box around the subject, then is pasted back |
 | `+ temporal_tile_size` | long clips sampled in chunks with overlap |
 | `+ auto_config` | crop, mask and feather amounts measured off the subject itself |
+
+`identity_image` is optional as of 1.38.0. A head-swap LoRA wants one; an
+instruction-edit, restyle or sharpening LoRA works from the guide alone, and
+with the slot empty it is simply not packed — the guide becomes the only
+reference. Everything else in the node is indifferent to which kind it is.
 
 The LoRA is never asked to understand a mask or a crop. It keeps doing its one
 job: the guide rides on `source_id 1`, the identity on `source_id 2`. Everything

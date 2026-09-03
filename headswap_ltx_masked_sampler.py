@@ -2,7 +2,9 @@
 
 Everything is optional, so the node degrades to whatever you connect:
 
-    guide_video + identity_image                  -> plain head swap, one pass
+    guide_video                                   -> the LoRA over the whole clip, one pass
+    + identity_image                              -> for a LoRA that takes a reference
+                                                     (head swap, identity transfer)
     + subject_mask                                -> native inpainting: only the
                                                      masked region is denoised
     + crop_mode                                   -> the swap runs inside a stable
@@ -395,9 +397,13 @@ class BFSHeadSwapMaskedSampler:
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "guide_video": ("IMAGE", {"tooltip": "Source clip: body, motion, camera, scene. Output geometry follows it."}),
-                "identity_image": ("IMAGE", {"tooltip": "Head/face reference. Crop to the head."}),
             },
             "optional": {
+                "identity_image": ("IMAGE", {"tooltip":
+                    "Reference image for the LoRA that wants one — a head crop for a head swap, "
+                    "a subject for identity transfer. Leave it unconnected for any IC-LoRA that "
+                    "works from the guide alone (an instruction edit, a sharpener, a restyler): "
+                    "the slot is simply not packed and the guide is the only reference."}),
                 "latent": ("LATENT", {"tooltip":
                     "Empty latent from EmptyLTXVLatentVideo, sized to the CROP when cropping is on. "
                     "Strongly recommended: LTX-2.5 latents are AV (video+audio) and this node cannot "
@@ -406,23 +412,6 @@ class BFSHeadSwapMaskedSampler:
                 "subject_mask": ("MASK", {"tooltip":
                     "Per-frame mask of the region to edit (head, with margin). Drives the crop box and, "
                     "with inpaint_with_mask on, restricts denoising to it. Leave unconnected for a plain swap."}),
-
-                "auto_config": ("BOOLEAN", {"default": False, "tooltip":
-                    "Measure the subject in the mask and set crop mode, crop scale, mask grow "
-                    "and blur, paste feather and latent dilation from its size -- ignoring those "
-                    "widgets. Needs subject_mask. Every amount below is in pixels, which only "
-                    "means something relative to how big the head is in frame: the same 8 px is "
-                    "generous on a distant head and invisible on a close one, and that mismatch "
-                    "is what leaves a seam. The debug output prints what it chose."}),
-
-                "identity_headroom": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05,
-                    "tooltip":
-                    "auto_config only. How much bigger the reference head may be than the head in "
-                    "the guide. The mask is the OLD head, so a wider face or more hair lands "
-                    "outside it and gets clipped -- the seam. The reference's PROPORTIONS are "
-                    "measured from identity_image against the mask; its absolute size cannot be, "
-                    "because a cropped head carries no scale. Raise it for big hair or a visibly "
-                    "larger head; 1.0 assumes the two heads match."}),
 
                 "crop_mode": (["off", "combined", "tracked", "zoomed"], {"default": "off", "tooltip":
                     "Sample inside a box around the subject instead of the whole frame -- the fix for faces "
@@ -496,14 +485,38 @@ class BFSHeadSwapMaskedSampler:
                 "guide_source_id": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 1.0}),
                 "identity_source_id": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 8.0, "step": 1.0}),
                 "debug_log": ("BOOLEAN", {"default": False}),
+
+                # ── appended, never inserted ──────────────────────────────────
+                # ComfyUI stores widgets_values positionally, so a widget added
+                # anywhere but the end shifts every later value in every saved
+                # workflow: crop_mode lands in this slot, crop_scale in the next,
+                # and the graph fails validation with "input out of range".
+                "auto_config": ("BOOLEAN", {"default": False, "tooltip":
+                    "Measure the subject in the mask and set crop mode, crop scale, mask grow "
+                    "and blur, paste feather and latent dilation from its size -- ignoring those "
+                    "widgets. Needs subject_mask. Every amount below is in pixels, which only "
+                    "means something relative to how big the head is in frame: the same 8 px is "
+                    "generous on a distant head and invisible on a close one, and that mismatch "
+                    "is what leaves a seam. The debug output prints what it chose."}),
+
+                "identity_headroom": ("FLOAT", {"default": 1.15, "min": 1.0, "max": 2.0, "step": 0.05,
+                    "tooltip":
+                    "auto_config only. How much bigger the reference head may be than the head in "
+                    "the guide. The mask is the OLD head, so a wider face or more hair lands "
+                    "outside it and gets clipped -- the seam. The reference's PROPORTIONS are "
+                    "measured from identity_image against the mask; its absolute size cannot be, "
+                    "because a cropped head carries no scale. Raise it for big hair or a visibly "
+                    "larger head; 1.0 assumes the two heads match."}),
             },
         }
 
-    DESCRIPTION = ("Head swap with an optional stable crop around the subject, native mask "
-                   "inpainting and temporal chunking. Connect only what you need: guide + identity "
-                   "is a plain swap; add a mask to restrict the edit; add a crop mode to sample the "
-                   "subject full-frame when the face is too small to carry identity. auto_config "
-                   "measures the subject in the mask and derives every pixel amount from its size.")
+    DESCRIPTION = ("Sampler for guide-driven IC-LoRAs, with an optional stable crop around the "
+                   "subject, native mask inpainting and temporal chunking. Connect only what you "
+                   "need: a guide alone runs the LoRA over the whole clip; add an identity image "
+                   "for a LoRA that takes one; add a mask to restrict the edit; add a crop mode to "
+                   "sample the subject full-frame when it is too small to carry detail. "
+                   "auto_config measures the subject in the mask and derives every pixel amount "
+                   "from its size.")
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK", "MASK", "LATENT", "BOUNDING_BOX", "STRING")
     RETURN_NAMES = ("images", "mask_over_source", "cropped_guide", "crop_mask",
                     "latent_mask", "latent", "crop_bboxes", "debug")
@@ -608,7 +621,7 @@ class BFSHeadSwapMaskedSampler:
     # -- entry point --------------------------------------------------------
 
     def execute(self, model, vae, noise, sampler, sigmas, guider, positive, negative,
-                guide_video, identity_image, latent=None, subject_mask=None,
+                guide_video, identity_image=None, latent=None, subject_mask=None,
                 auto_config=False, identity_headroom=1.15,
                 crop_mode="off", crop_scale=1.5, crop_divisible_by=32, uncrop_feather=16,
                 inpaint_with_mask=True, mask_grow=8, mask_blur=4,
@@ -896,6 +909,6 @@ NODE_CLASS_MAPPINGS = {
     "BFSHeadSwapPasteBack": BFSHeadSwapPasteBack,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BFSHeadSwapMaskedSampler": "BFS Head Swap Sampler (crop · mask · loop)",
-    "BFSHeadSwapPasteBack": "BFS Head Swap Paste Back",
+    "BFSHeadSwapMaskedSampler": "BFS Sampler (crop · mask · loop)",
+    "BFSHeadSwapPasteBack": "BFS Paste Back",
 }
