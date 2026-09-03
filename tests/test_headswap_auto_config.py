@@ -249,6 +249,42 @@ class PasteBackWithoutCropTest(unittest.TestCase):
         self.assertEqual(out.shape, self.original.shape)
 
 
+class ChunkOverlapTest(unittest.TestCase):
+    """Chunks are sampled with an overlap for continuity. Concatenating them
+    whole made the clip longer than it is, so every frame after the first seam
+    landed on the wrong moment -- and, with per-frame crop boxes, in the wrong
+    box. 97 frames at tile 72 / overlap 16 produced 15 latent frames where the
+    clip has 13."""
+
+    @staticmethod
+    def run_chunks(lat_per_chunk, total):
+        produced, out = 0, []
+        for t in lat_per_chunk:
+            got, produced = NODE._keep_new_frames(torch.zeros(1, 4, t, 2, 2), produced, total)
+            out.append(got)
+        return torch.cat(out, dim=2)
+
+    def test_the_concatenation_is_exactly_the_clip(self):
+        self.assertEqual(self.run_chunks([9, 6], 13).shape[2], 13)
+
+    def test_it_keeps_each_chunk_s_tail_not_its_head(self):
+        a = torch.zeros(1, 4, 9, 2, 2)
+        b = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1, 1).expand(1, 4, 6, 2, 2).clone()
+        _, produced = NODE._keep_new_frames(a, 0, 13)
+        kept, _ = NODE._keep_new_frames(b, produced, 13)
+        self.assertEqual(kept.shape[2], 4)
+        self.assertEqual(kept[0, 0, 0, 0, 0].item(), 2.0)   # frames 2..5, the new tail
+
+    def test_a_single_chunk_is_untouched(self):
+        got, produced = NODE._keep_new_frames(torch.zeros(1, 4, 13, 2, 2), 0, 13)
+        self.assertEqual(got.shape[2], 13)
+        self.assertEqual(produced, 13)
+
+    def test_it_never_returns_more_than_is_left(self):
+        got, _ = NODE._keep_new_frames(torch.zeros(1, 4, 9, 2, 2), 12, 13)
+        self.assertEqual(got.shape[2], 1)
+
+
 class NoShadowedModulesTest(unittest.TestCase):
     """`import comfy.x` inside a function binds `comfy` as a LOCAL for the whole
     function, so every earlier comfy.* use in it raises UnboundLocalError. It

@@ -325,6 +325,22 @@ def _mask_to_latent(masks, vae, latent_t, latent_h, latent_w):
 # node
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _keep_new_frames(samples, produced, total):
+    """Drop the head a chunk shares with the one before it.
+
+    Chunks are sampled with an overlap for continuity, so consecutive chunks
+    cover some of the same frames. Concatenating them whole makes the clip
+    longer than it is and every frame after the first seam lands on the wrong
+    moment -- and, with per-frame crop boxes, in the wrong box. Keeping only
+    what each chunk adds makes the concatenation exactly `total` frames.
+    """
+    have = samples.shape[2]
+    new = max(0, min(have, total - produced))
+    if new < have:
+        samples = samples[:, :, have - new:]
+    return samples, produced + samples.shape[2]
+
+
 def _inject_transformer_options(guider, model_patcher, debug=False):
     """Copy the patched model's transformer_options INTO the guider's own dict.
 
@@ -715,6 +731,7 @@ class BFSHeadSwapMaskedSampler:
         mc = LTXMultipleControls()
         out_latents = []
         injections = []
+        produced = 0
         try:
             for idx, (a, b) in enumerate(chunks):
                 g = guide[a:b]
@@ -792,6 +809,7 @@ class BFSHeadSwapMaskedSampler:
                 chunk = _Loop._sample_chunk(m, noise, sampler, sigmas, gd, latent, seed_offset=idx)
                 got = chunk["samples"]
                 if len(chunks) > 1 and not getattr(got, "is_nested", False):
+                    got, produced = _keep_new_frames(got, produced, lat_t_total)
                     # a long clip is many chunks: holding them all on the sampling
                     # device grows VRAM with the clip while the model is still loaded
                     got = got.to(comfy.model_management.intermediate_device())
