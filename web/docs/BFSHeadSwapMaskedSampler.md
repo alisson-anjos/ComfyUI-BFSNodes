@@ -199,6 +199,31 @@ crop is a framing the LoRA never saw in training, and it will show.
 
 ## Sizing, which is the one fiddly part
 
+**Use BFS Crop Size and this stops being fiddly.** It runs the same planner on
+the same mask before anything is sampled and hands back the width and height to
+build `EmptyLTXVLatentVideo` at:
+
+```
+subject_mask ──┬─→ BFS Crop Size ──→ width / height ──→ EmptyLTXVLatentVideo ──┐
+               │                                                               │
+               └───────────────────────────────────────────→ BFS Sampler ←─────┘
+```
+
+Keep its three crop widgets identical to the sampler's — the planner is
+deterministic, so equal inputs give the same box, and a mismatch means the
+sampler silently resizes the crop into a latent that does not fit it.
+
+That resize is worth naming, because it does not look like a sizing problem when
+it happens. A mask around a face in a 1920x1080 frame gives a portrait box —
+512x672, say. Sampling it into a 768x512 landscape latent stretches the crop
+horizontally, and the paste-back then squeezes the result back into the portrait
+box. The face comes out visibly deformed, and with `crop_mode: zoomed` the
+amount of deformation changes from frame to frame.
+
+### Doing it by hand
+
+
+
 The connected `latent` sets the sampled size. When you crop, the box is smaller
 than the frame, so the latent should match the box — the `debug` output prints
 the size to use:

@@ -341,6 +341,20 @@ def _keep_new_frames(samples, produced, total):
     return samples, produced + samples.shape[2]
 
 
+def _boxes_per_frame(crop_ctx, n_frames):
+    """One box per frame, whatever the crop mode produced.
+
+    The planner already returns per-frame boxes; a static box is repeated so the
+    paste-back sees the same shape either way and never has to branch.
+    """
+    if crop_ctx is None:
+        return []
+    if crop_ctx[0] == "static":
+        x0, y0, w, h = crop_ctx[1]
+        return [[{"x": x0, "y": y0, "width": w, "height": h}]] * n_frames
+    return crop_ctx[1]
+
+
 def _inject_transformer_options(guider, model_patcher, debug=False):
     """Copy the patched model's transformer_options INTO the guider's own dict.
 
@@ -896,10 +910,7 @@ class BFSHeadSwapMaskedSampler:
         debug = " | ".join(notes)
         if debug_log:
             print("[BFS Head Swap Masked Sampler]", debug)
-        boxes_out = crop_ctx[1] if crop_ctx is not None else []
-        if crop_ctx is not None and crop_ctx[0] == "static":
-            x0, y0, w, h = crop_ctx[1]
-            boxes_out = [[{"x": x0, "y": y0, "width": w, "height": h}]] * guide_video.shape[0]
+        boxes_out = _boxes_per_frame(crop_ctx, guide_video.shape[0])
         return (final, overlay, guide, crop_mask_out, latent_mask_out,
                 {"samples": samples}, boxes_out, debug)
 
@@ -944,11 +955,67 @@ class BFSHeadSwapPasteBack:
             cropped_images, original_images, ("planned", crop_bboxes), feather, confine_mask),)
 
 
+
+class BFSCropSize:
+    """The crop's size, before anything is sampled.
+
+    The sampler derives its box from the mask, so the size to build the empty
+    latent at is only knowable after a run -- which meant sampling a whole clip
+    to read one number off the debug string, and doing it again after every
+    change to the mask or the crop. This runs the same planner on the same
+    inputs and hands the number over up front.
+
+    Feed `width` and `height` straight into EmptyLTXVLatentVideo. Keep these
+    three widgets identical to the sampler's: the planner is deterministic, so
+    equal inputs give the same box, and a mismatch here means the sampler
+    silently resizes the crop to a latent that does not fit it.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "guide_video": ("IMAGE", {"tooltip": "The same clip you feed the sampler."}),
+                "subject_mask": ("MASK", {"tooltip": "The same mask you feed the sampler."}),
+                "crop_mode": (["combined", "tracked", "zoomed"], {"default": "tracked"}),
+                "crop_scale": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0, "step": 0.05}),
+                "crop_divisible_by": ("INT", {"default": 32, "min": 8, "max": 128, "step": 8}),
+            },
+        }
+
+    DESCRIPTION = ("The size the sampler will crop to, computed from the mask before sampling, "
+                   "so EmptyLTXVLatentVideo can be built at exactly that size instead of being "
+                   "guessed and silently resized. Keep the three crop widgets identical to the "
+                   "sampler's.")
+    RETURN_TYPES = ("INT", "INT", "BOUNDING_BOX", "STRING")
+    RETURN_NAMES = ("width", "height", "crop_bboxes", "info")
+    OUTPUT_TOOLTIPS = (
+        "Crop width -- into EmptyLTXVLatentVideo's width.",
+        "Crop height -- into EmptyLTXVLatentVideo's height.",
+        "One box per frame, the same the sampler will use. Feeds BFS Paste Back.",
+        "What the planner decided, for a PreviewAny.",
+    )
+    FUNCTION = "execute"
+    CATEGORY = CATEGORY
+
+    def execute(self, guide_video, subject_mask, crop_mode, crop_scale, crop_divisible_by):
+        masks = subject_mask.squeeze(-1) if subject_mask.ndim == 4 else subject_mask
+        cropped, _cm, ctx, note = BFSHeadSwapMaskedSampler()._crop(
+            guide_video, masks, crop_mode, crop_scale, crop_divisible_by)
+        h, w = int(cropped.shape[1]), int(cropped.shape[2])
+        boxes = _boxes_per_frame(ctx, guide_video.shape[0])
+        info = (f"{note} | sample size {w}x{h} "
+                f"(build EmptyLTXVLatentVideo at this size) | {len(boxes)} box(es)")
+        return (w, h, boxes, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "BFSHeadSwapMaskedSampler": BFSHeadSwapMaskedSampler,
     "BFSHeadSwapPasteBack": BFSHeadSwapPasteBack,
+    "BFSCropSize": BFSCropSize,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BFSHeadSwapMaskedSampler": "BFS Sampler (crop · mask · loop)",
     "BFSHeadSwapPasteBack": "BFS Paste Back",
+    "BFSCropSize": "BFS Crop Size",
 }

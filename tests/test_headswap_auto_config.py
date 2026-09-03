@@ -285,6 +285,48 @@ class ChunkOverlapTest(unittest.TestCase):
         self.assertEqual(got.shape[2], 1)
 
 
+class CropSizeTest(unittest.TestCase):
+    """The size to build the empty latent at, known before sampling instead of
+    read off the debug string after a whole pass."""
+
+    def setUp(self):
+        self.video = torch.zeros(6, 256, 512, 3)
+        self.mask = torch.zeros(6, 256, 512)
+        self.mask[:, 60:160, 200:280] = 1.0          # 80x100, portrait
+
+    def size(self, mode="combined", scale=1.5, div=32):
+        w, h, boxes, info = NODE.BFSCropSize().execute(
+            self.video, self.mask, mode, scale, div)
+        return w, h, boxes, info
+
+    def test_it_reports_the_size_the_sampler_would_crop_to(self):
+        w, h, _, _ = self.size()
+        cropped, _, _, _ = NODE.BFSHeadSwapMaskedSampler()._crop(
+            self.video, self.mask, "combined", 1.5, 32)
+        self.assertEqual((w, h), (cropped.shape[2], cropped.shape[1]))
+
+    def test_the_size_is_divisible_by_the_grid(self):
+        for div in (8, 32, 64):
+            w, h, _, _ = self.size(div=div)
+            self.assertEqual((w % div, h % div), (0, 0))
+
+    def test_it_follows_the_subject_s_aspect_not_the_frame_s(self):
+        w, h, _, _ = self.size()
+        self.assertLess(w, h)                        # the mask is portrait
+
+    def test_one_box_per_frame(self):
+        _, _, boxes, _ = self.size()
+        self.assertEqual(len(boxes), self.video.shape[0])
+
+    def test_the_info_names_the_size(self):
+        w, h, _, info = self.size()
+        self.assertIn(f"{w}x{h}", info)
+
+    def test_it_is_registered(self):
+        self.assertIn("BFSCropSize", NODE.NODE_CLASS_MAPPINGS)
+        self.assertEqual(NODE.NODE_DISPLAY_NAME_MAPPINGS["BFSCropSize"], "BFS Crop Size")
+
+
 class NoShadowedModulesTest(unittest.TestCase):
     """`import comfy.x` inside a function binds `comfy` as a LOCAL for the whole
     function, so every earlier comfy.* use in it raises UnboundLocalError. It
