@@ -199,9 +199,23 @@ crop is a framing the LoRA never saw in training, and it will show.
 
 ## Sizing, which is the one fiddly part
 
-**Use BFS Crop Size and this stops being fiddly.** It runs the same planner on
-the same mask before anything is sampled and hands back the width and height to
-build `EmptyLTXVLatentVideo` at:
+**Since 1.41.0 the node handles it.** The crop's size comes from the mask, so an
+upstream `EmptyLTXVLatentVideo` cannot know it — the sampler now rebuilds the
+latent's video stream at the crop's shape when they disagree, keeping the audio
+stream, and says so in `debug`:
+
+```
+latent rebuilt 768x512 -> 512x672 to match the crop
+```
+
+Nothing is lost by rebuilding: at denoise 1.0 the initial latent contributes
+nothing, and the inpainting path overwrites the video stream with the encoded
+guide anyway. Size the latent however you like; it is the guide and the mask
+that decide.
+
+**BFS Crop Size** is still there for when you want the number, or the per-frame
+boxes, upstream of the sampler — building the latent at the right size skips the
+rebuild, and the boxes feed BFS Paste Back directly:
 
 ```
 subject_mask ──┬─→ BFS Crop Size ──→ width / height ──→ EmptyLTXVLatentVideo ──┐

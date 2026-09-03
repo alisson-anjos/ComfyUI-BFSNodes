@@ -285,6 +285,49 @@ class ChunkOverlapTest(unittest.TestCase):
         self.assertEqual(got.shape[2], 1)
 
 
+class FitLatentToCropTest(unittest.TestCase):
+    """The crop's size comes from the mask, so an upstream empty latent cannot
+    know it. A mismatch was silent: the model sampled at the latent's shape and
+    the paste-back squeezed the result into the box, deforming it."""
+
+    def test_a_mismatched_latent_is_rebuilt_to_the_crop(self):
+        sm = torch.zeros(1, 128, 13, 16, 24)                  # landscape
+        fitted, was = NODE._fit_latent_to_crop(sm, 13, 21, 16)  # crop is portrait
+        self.assertEqual(tuple(fitted.shape[2:]), (13, 21, 16))
+        self.assertEqual(was, (13, 16, 24))
+
+    def test_a_matching_latent_is_left_alone(self):
+        sm = torch.zeros(1, 128, 13, 21, 16)
+        fitted, was = NODE._fit_latent_to_crop(sm, 13, 21, 16)
+        self.assertIsNone(fitted)
+        self.assertIsNone(was)
+
+    def test_the_time_axis_is_taken_from_the_chunk(self):
+        sm = torch.zeros(1, 128, 13, 21, 16)
+        fitted, _ = NODE._fit_latent_to_crop(sm, 9, 21, 16)
+        self.assertEqual(fitted.shape[2], 9)
+
+    def test_dtype_and_device_survive(self):
+        sm = torch.zeros(1, 128, 13, 16, 24, dtype=torch.float16)
+        fitted, _ = NODE._fit_latent_to_crop(sm, 13, 21, 16)
+        self.assertEqual(fitted.dtype, torch.float16)
+
+    def test_an_av_latent_keeps_its_audio_stream(self):
+        class _Nested:
+            is_nested = True
+            def __init__(self, tensors): self.tensors = tuple(tensors)
+        mod = types.ModuleType("comfy.nested_tensor")
+        mod.NestedTensor = _Nested
+        sys.modules["comfy.nested_tensor"] = mod
+        sys.modules["comfy"].nested_tensor = mod
+
+        audio = torch.arange(6, dtype=torch.float32).view(1, 2, 3)
+        av = _Nested([torch.zeros(1, 128, 13, 16, 24), audio])
+        fitted, was = NODE._fit_latent_to_crop(av, 13, 21, 16)
+        self.assertEqual(tuple(fitted.tensors[0].shape[2:]), (13, 21, 16))
+        self.assertTrue(torch.equal(fitted.tensors[1], audio))
+
+
 class CropSizeTest(unittest.TestCase):
     """The size to build the empty latent at, known before sampling instead of
     read off the debug string after a whole pass."""
