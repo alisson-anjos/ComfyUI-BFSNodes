@@ -20,6 +20,15 @@ ROOT = Path(__file__).resolve().parents[1]
 for name in ("comfy", "comfy.model_management", "comfy.utils"):
     sys.modules.setdefault(name, types.ModuleType(name))
 
+# the module reaches comfy.utils.common_upscale as an attribute, so the stub has
+# to be attached to the package, not just registered in sys.modules
+def _common_upscale(samples, width, height, upscale_method, crop):
+    return torch.nn.functional.interpolate(samples, size=(height, width), mode="bilinear")
+
+sys.modules["comfy.utils"].common_upscale = _common_upscale
+sys.modules["comfy"].utils = sys.modules["comfy.utils"]
+sys.modules["comfy"].model_management = sys.modules["comfy.model_management"]
+
 SPEC = importlib.util.spec_from_file_location(
     "headswap_ltx_masked_sampler", ROOT / "headswap_ltx_masked_sampler.py")
 assert SPEC is not None and SPEC.loader is not None
@@ -208,6 +217,36 @@ class GenericIcLoraTest(unittest.TestCase):
     def test_the_display_name_no_longer_claims_head_swap(self):
         for name in NODE.NODE_DISPLAY_NAME_MAPPINGS.values():
             self.assertNotIn("Head Swap", name)
+
+
+class PasteBackWithoutCropTest(unittest.TestCase):
+    """Crop off, mask on: everything the edit did not touch must stay the
+    source's own pixels, not the VAE's round trip of them."""
+
+    def setUp(self):
+        self.node = NODE.BFSHeadSwapMaskedSampler()
+        self.original = torch.zeros(3, 8, 8, 3)          # source frames
+        self.result = torch.ones(3, 8, 8, 3)             # what the sampler returned
+        self.mask = torch.zeros(3, 8, 8)
+        self.mask[:, 2:5, 2:5] = 1.0
+
+    def test_outside_the_mask_is_the_source_verbatim(self):
+        out = self.node._paste_back(self.result, self.original, None, 16, self.mask)
+        self.assertTrue(torch.equal(out[:, 0, 0], self.original[:, 0, 0]))
+        self.assertTrue(torch.equal(out[:, 7, 7], self.original[:, 7, 7]))
+
+    def test_inside_the_mask_is_the_result(self):
+        out = self.node._paste_back(self.result, self.original, None, 16, self.mask)
+        self.assertTrue(torch.equal(out[:, 3, 3], self.result[:, 3, 3]))
+
+    def test_without_a_mask_nothing_is_composited(self):
+        out = self.node._paste_back(self.result, self.original, None, 16, None)
+        self.assertTrue(torch.equal(out, self.result))
+
+    def test_a_result_of_another_size_is_brought_back_to_the_frame(self):
+        big = torch.ones(3, 16, 16, 3)
+        out = self.node._paste_back(big, self.original, None, 16, self.mask)
+        self.assertEqual(out.shape, self.original.shape)
 
 
 class WidgetOrderTest(unittest.TestCase):

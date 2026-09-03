@@ -432,9 +432,11 @@ class BFSHeadSwapMaskedSampler:
                     "composite at the end with the Head Swap Paste Back node, feeding it the "
                     "crop_bboxes output."}),
                 "paste_confine_to_mask": ("BOOLEAN", {"default": True, "tooltip":
-                    "Paste only inside the mask instead of the whole crop rectangle, so anything the "
-                    "model changed in the crop's background never reaches the frame. Off pastes the "
-                    "full box."}),
+                    "Composite only inside the mask, so anything the model changed outside it never "
+                    "reaches the frame. With a crop this confines the paste to the mask instead of "
+                    "the whole box; WITHOUT a crop it is what keeps the untouched pixels the "
+                    "source's own — otherwise the whole frame is the VAE's round trip of it, "
+                    "softer everywhere the edit never went. Off pastes the full frame or box."}),
 
                 "inpaint_with_mask": ("BOOLEAN", {"default": True, "tooltip":
                     "Send the mask to the sampler as a denoise mask, so only the masked region changes and "
@@ -565,7 +567,24 @@ class BFSHeadSwapMaskedSampler:
 
     def _paste_back(self, result, original, ctx, feather, confine=None):
         if ctx is None:
-            return result
+            if confine is None:
+                return result
+            # No crop, but a mask: composite the full frame through it. Without
+            # this the whole frame is whatever came out of the VAE, so every
+            # pixel the edit never touched still went through encode/decode and
+            # came back softer. Confining here keeps them the source's own.
+            out = original.clone()[: result.shape[0]]
+            patch = result[: out.shape[0]]
+            H, W = out.shape[1], out.shape[2]
+            if patch.shape[1] != H or patch.shape[2] != W:
+                patch = comfy.utils.common_upscale(
+                    patch.movedim(-1, 1), W, H, "lanczos", "disabled").movedim(1, -1)
+            cm = confine[:1] if confine.shape[0] == 1 else confine[: out.shape[0]]
+            if cm.shape[-2:] != (H, W):
+                cm = torch.nn.functional.interpolate(
+                    cm.unsqueeze(1), size=(H, W), mode="bilinear").squeeze(1)
+            a = cm.unsqueeze(-1).to(patch.device, patch.dtype)
+            return a * patch + (1 - a) * out
         kind, box = ctx
         if kind == "planned":
             # one box per frame: paste each crop into its own box

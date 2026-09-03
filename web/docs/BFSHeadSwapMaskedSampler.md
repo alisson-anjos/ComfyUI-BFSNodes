@@ -141,6 +141,37 @@ video frame, and that is the real resolution of the edit. A tight outline around
 a face can nearly vanish at that scale — and then nothing changes, no matter how
 good the LoRA is. If the mask looks thin there, raise `mask_grow`.
 
+## Applying a LoRA to one region and putting it back
+
+The shape of the thing: cut the region out as its own small clip, run the LoRA
+on it, composite it back. What makes the result honest is that the composite
+goes into the **original frames**, so every pixel outside the mask is the
+source's own — it never went through the VAE at all.
+
+```
+subject_mask            connected
+inpaint_with_mask       true     # outside the mask the latent IS the guide, not noise
+mask_hard_for_inpaint   true     # a soft DENOISE mask means partial denoising at the edge
+mask_strength           1.0      # below this the original is blended back INSIDE the mask
+paste_back              true
+paste_confine_to_mask   true     # only the mask reaches the frame
+latent_mask_dilate      0        # one cell is 32 px of extra regenerated area, per side
+mask_grow               the least that fits the new content
+mask_blur               3-5% of the subject's width — the paste's soft edge
+```
+
+Since 1.39.0 this works with `crop_mode: off` too. Before that, with no crop the
+node returned the decoded frame whole: nothing *changed* outside the mask, but
+everything had been through an encode/decode round trip and came back softer.
+Now the mask composites against the source either way, and the crop goes back to
+being purely a resolution decision.
+
+**Two passes on the region.** Set `paste_back: false` and the images and latent
+stay in the crop's own space, so you can upscale and refine there — where the
+region actually has pixels — and composite at the end with **BFS Paste Back**,
+feeding it the `crop_bboxes` output. That is the whole point of `crop_bboxes`
+being a socket.
+
 ## Why crop, and which mode
 
 At 512×288 a person filling a fifth of the frame leaves a face about 25 px tall.
