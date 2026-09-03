@@ -81,8 +81,13 @@ def _feather_ramp(h, w, feather, device, touches=(False, False, False, False)):
     return ramp[None, :, :, None]
 
 
-def _static_box(masks, images, crop_scale, divisible_by, thresh=0.1):
-    """Fallback crop: one box around the subject's whole travel, held for the clip."""
+def _static_box(masks, images, crop_scale, divisible_by, thresh=0.1, aspect=0.0):
+    """Fallback crop: one box around the subject's whole travel, held for the clip.
+
+    ``aspect`` (width/height, 0 = free) grows the short side so the box matches
+    the shape it will be resized into. Without it the crop is stretched on the
+    way in and squeezed on the way back out.
+    """
     m = masks if masks.ndim == 3 else masks.squeeze(-1)
     hits = (m > thresh).any(dim=0)
     ys, xs = torch.where(hits)
@@ -94,6 +99,11 @@ def _static_box(masks, images, crop_scale, divisible_by, thresh=0.1):
     cy, cx = (y0 + y1) / 2.0, (x0 + x1) / 2.0
     h = max(1.0, (y1 - y0) * crop_scale)
     w = max(1.0, (x1 - x0) * crop_scale)
+    if aspect and aspect > 0:
+        if w / h < aspect:
+            w = h * aspect
+        else:
+            h = w / aspect
     h = min(H, (int(h) + divisible_by - 1) // divisible_by * divisible_by)
     w = min(W, (int(w) + divisible_by - 1) // divisible_by * divisible_by)
     y0 = int(min(max(0, cy - h / 2), H - h))
@@ -355,41 +365,6 @@ def _boxes_per_frame(crop_ctx, n_frames):
     return crop_ctx[1]
 
 
-def _fit_latent_to_crop(samples, lat_t, lat_h, lat_w):
-    """Rebuild the video stream at the crop's latent shape, keeping the audio.
-
-    The crop's size comes from the mask, so it cannot be known when the empty
-    latent is built upstream -- and a latent that does not match it is not an
-    error anywhere: the model samples at the latent's shape and the paste-back
-    squeezes the result into the box. A face crop is portrait; sampled into a
-    landscape latent it comes back visibly deformed, and under crop_mode zoomed
-    the deformation changes frame to frame.
-
-    Nothing is lost by rebuilding. At denoise 1.0 the initial latent contributes
-    nothing (x = sigma*noise + (1-sigma)*latent), and the inpainting path
-    overwrites the video stream with the encoded guide anyway. Returns the
-    samples and a note, or None when they already fit.
-    """
-    def _shape_of(v):
-        return (int(v.shape[2]), int(v.shape[3]), int(v.shape[4]))
-
-    if getattr(samples, "is_nested", False):
-        streams = list(samples.tensors) if hasattr(samples, "tensors") else list(samples.unbind())
-        v = streams[0]
-        if _shape_of(v) == (lat_t, lat_h, lat_w):
-            return None, None
-        was = _shape_of(v)
-        streams[0] = torch.zeros(v.shape[0], v.shape[1], lat_t, lat_h, lat_w,
-                                 device=v.device, dtype=v.dtype)
-        from comfy import nested_tensor as _nested
-        return _nested.NestedTensor(tuple(streams)), was
-    if _shape_of(samples) == (lat_t, lat_h, lat_w):
-        return None, None
-    was = _shape_of(samples)
-    return torch.zeros(samples.shape[0], samples.shape[1], lat_t, lat_h, lat_w,
-                       device=samples.device, dtype=samples.dtype), was
-
-
 def _inject_transformer_options(guider, model_patcher, debug=False):
     """Copy the patched model's transformer_options INTO the guider's own dict.
 
@@ -608,7 +583,7 @@ class BFSHeadSwapMaskedSampler:
 
     # -- internals ----------------------------------------------------------
 
-    def _crop(self, guide, masks, mode, scale, div):
+    def _crop(self, guide, masks, mode, scale, div, aspect=0.0):
         """Returns (cropped guide, cropped masks, paste-back fn, note)."""
         if mode == "off" or masks is None:
             return guide, masks, None, "crop: off"
@@ -616,7 +591,7 @@ class BFSHeadSwapMaskedSampler:
         planner = _planner() if mode in ("tracked", "zoomed") else None
         if planner is not None:
             try:
-                p = {"crop_scale": scale, "aspect_ratio": 0.0, "padding": "firm",
+                p = {"crop_scale": scale, "aspect_ratio": float(aspect), "padding": "firm",
                      "prefer": "stillness", "seamless_loop": False,
                      "pad_surplus_tol": 16, "zoom_step": 1.0}
                 out = planner(guide, masks, mode, p, div, 0.1, 0.0)
@@ -625,7 +600,7 @@ class BFSHeadSwapMaskedSampler:
             except Exception as exc:
                 log.warning("crop planner failed (%s); using the static box", exc)
 
-        x0, y0, w, h = _static_box(masks, guide, scale, div)
+        x0, y0, w, h = _static_box(masks, guide, scale, div, aspect=aspect)
         cropped = guide[:, y0:y0 + h, x0:x0 + w, :]
         cropped_masks = masks[:, y0:y0 + h, x0:x0 + w]
         return cropped, cropped_masks, ("static", (x0, y0, w, h)), f"crop: static {w}x{h} @({x0},{y0})"
@@ -753,17 +728,31 @@ class BFSHeadSwapMaskedSampler:
                 notes.append(f"mask: grow {g}, blur {mask_blur}px, strength {mask_strength}")
 
         masks_full = masks
+        # The crop is resized into the connected latent, so the box has to share
+        # its aspect: otherwise the region is stretched on the way in and squeezed
+        # back on the way out, and under crop_mode zoomed by a different amount
+        # every frame. The latent's SIZE is left alone on purpose -- sampling a
+        # small region at the model's resolution is the whole point of cropping.
+        target_ar = 0.0
+        if latent is not None:
+            _sm = latent["samples"]
+            if getattr(_sm, "is_nested", False):
+                _v = _sm.tensors[0] if hasattr(_sm, "tensors") else _sm.unbind()[0]
+            else:
+                _v = _sm
+            target_ar = float(_v.shape[4]) / max(1.0, float(_v.shape[3]))
         guide, masks, crop_ctx, note = self._crop(
-            guide_video, masks, crop_mode, crop_scale, crop_divisible_by)
+            guide_video, masks, crop_mode, crop_scale, crop_divisible_by, target_ar)
         notes.append(note)
+        if target_ar:
+            notes.append(f"crop shaped to the latent's {target_ar:.3f} aspect")
 
         n_frames = guide.shape[0]
         tile = temporal_tile_size if 0 < temporal_tile_size < n_frames else n_frames
         overlap = min(temporal_overlap, max(0, tile - 8)) if tile < n_frames else 0
         stride = max(1, tile - overlap)
         notes.append(f"frames {n_frames}, tile {tile}, overlap {overlap}")
-        notes.append(f"sample size {guide.shape[2]}x{guide.shape[1]} "
-                     f"(the latent is rebuilt to this if it does not match)")
+        notes.append(f"crop {guide.shape[2]}x{guide.shape[1]}px, sampled at the latent's size")
 
         _, w_sf, h_sf = vae.downscale_index_formula
         lat_h, lat_w = guide.shape[1] // h_sf, guide.shape[2] // w_sf
@@ -792,13 +781,8 @@ class BFSHeadSwapMaskedSampler:
                         raise ValueError(
                             "chunked sampling with an AV (nested) latent is not supported yet: "
                             "set temporal_tile_size to 0, or feed a video-only latent")
-                    fitted, was = _fit_latent_to_crop(sm, lat_t, lat_h, lat_w)
-                    if fitted is not None:
-                        empty["samples"] = fitted
-                        if idx == 0:
-                            notes.append(
-                                f"latent rebuilt {was[2]*w_sf}x{was[1]*h_sf} -> "
-                                f"{lat_w*w_sf}x{lat_h*h_sf} to match the crop")
+                    if not getattr(sm, "is_nested", False) and sm.shape[2] != lat_t:
+                        empty["samples"] = sm[:, :, :lat_t]
                 else:
                     # last resort: a plain video latent. On LTX-2.5 the real thing is an
                     # AV (video+audio) latent, so connect EmptyLTXVLatentVideo instead.

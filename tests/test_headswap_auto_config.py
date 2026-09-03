@@ -285,47 +285,48 @@ class ChunkOverlapTest(unittest.TestCase):
         self.assertEqual(got.shape[2], 1)
 
 
-class FitLatentToCropTest(unittest.TestCase):
-    """The crop's size comes from the mask, so an upstream empty latent cannot
-    know it. A mismatch was silent: the model sampled at the latent's shape and
-    the paste-back squeezed the result into the box, deforming it."""
+class CropAspectTest(unittest.TestCase):
+    """The crop is resized into the connected latent, so the box has to share
+    its aspect. Free-shaped boxes were stretched on the way in and squeezed on
+    the way back -- a portrait face crop sampled in a landscape latent came out
+    visibly deformed. The latent's SIZE is deliberately not touched: sampling a
+    small region at the model's resolution is why cropping exists."""
 
-    def test_a_mismatched_latent_is_rebuilt_to_the_crop(self):
-        sm = torch.zeros(1, 128, 13, 16, 24)                  # landscape
-        fitted, was = NODE._fit_latent_to_crop(sm, 13, 21, 16)  # crop is portrait
-        self.assertEqual(tuple(fitted.shape[2:]), (13, 21, 16))
-        self.assertEqual(was, (13, 16, 24))
+    def setUp(self):
+        self.node = NODE.BFSHeadSwapMaskedSampler()
+        self.video = torch.zeros(6, 1080, 1920, 3)
+        self.mask = torch.zeros(6, 1080, 1920)
+        self.mask[:, 300:560, 900:1100] = 1.0        # 200x260, portrait
 
-    def test_a_matching_latent_is_left_alone(self):
-        sm = torch.zeros(1, 128, 13, 21, 16)
-        fitted, was = NODE._fit_latent_to_crop(sm, 13, 21, 16)
-        self.assertIsNone(fitted)
-        self.assertIsNone(was)
+    def box(self, aspect):
+        cropped, _, ctx, _ = self.node._crop(
+            self.video, self.mask, "off" if False else "combined", 1.2, 32, aspect)
+        return cropped.shape[2], cropped.shape[1], ctx
 
-    def test_the_time_axis_is_taken_from_the_chunk(self):
-        sm = torch.zeros(1, 128, 13, 21, 16)
-        fitted, _ = NODE._fit_latent_to_crop(sm, 9, 21, 16)
-        self.assertEqual(fitted.shape[2], 9)
+    def test_a_free_box_follows_the_subject(self):
+        w, h, _ = self.box(0.0)
+        self.assertLess(w, h)                         # portrait, like the mask
 
-    def test_dtype_and_device_survive(self):
-        sm = torch.zeros(1, 128, 13, 16, 24, dtype=torch.float16)
-        fitted, _ = NODE._fit_latent_to_crop(sm, 13, 21, 16)
-        self.assertEqual(fitted.dtype, torch.float16)
+    def test_a_landscape_latent_gives_a_landscape_box(self):
+        w, h, _ = self.box(768 / 512)
+        self.assertAlmostEqual(w / h, 768 / 512, delta=0.25)
+        self.assertGreater(w, h)
 
-    def test_an_av_latent_keeps_its_audio_stream(self):
-        class _Nested:
-            is_nested = True
-            def __init__(self, tensors): self.tensors = tuple(tensors)
-        mod = types.ModuleType("comfy.nested_tensor")
-        mod.NestedTensor = _Nested
-        sys.modules["comfy.nested_tensor"] = mod
-        sys.modules["comfy"].nested_tensor = mod
+    def test_the_box_still_contains_the_subject(self):
+        w, h, ctx = self.box(768 / 512)
+        x0, y0, bw, bh = ctx[1]
+        self.assertLessEqual(x0, 900)
+        self.assertGreaterEqual(x0 + bw, 1100)
+        self.assertLessEqual(y0, 300)
+        self.assertGreaterEqual(y0 + bh, 560)
 
-        audio = torch.arange(6, dtype=torch.float32).view(1, 2, 3)
-        av = _Nested([torch.zeros(1, 128, 13, 16, 24), audio])
-        fitted, was = NODE._fit_latent_to_crop(av, 13, 21, 16)
-        self.assertEqual(tuple(fitted.tensors[0].shape[2:]), (13, 21, 16))
-        self.assertTrue(torch.equal(fitted.tensors[1], audio))
+    def test_the_box_stays_divisible(self):
+        w, h, _ = self.box(1.5)
+        self.assertEqual((w % 32, h % 32), (0, 0))
+
+    def test_static_box_honours_the_aspect_directly(self):
+        x0, y0, w, h = NODE._static_box(self.mask, self.video, 1.2, 32, aspect=2.0)
+        self.assertAlmostEqual(w / h, 2.0, delta=0.3)
 
 
 class CropSizeTest(unittest.TestCase):
