@@ -23,6 +23,7 @@ import { videoTab } from "./shotloop/view_video.js";
 import { shotsTab } from "./shotloop/view_shots.js";
 import { peopleTab } from "./shotloop/view_people.js";
 import { promptsTab } from "./shotloop/view_prompts.js";
+import { createAgent, agentTab, agentBar } from "./shotloop/view_agent.js";
 import { runTab } from "./shotloop/view_run.js";
 import { busyBar, pointsModal, tourModal } from "./shotloop/view_modal.js";
 
@@ -37,7 +38,7 @@ const store = {   // per-browser UI conveniences (never the plan itself)
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
 };
 const DEFAULT_W = 1180, MIN_W = 1040, MIN_H = 1000;   // node size: wide enough for the four-column settings
-const TABS = [["video", "🎞 Video"], ["shots", "🎬 Shots"], ["people", "👥 People / Filters / Masks"], ["prompts", "📝 Prompts & refs"], ["run", "▶ Run"]];
+const TABS = [["video", "🎞 Video"], ["shots", "🎬 Shots"], ["people", "👥 People / Filters / Masks"], ["prompts", "📝 Prompts & refs"], ["run", "▶ Run"], ["agent", "🤖 Agent"]];
 
 function Panel(io) {
   const plan = reactive({ ...DEFAULTS });
@@ -878,6 +879,8 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     autoFor, writtenOf, setAuto, setWritten, writePrompts,
   };
 
+  c.agent = createAgent(c, io, app);
+
   return () => {
     const S = segs.value, N = n.value, fps = plan.fps;
     const warns = checks.value.filter(x => x.lvl === "warn").length;
@@ -905,10 +908,10 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       class: ["tab", tab.value === k && "on"], disabled: k !== "video" && !an.value, onClick: () => { tab.value = k; } }, [
       label, counts[k] ? h("span", { class: "n" }, counts[k]) : null, k === "run" && warns ? h("span", { class: "dot", title: `${warns} warning(s)` }) : null,
     ])));
-    const views = { video: videoTab, shots: shotsTab, people: peopleTab, prompts: promptsTab, run: runTab };
+    const views = { video: videoTab, shots: shotsTab, people: peopleTab, prompts: promptsTab, run: runTab, agent: agentTab };
     const cur = an.value || tab.value === "video" ? tab.value : "video";
     return h("div", { class: "bsl root", ref: rootEl, tabindex: 0, onKeydown: onKey }, [
-      header, tabs,
+      header, agentBar(c), tabs,
       busy.value ? busyBar(c, busy.value) : null,
       error.value ? h("div", { class: "err" }, [h("span", { class: "grow" }, error.value), h("button", { class: "ghost", onClick: () => { error.value = ""; } }, "✕")]) : null,
       an.value ? timelineCard(c) : null,
@@ -1011,6 +1014,7 @@ app.registerExtension({
     const handle = {};
     createApp({
       setup: () => Panel({
+        nodeId: node.id,
         getPlan: () => planWidget?.value ?? "{}",
         setPlan: v => { if (planWidget) planWidget.value = v; node.graph?.setDirtyCanvas(true); },
         expose: o => Object.assign(handle, o),

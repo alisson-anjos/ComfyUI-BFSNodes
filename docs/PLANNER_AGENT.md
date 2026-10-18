@@ -1,0 +1,122 @@
+# Planner Agent experiment
+
+Branch: `feat/planner-agentic`, based on `origin/main` at `488cb77`.
+
+This adds a server-side tool agent to BFS Shot Planner. The Agent tab accepts a video task,
+starts the local VLM, edits the Planner's own plan, uses SAM, renders the workflow, inspects
+outputs, retries shots and combines a reviewed result. The browser displays activity and can
+follow the tab and shot involved in each action. Closing the browser does not stop the worker.
+
+## Local setup
+
+1. Install this branch as the BFSNodes checkout in your local ComfyUI and restart ComfyUI.
+2. Open a working Planner → conditioning → sampler → decode → Shot Join → save workflow.
+   Select the video and reference pictures as usual. Connect a vision-language CLIP to
+   Planner's `vlm` input. Choose a model checkpoint capable of thinking if enabling Thinking.
+3. Leave Planner's optional external `prompt` input disconnected/empty. The Agent writes
+   global and per-shot prompts in the plan. Keep only one Planner in this generation chain.
+4. Open **Agent**, describe the task and preservation requirements, set render/action budgets,
+   and click **Start automatic task**. No preliminary full video render is needed: an internal
+   context-only queue loads the connected VLM first.
+
+The generation workflow is snapshotted when starting a task. Graph changes afterward require
+a new task. The agent can change seed/steps/cfg on supported generation nodes through its
+`update_sampler` tool. It cannot edit arbitrary graph connections or execute shell commands.
+The worker restricts rendering to the selected Planner's downstream outputs and their dependencies.
+
+## Intermediate H3 previews
+
+Insert **BFS Agent Preview Sampler (H3)** between a SAMPLER selector and SamplerCustom /
+SamplerCustomAdvanced. It is an explicit wrapper; regular KSampler nodes with an internal
+sampler are not intercepted. Existing generation without this wrapper still supports final-shot
+inspection and correction, but has no agent intermediate previews.
+
+- Put a compatible `taeh3*` checkpoint in `ComfyUI/models/vae_approx`, **or** connect a
+  compatible tiny/light H3 VAE to `preview_vae`. The experiment does not download weights.
+- Session ID and the Planner shot link are bound automatically in the Agent's queue snapshot.
+- Defaults: inspect every 5 sampling steps, at least 15 seconds apart, using 4 temporal positions.
+  The final step is captured even if the interval has not expired.
+- Captures use **denoised x0**, converted through the generation model's latent format.
+  Each selected position is decoded with a contiguous temporal neighborhood. Positions are
+  approximate latent-time observations, not a full decoded video or exact frame timestamps.
+- With `review_with_vlm` on, reviews begin after 35% progress. A VLM may request a retry
+  for a major failure after 65%; that interrupts this generation and returns control to the
+  agent, which can adjust the plan and render again within its budget.
+- Source frames and reference images are supplied with the intermediate previews. The VLM
+  is instructed not to judge fine identity from early previews.
+- Review runs synchronously at a sampler boundary; generation waits while decoding/reviewing.
+  Previously loaded models are restored before the next denoising step. This is not concurrent
+  VLM and diffusion inference, and its overhead and compatibility require local GPU testing.
+
+## Tools
+
+| Tool | Operation |
+|---|---|
+| `set_checklist` | Visible step-by-step plan with pending/in progress/done states |
+| `inspect_plan` | Resolved shots, active filters, cached render status, sampler settings |
+| `inspect_source` | Ordered source frames and assigned references |
+| `update_plan`, `update_shot`, `split_shot` | Planner settings, shot prompts/references/modes and boundaries |
+| `segment`, `preview_mask` | SAM text/positive/negative points, temporal tracking and mask overlays |
+| `write_prompt`, `describe_refs` | Existing visual prompt writer and reference descriptions |
+| `render`, `inspect_result`, `inspect_preview` | Queue generation and visually inspect final/intermediate frames |
+| `retry_shot`, `restore_take` | Archive the previous shot files, invalidate a shot/dependents, restore archived files and their full render settings snapshot |
+| `update_sampler` | Bounded seed, steps, cfg or scheduler denoise changes on supported nodes |
+| `combine`, `finish` | Assemble only after all active current shots were inspected; then finish |
+| `list_directory`, `read_file`, `inspect_media` | Context files/images/videos under input, output or configured project root |
+| `search_web`, `fetch_url` | Public HTTPS text context; search uses DuckDuckGo HTML, no API key |
+
+SAM supports up to eight correction keyframes per shot through `segment.keyframes`.
+Coordinates are normalized; keys are frame indices relative to the shot. The first keyframe
+tracks backward and forward; subsequent corrections apply from their keyframe onward.
+Global mask shaping settings are shared across shots, as in the existing Planner.
+
+Directory tools are read-only. Resolved paths stay inside their configured roots, including
+symlinks; hidden/credential paths are excluded. Web tools read bounded public HTTPS text
+and reject local/private network destinations and non-text downloads. Search providers can
+rate-limit or return challenge pages; those observations are returned to the agent.
+Files/pages are context, not instructions or extra tool definitions.
+
+## Controls, persistence and limits
+
+- **Follow tabs** moves the panel to the tool's tab and selected shot. A persistent activity
+  bar has Pause, Resume and Stop even while another tab is open.
+- **Pause** stops further decisions after the current tool. A render already in the queue
+  may finish; Resume picks it up using its exact ComfyUI prompt ID and accepts manual plan edits.
+- **Stop** removes this session's queued render or interrupts it if it is currently running.
+  It does not cancel unrelated queue entries.
+- Sessions and workflow snapshots are written under `ComfyUI/output/bfs_agent/<id>.json`.
+  The session ID is saved in the Planner plan. Reloading the panel reconnects to the worker.
+  After a server restart, the session restores paused and must be explicitly resumed; a lost
+  render ID is reported instead of silently launching duplicate work.
+- One active Agent session at a time. Agent actions wait when another ComfyUI prompt runs.
+- Default limits: 40 tool decisions, 4 full render attempts, 4096 generated tokens per decision.
+  Three consecutive invalid responses/tool errors stop automatic decisions.
+  On a paused/errored/budget-limited session, adjust the limits and click Resume to continue.
+- Changes invalidate prior review and assembly. Cached results must be reconciled by a new
+  render before being accepted. Disabled/filtered timeline shots map to active render indices.
+- Intermediate/final VLM judgements are experimental. The system does not guarantee perfect
+  identity, motion, temporal consistency or successful thinking on every checkpoint.
+
+## Validation and GPU handoff
+
+CPU checks exercise action validation, budgets, pause/cancel boundaries, session persistence,
+SAM dispatch, mask correction boundaries, directory confinement, sampler settings, preview
+callback x0 selection/model restoration and a complete simulated server queue cycle.
+These use synthetic frames and mocked models/queue; they do not establish visual quality.
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m unittest discover -s tests -p test_planner_agent.py -v
+```
+
+For GPU validation start with one short shot, two references, at most two render attempts,
+then test SAM overlays, final review, previews without review, previews with thinking review,
+and interruption/retry. Verify frame shape/range, identity compared to the full VAE, model
+restoration after each review, memory peaks and time added per inspection. Repeat with several
+shots and pause/resume, then close/reopen the browser during a render.
+
+No VLM, SAM, preview decoding or diffusion inference was run on the training GPU during development.
+
+The existing Planner suite also reports two failures reproduced against untouched `origin/main`:
+`CastTest.test_plan_splits_assigns_and_skips_by_person` (empty cast reference under the existing test harness),
+and `FillDetailsTest.test_render_node_fills_details_with_its_vlm` (test mock accepts six arguments
+while the implementation passes seven). They are outside this experiment.

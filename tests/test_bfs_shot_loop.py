@@ -1575,3 +1575,26 @@ class FillDetailsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentMaskKeyframeTest(unittest.TestCase):
+    def test_later_keyframe_corrects_only_its_suffix(self):
+        frames = torch.zeros(8, 2, 2, 3)
+        seen = []
+        original = SL.segment_frames
+
+        def segment(images, spec):
+            if spec.get('keyframes'):
+                return original(images, spec)
+            seen.append((len(images), spec['key'], spec['text']))
+            return torch.full((len(images), 2, 2), 1.0 if spec['text']=='first' else 2.0)
+
+        spec = SL.mask_spec({'keyframes':[
+            {'key':2, 'text':'first', 'points':[]},
+            {'key':5, 'text':'second', 'points':[]},
+        ]})
+        with patch.object(SL, 'segment_frames', side_effect=segment):
+            out = original(frames, spec)
+        self.assertEqual(seen, [(5,2,'first'),(3,0,'second')])
+        self.assertEqual(out[:,0,0].tolist(), [1]*5+[2]*3)
+        self.assertTrue(SL.spec_has_mask(spec))

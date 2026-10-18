@@ -192,3 +192,7 @@ See [setup, workflow template, compatibility and validation](MINIMAX_H3_GUIDES.m
 
 BFSNodes **1.47.0** adds optional MiniMax-H3 overlap/sidecar source-phase RoPE and
 **MiniMax-H3 Identity Reference + RoPE (BFS)**. See [the H3 guide](MINIMAX_H3_GUIDES.md#experimental-reference-layouts-and-source-phase-1470).
+
+### Experimental Planner Agent
+
+The `feat/planner-agentic` branch adds an automatic tool agent to Shot Planner, with SAM masks, visual review, optional H3 intermediate previews, web/directory context and pause/resume controls. See [setup, tools and local GPU validation](docs/PLANNER_AGENT.md).

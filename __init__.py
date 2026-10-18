@@ -180,3 +180,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 WEB_DIRECTORY = "./web/js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+
+# Experimental agent preview is opt-in and does not alter existing sampler nodes.
+from .bfs_agent_preview import NODE_CLASS_MAPPINGS as _AGENT_NODES, NODE_DISPLAY_NAME_MAPPINGS as _AGENT_NAMES
+NODE_CLASS_MAPPINGS.update(_AGENT_NODES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_AGENT_NAMES)

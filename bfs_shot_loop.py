@@ -1002,10 +1002,10 @@ SAM3_URL = "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam
 _SAM3: dict[str, Any] = {}
 _MASK_CACHE: dict[tuple, dict] = {}
 # global mask settings (the planner's Mask card); a shot only says what to segment (text / points / key frame)
-DEFAULT_MASK = {"text": "", "points": [], "key": 0, "threshold": 0.5, "max_objects": 4, "invert": False,
+DEFAULT_MASK = {"text": "", "points": [], "key": 0, "keyframes": [], "threshold": 0.5, "max_objects": 4, "invert": False,
                 "fill_holes": True, "temporal_expand": 2, "blockify": 0, "padding": 0.15, "expand": 16,
                 "feather": 12, "paste": "box"}
-SHOT_MASK_KEYS = ("text", "points", "key")
+SHOT_MASK_KEYS = ("text", "points", "key", "keyframes")
 
 
 def _sam3_path() -> str:
@@ -1059,7 +1059,7 @@ def plan_spec(p: dict, m: dict | None, path: str = "") -> dict:
     spec = mask_spec(m, p.get("mask_cfg"))
     if (m or {}).get("video"):
         spec["ext"] = {"file": m["video"], "scope": "shot"}
-    elif (m or {}).get("points") or str((m or {}).get("text") or "").strip():
+    elif (m or {}).get("keyframes") or (m or {}).get("points") or str((m or {}).get("text") or "").strip():
         pass                                                    # the shot's own SAM 3 selection
     elif path and (p.get("track") or {}).get("points"):         # one selection tracked through the whole video
         fps = float(p.get("fps") or 24)
@@ -1074,7 +1074,7 @@ def plan_spec(p: dict, m: dict | None, path: str = "") -> dict:
 
 
 def spec_has_mask(spec: dict) -> bool:
-    return bool(spec.get("ext") or spec.get("points") or str(spec.get("text") or "").strip())
+    return bool(spec.get("ext") or spec.get("keyframes") or spec.get("points") or str(spec.get("text") or "").strip())
 
 
 def ext_masks(ext: dict, analysis: dict, start: int, length: int, w: int, h: int) -> torch.Tensor:
@@ -1208,6 +1208,19 @@ def _track(model, imgs: torch.Tensor, init: torch.Tensor | None, cond, spec: dic
 
 def segment_frames(imgs: torch.Tensor, spec: dict) -> torch.Tensor:
     """[N,H,W,3] -> [N,H,W] masks with SAM 3: tracked from the points on the key frame, or from the text."""
+    keyframes = spec.get("keyframes") or []
+    if keyframes:
+        # Later corrections take effect at their keyframe; the first selection tracks backward too.
+        keys = sorted(keyframes, key=lambda k: int(k["key"]))
+        parts = []
+        for j, keyframe in enumerate(keys):
+            start = 0 if j == 0 else int(keyframe["key"])
+            end = int(keys[j + 1]["key"]) if j + 1 < len(keys) else len(imgs)
+            local = dict(spec, **keyframe)
+            local["keyframes"] = []
+            local["key"] = int(keyframe["key"]) - start
+            parts.append(segment_frames(imgs[start:end], local))
+        return torch.cat(parts, 0)
     from comfy_extras.nodes_sam3 import SAM3_Detect
     model, clip = _sam3()
     text = str(spec.get("text") or "").strip()
@@ -1244,7 +1257,7 @@ def _mask_key(path: str, analysis: dict, start: int, length: int, spec: dict) ->
     else:
         e = None
     return (path, os.path.getmtime(path), float(analysis["fps"]), int(start), int(length),
-            json.dumps({k: spec[k] for k in ("text", "points", "key", "threshold", "max_objects")}, sort_keys=True), e)
+            json.dumps({k: spec.get(k) for k in ("text", "points", "key", "keyframes", "threshold", "max_objects")}, sort_keys=True), e)
 
 
 def shot_mask(path: str, analysis: dict, start: int, length: int, spec: dict) -> dict:
@@ -5825,3 +5838,11 @@ try:
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
 except Exception as _exc:  # noqa: BLE001 - nodes still work without the panel
     print(f"[BFSNodes] Shot loop HTTP routes not registered: {_exc!r}")
+
+# Agent tools use the same Planner operations as the manual panel.
+try:
+    import sys as _sys
+    from .bfs_agent_runtime import register as _register_agent
+    _AGENT_RUNTIME = _register_agent(_sys.modules[__name__])
+except Exception as _agent_exc:
+    print(f"[BFSNodes] Agent routes unavailable: {_agent_exc!r}")
