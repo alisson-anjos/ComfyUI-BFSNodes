@@ -209,6 +209,11 @@ const CSS = `
 .bsl .pt.pos{background:#3ccf6b}.bsl .pt.neg{background:#e8455a}
 .bsl .pt.cg.pos{background:var(--point-color,#00ff00)}
 .bsl .pt.other{opacity:.5}
+.bsl .kslider{position:relative;flex:1;min-width:160px;padding-bottom:8px}
+.bsl .kmarks{position:absolute;left:8px;right:8px;bottom:0;height:8px}
+.bsl .kmark{position:absolute;width:8px;height:8px;margin-left:-4px;border-radius:50%;background:var(--mark,#3ccf6b);opacity:.55;cursor:pointer;border:1px solid #000}
+.bsl .kmark.on{opacity:1}
+.bsl .kchip{display:inline-flex;gap:1px}.bsl .kchip.on button:first-child{border-color:var(--acc)}
 .bsl .mreg{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}
 `;
 

@@ -162,7 +162,7 @@ function editor(c, cur) {
         h("button", { disabled: !!busy.value || !(r.text || (r.points || []).length),
           onClick: () => c.previewMask(i, { text: r.text || "", points: r.points || [], key: r.key || 0, max_objects: 1,
             preview_color: pictureColor(plan, r.picture) }) }, "👁 Preview"),
-        h("button", { onClick: () => c.openPoints(i, j + 2) }, (r.points || []).length ? `🎯 Points (${r.points.length})` : "🎯 Points…"),
+        h("button", { onClick: () => c.openPoints(i, j + 2) }, c.keyFramesOf(r).length ? `🎯 Points (${c.keyFramesOf(r).length} key frame${c.keyFramesOf(r).length > 1 ? "s" : ""})` : "🎯 Points…"),
         h("button", { class: "dng", title: "remove this person's mark", onClick: () => c.removeMarkRegion(i)(j) }, "✕"),
       ])),
       h("div", { class: "row", style: "margin-top:6px;align-items:center;gap:8px" }, [
@@ -180,7 +180,7 @@ function editor(c, cur) {
         onInput: e => c.setMask(i, "text", e.target.value),
         onKeydown: e => { if (e.key === "Enter") { e.preventDefault(); c.setMask(i, "text", e.target.value); if (e.target.value || (cur.mask.points || []).length) c.previewMask(i); } } }),
       h("button", { title: "Pick positive / negative points on a frame of this shot (more precise than text when several people look alike)",
-        onClick: () => c.openPoints(i) }, (cur.mask.points || []).length ? `🎯 Points (${cur.mask.points.length})` : "🎯 Points…"),
+        onClick: () => c.openPoints(i) }, c.keyFramesOf(cur.mask).length ? `🎯 Points (${c.keyFramesOf(cur.mask).length} key frame${c.keyFramesOf(cur.mask).length > 1 ? "s" : ""})` : "🎯 Points…"),
       h("button", { class: hasMask(cur) && !mp ? "pri" : "", disabled: !!busy.value || !hasMask(cur),
         title: (cur.mask.points || []).length ? "Segment this shot (the points win over the text)" : "Segment this shot with the text and show a few frames",
         onClick: () => c.previewMask(i) }, "👁 Preview"),

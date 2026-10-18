@@ -1088,6 +1088,52 @@ class MultiRefTest(unittest.TestCase):
         self.assertNotIn("ref_image", SL.BFSShotPlanner.INPUT_TYPES()["optional"])
 
 
+class KeyFrameSegmentTest(unittest.TestCase):
+    """Points on several frames of a shot: each key frame starts the track up to the next one."""
+
+    def setUp(self):
+        import json as _json
+
+        class Detect:   # the mask of a key frame carries its first point's x (in pixels), to see who filled a frame
+            @staticmethod
+            def execute(model, image, positive_coords, **kw):
+                return types.SimpleNamespace(args=(torch.full((1, 4, 4), _json.loads(positive_coords)[0]["x"]),))
+        mod = types.ModuleType("comfy_extras.nodes_sam3"); mod.SAM3_Detect = Detect
+        sys.modules.setdefault("comfy_extras", types.ModuleType("comfy_extras"))
+        self._old = (sys.modules.get("comfy_extras.nodes_sam3"), SL._sam3, SL._track)
+        sys.modules["comfy_extras.nodes_sam3"] = mod
+        SL._sam3 = lambda: (None, None)
+        self.tracks = []
+
+        def track(model, imgs, seed, cond, spec):
+            self.tracks.append((imgs.shape[0], float(seed.flatten()[0])))
+            return seed.expand(imgs.shape[0], -1, -1).clone()
+        SL._track = track
+
+    def tearDown(self):
+        mod, SL._sam3, SL._track = self._old
+        if mod is None:
+            sys.modules.pop("comfy_extras.nodes_sam3", None)
+        else:
+            sys.modules["comfy_extras.nodes_sam3"] = mod
+
+    def test_each_key_frame_corrects_the_mask_from_its_frame_on(self):
+        pt = lambda x: [{"x": x, "y": 0.5, "label": 1}]
+        spec = dict(SL.DEFAULT_MASK, keys=[{"key": 6, "points": pt(0.75)}, {"key": 2, "points": pt(0.25)}])
+        out = SL.segment_frames(torch.zeros(10, 4, 4, 3), spec)
+        self.assertEqual([float(out[f, 0, 0]) for f in range(10)], [1.0] * 6 + [3.0] * 4)   # frames 0-5 from key 2, 6-9 from key 6
+        self.assertEqual(self.tracks, [(3, 1.0), (4, 1.0), (4, 3.0)])     # back 2->0, forward 2->5, forward 6->9
+        self.assertTrue(SL.spec_has_mask(dict(SL.DEFAULT_MASK, keys=[{"key": 3, "points": pt(0.5)}])))
+        self.assertFalse(SL.spec_has_mask(dict(SL.DEFAULT_MASK, keys=[{"key": 3, "points": []}])))
+
+    def test_a_plan_with_one_key_frame_works_as_before(self):
+        spec = dict(SL.DEFAULT_MASK, points=[{"x": 0.5, "y": 0.5, "label": 1}], key=4)
+        self.assertEqual(SL.point_keys(spec), [(4, spec["points"])])
+        out = SL.segment_frames(torch.zeros(8, 4, 4, 3), spec)
+        self.assertEqual(self.tracks, [(5, 2.0), (4, 2.0)])
+        self.assertEqual(float(out.sum()), 2.0 * 8 * 16)
+
+
 class DescribeShortTest(unittest.TestCase):
     def test_short_details_fit_inside_the_prompt(self):
         self.assertEqual(SL.tidy_details('"The green goblin in a torn leather vest."\nextra', {"describe_preset": "short"}),

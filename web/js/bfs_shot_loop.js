@@ -70,7 +70,8 @@ function Panel(io) {
   const maskPrev = ref({});      // "start-end" -> {frames, box, coverage, empty} from /bfs/shotloop/mask
   const showMasks = ref(true);   // overlay the mask preview on the shot cards
   const vlmSug = ref({});        // "start-end" -> {segment, shot, people, recommend, reason} from the VLM
-  const modal = reactive({ open: false, idx: -1, key: 0, points: [], text: "", region: 1, groups: {}, prev: null, busy: "" });
+  const modal = reactive({ open: false, idx: -1, key: 0, points: [], text: "", region: 1, groups: {}, prev: null, stale: false,
+                           showMask: true, playing: 0, busy: "" });
   const segPeople = ref({});     // "start-end" -> {people, main} from /bfs/shotloop/plan
   const targetCrop = ref({});    // "start-end" -> data URL of the subject the description was made from
   const tab = ref(store.get("bfs.shotloop.tab", "shots"));
@@ -352,15 +353,17 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
+  // intoModal: every frame of the shot, for the points window's player (count 0)
   async function previewMask(i, spec, intoModal = false) {
     const s = segs.value[i]; if (!s) return;
     const label = "Segmenting with SAM 3… (the first time downloads/loads the model)";
     if (intoModal) { modal.busy = label; busySince.value = Date.now(); Object.assign(status, { stage: "", done: 0, total: 0 }); } else busy.value = label;
     error.value = "";
     try {
-      const r = await api.fetchApi("/bfs/shotloop/mask", { method: "POST", body: JSON.stringify({ plan: { ...plan }, index: i, mask: spec || null }) });
+      const body = { plan: { ...plan }, index: i, mask: spec || null, ...(intoModal ? { count: 0 } : {}) };
+      const r = await api.fetchApi("/bfs/shotloop/mask", { method: "POST", body: JSON.stringify(body) });
       const j = await r.json(); if (j.error) throw new Error(j.error);
-      if (intoModal) modal.prev = j; else maskPrev.value = { ...maskPrev.value, [segKey(s)]: j };
+      if (intoModal) { modal.prev = j; modal.stale = false; modal.showMask = true; } else maskPrev.value = { ...maskPrev.value, [segKey(s)]: j };
     } catch (e) { error.value = String(e.message || e); }
     if (intoModal) modal.busy = ""; else busy.value = "";
   }
@@ -371,29 +374,52 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     if (s && maskPrev.value[segKey(s)]) { const mp = { ...maskPrev.value }; delete mp[segKey(s)]; maskPrev.value = mp; }
   };
   const setMaskCfg = (k, v) => { plan.mask_cfg = { ...plan.mask_cfg, [k]: v }; save(); maskPrev.value = {}; };
-  // Colored Mark regions in the points window: 1 = the shot's own selection (its mask), 2.. = its extra regions
+  // The points window. A selection (region 1 = the shot's own mask, 2.. = its extra Colored Mark regions) has key
+  // frames, each with its own points: SAM 3 starts from a key frame and tracks up to the next one, so points added on a
+  // later frame correct the mask from there on. modal.key is the frame shown, modal.points its points (being edited).
+  const keyFramesOf = m => (Array.isArray(m?.keys) && m.keys.length ? m.keys.map(k => ({ key: +k.key || 0, points: [...(k.points || [])] }))
+    : (m?.points || []).length ? [{ key: +m.key || 0, points: [...m.points] }] : []);
+  const pointGroup = () => modal.groups[modal.region];
+  const keepFrame = () => {     // the frame being edited back into its selection's key frames
+    const g = pointGroup(); if (!g) return;
+    g.keys = g.keys.filter(k => k.key !== modal.key);
+    if (modal.points.length) g.keys = [...g.keys, { key: modal.key, points: [...modal.points] }].sort((a, b) => a.key - b.key);
+    g.text = modal.text;
+  };
+  const showFrame = f => {
+    keepFrame();
+    modal.key = Math.max(0, Math.min((segs.value[modal.idx]?.len || 1) - 1, f));
+    modal.points = [...(pointGroup()?.keys.find(k => k.key === modal.key)?.points || [])];
+  };
+  const dropKeyFrame = f => {
+    const g = pointGroup(); g.keys = g.keys.filter(k => k.key !== f);
+    if (f === modal.key) modal.points = [];
+    modal.stale = !!modal.prev;
+  };
   const openPoints = (i, region = 1) => {
     const s = segs.value[i]; if (!s) return;
-    const g1 = { key: s.mask.key ?? Math.floor(s.len / 2), points: [...(s.mask.points || [])], text: s.mask.text || "" };
-    const groups = { 1: g1 };
-    if (s.color_guide) s.regions.forEach((r, j) => { groups[j + 2] = { key: r.key ?? g1.key, points: [...(r.points || [])], text: r.text || "" }; });
-    const g = groups[region] || g1;
-    Object.assign(modal, { open: true, idx: i, region: groups[region] ? region : 1, groups, key: g.key, points: [...g.points],
-      text: g.text, prev: null, busy: "" });
+    const groups = { 1: { keys: keyFramesOf(s.mask), text: s.mask.text || "" } };
+    if (s.color_guide) s.regions.forEach((r, j) => { groups[j + 2] = { keys: keyFramesOf(r), text: r.text || "" }; });
+    const r0 = groups[region] ? region : 1, key = groups[r0].keys[0]?.key ?? Math.floor(s.len / 2);
+    Object.assign(modal, { open: true, idx: i, region: r0, groups, key, points: [...(groups[r0].keys[0]?.points || [])],
+      text: groups[r0].text, prev: null, stale: false, showMask: true, busy: "" });
   };
   const switchPointRegion = region => {
-    modal.groups[modal.region] = { key: modal.key, points: [...modal.points], text: modal.text };
-    const next = modal.groups[region] || { key: modal.key, points: [], text: "" };
-    modal.region = region; modal.points = [...next.points]; modal.text = next.text; modal.prev = null;
+    keepFrame();
+    modal.region = region; modal.text = pointGroup()?.text || "";
+    modal.points = [...(pointGroup()?.keys.find(k => k.key === modal.key)?.points || [])]; modal.prev = null;
   };
+  // the selection being edited as a mask spec (what Segment sends)
+  const pointSpec = () => { keepFrame(); const g = pointGroup(); return { keys: g.keys, points: g.keys[0]?.points || [], key: g.keys[0]?.key ?? modal.key, text: g.text }; };
   const commitPointGroups = i => {
-    modal.groups[modal.region] = { key: modal.key, points: [...modal.points], text: modal.text };
+    keepFrame();
     const m = meta(i), g1 = modal.groups[1];
-    m.mask = { ...(m.mask || {}), points: [...g1.points], key: g1.key, text: g1.text };
+    // keys is what 1.116 reads; points + key (the first key frame) for older versions
+    m.mask = { ...(m.mask || {}), keys: g1.keys, points: g1.keys[0]?.points || [], key: g1.keys[0]?.key ?? 0, text: g1.text };
     if (segs.value[i]?.color_guide) {
       m.color_guide_regions = markRegions(m).map((r, j) => {
         const g = modal.groups[j + 2];
-        return g ? { ...r, points: [...g.points], key: g.key, text: g.text } : r;
+        return g ? { ...r, keys: g.keys, points: g.keys[0]?.points || [], key: g.keys[0]?.key ?? 0, text: g.text } : r;
       });
     }
   };
@@ -421,7 +447,11 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   };
   const savePoints = () => {
     const i = modal.idx; commitPointGroups(i); save();
-    if (modal.prev) maskPrev.value = { ...maskPrev.value, [segKey(segs.value[modal.idx])]: modal.prev };
+    if (modal.prev && !modal.stale) {   // the card's strip shows 6 of the window's frames
+      const fr = modal.prev.frames, pick = [...new Set(Array.from({ length: Math.min(6, fr.length) }, (_, k) => Math.round(k * (fr.length - 1) / Math.max(1, Math.min(6, fr.length) - 1))))];
+      maskPrev.value = { ...maskPrev.value, [segKey(segs.value[modal.idx])]: { ...modal.prev, frames: pick.map(k => fr[k]) } };
+    }
+    clearInterval(modal.playing); modal.playing = 0;
     modal.open = false;
   };
   const targets = (scope, from) => segs.value.map((_, i) => i).filter(i => i !== from && (scope === "all" || i > from));
@@ -431,7 +461,8 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     const src = segs.value[fromIdx]; const rel = src ? key / Math.max(1, src.len - 1) : 0.5;
     [fromIdx, ...targets(scope, fromIdx)].forEach(i => {
       const x = segs.value[i], m = meta(i);
-      m.mask = { ...(m.mask || {}), points: points.map(p => ({ ...p })), key: Math.round(rel * Math.max(0, x.len - 1)), text: text ?? (m.mask || {}).text };
+      const key = Math.round(rel * Math.max(0, x.len - 1));
+      m.mask = { ...(m.mask || {}), keys: [{ key, points: points.map(p => ({ ...p })) }], points: points.map(p => ({ ...p })), key, text: text ?? (m.mask || {}).text };
     });
     maskPrev.value = {}; save();
   };
@@ -444,13 +475,13 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   // part of that track, so the subject is found wherever it moves (copied points can fall on the background)
   const saveTrack = () => {
     const s0 = segs.value[modal.idx]; if (!s0 || !modal.points.length) return;
-    const own = segs.value.filter((x, i) => i !== modal.idx && (x.mask.text || (x.mask.points || []).length)).length;
+    const own = segs.value.filter((x, i) => i !== modal.idx && (x.mask.text || (x.mask.points || []).length || (x.mask.keys || []).length)).length;
     if (own && !window.confirm(`${own} other shot(s) have their own mask text or points, which would win over the track. Clear them so every shot uses the track?`)) {
       // keep them: those shots keep their own selection
     } else {
-      segs.value.forEach((_, i) => { const m = meta(i); if (m.mask) { m.mask = { ...m.mask, points: [], text: "" }; } });
+      segs.value.forEach((_, i) => { const m = meta(i); if (m.mask) { m.mask = { ...m.mask, points: [], keys: [], text: "" }; } });
     }
-    const m = meta(modal.idx); m.mask = { ...(m.mask || {}), points: [], text: "" };
+    const m = meta(modal.idx); m.mask = { ...(m.mask || {}), points: [], keys: [], text: "" };
     plan.track = { points: modal.points.map(p => ({ ...p })), frame: s0.start + modal.key, text: modal.text || "",
                    threshold: plan.mask_cfg?.threshold ?? 0.5 };
     maskPrev.value = {}; save(); modal.open = false;
@@ -873,7 +904,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     refreshFiles, analyze, autoSplit, analyzeContent, findPeople, setCast, describeTarget, previewMask, setMask, setMaskCfg,
     openPoints, switchPointRegion, savePoints, savePointsAll, saveTrack, clearTrack, pointsTo, clearMask, copyFrom, analyseVLM, setVlmCfg,
     applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
-    frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describePictures, setPictureDetail, setPictureCfg,
+    frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, showFrame, dropKeyFrame, pointSpec, keyFramesOf, pictures, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
     autoFor, writtenOf, setAuto, setWritten, writePrompts,
   };

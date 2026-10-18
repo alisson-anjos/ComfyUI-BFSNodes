@@ -1002,10 +1002,19 @@ SAM3_URL = "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam
 _SAM3: dict[str, Any] = {}
 _MASK_CACHE: dict[tuple, dict] = {}
 # global mask settings (the planner's Mask card); a shot only says what to segment (text / points / key frame)
-DEFAULT_MASK = {"text": "", "points": [], "key": 0, "threshold": 0.5, "max_objects": 4, "invert": False,
+DEFAULT_MASK = {"text": "", "points": [], "key": 0, "keys": [], "threshold": 0.5, "max_objects": 4, "invert": False,
                 "fill_holes": True, "temporal_expand": 2, "blockify": 0, "padding": 0.15, "expand": 16,
                 "feather": 12, "paste": "box"}
-SHOT_MASK_KEYS = ("text", "points", "key")
+SHOT_MASK_KEYS = ("text", "points", "key", "keys")
+
+
+def point_keys(spec: dict) -> list[tuple[int, list]]:
+    """The shot's key frames with their points, in frame order: spec['keys'] ([{key, points}], 1.116), else the single
+    key frame of older plans (points + key)."""
+    keys = {int(k.get("key") or 0): list(k.get("points") or []) for k in spec.get("keys") or [] if k.get("points")}
+    if not keys and spec.get("points"):
+        keys = {int(spec.get("key") or 0): list(spec["points"])}
+    return sorted(keys.items())
 
 
 def _sam3_path() -> str:
@@ -1074,7 +1083,7 @@ def plan_spec(p: dict, m: dict | None, path: str = "") -> dict:
 
 
 def spec_has_mask(spec: dict) -> bool:
-    return bool(spec.get("ext") or spec.get("points") or str(spec.get("text") or "").strip())
+    return bool(spec.get("ext") or point_keys(spec) or str(spec.get("text") or "").strip())
 
 
 def ext_masks(ext: dict, analysis: dict, start: int, length: int, w: int, h: int) -> torch.Tensor:
@@ -1207,28 +1216,34 @@ def _track(model, imgs: torch.Tensor, init: torch.Tensor | None, cond, spec: dic
 
 
 def segment_frames(imgs: torch.Tensor, spec: dict) -> torch.Tensor:
-    """[N,H,W,3] -> [N,H,W] masks with SAM 3: tracked from the points on the key frame, or from the text."""
+    """[N,H,W,3] -> [N,H,W] masks with SAM 3, from the text or from the points of the key frames: each key frame's
+    points select the subject there and it is tracked from that frame up to the next key frame (before the first one,
+    backward from it), so a later key frame corrects the mask from its frame on."""
     from comfy_extras.nodes_sam3 import SAM3_Detect
     model, clip = _sam3()
     text = str(spec.get("text") or "").strip()
     cond = clip.encode_from_tokens_scheduled(clip.tokenize(text)) if text else None
-    pts = spec.get("points") or []
     N, H, W = imgs.shape[:3]
-    if not pts:
+    keys = [(max(0, min(N - 1, k)), pts) for k, pts in point_keys(spec)]
+    if not keys:
         if cond is None:
             raise ValueError("the shot's mask needs a text prompt or points")
         return _track(model, imgs, None, cond, spec)
-    key = max(0, min(N - 1, int(spec.get("key") or 0)))
-    pos = [{"x": p["x"] * W, "y": p["y"] * H} for p in pts if p.get("label", 1)]
-    neg = [{"x": p["x"] * W, "y": p["y"] * H} for p in pts if not p.get("label", 1)]
-    first = SAM3_Detect.execute(model=model, image=imgs[key:key + 1], positive_coords=json.dumps(pos),
-                                negative_coords=json.dumps(neg), threshold=float(spec["threshold"]),
-                                refine_iterations=2).args[0][:1].float()
-    fwd = _track(model, imgs[key:], first, None, spec)                     # key frame -> end
-    if key == 0:
-        return fwd
-    back = _track(model, imgs[:key + 1].flip(0), first, None, spec).flip(0)  # key frame -> start
-    return torch.cat([back[:-1], fwd], 0)
+
+    def detect(k, pts):
+        pos = [{"x": p["x"] * W, "y": p["y"] * H} for p in pts if p.get("label", 1)]
+        neg = [{"x": p["x"] * W, "y": p["y"] * H} for p in pts if not p.get("label", 1)]
+        return SAM3_Detect.execute(model=model, image=imgs[k:k + 1], positive_coords=json.dumps(pos),
+                                   negative_coords=json.dumps(neg), threshold=float(spec["threshold"]),
+                                   refine_iterations=2).args[0][:1].float()
+    out = torch.zeros(N, H, W)
+    for i, (k, pts) in enumerate(keys):
+        seed = detect(k, pts)
+        if i == 0 and k > 0:                                                  # first key frame -> start
+            out[:k + 1] = _track(model, imgs[:k + 1].flip(0), seed, None, spec).flip(0)
+        end = keys[i + 1][0] if i + 1 < len(keys) else N                      # this key frame -> the next one
+        out[k:end] = _track(model, imgs[k:end], seed, None, spec)
+    return out
 
 
 def _mask_key(path: str, analysis: dict, start: int, length: int, spec: dict) -> tuple:
@@ -1244,7 +1259,7 @@ def _mask_key(path: str, analysis: dict, start: int, length: int, spec: dict) ->
     else:
         e = None
     return (path, os.path.getmtime(path), float(analysis["fps"]), int(start), int(length),
-            json.dumps({k: spec[k] for k in ("text", "points", "key", "threshold", "max_objects")}, sort_keys=True), e)
+            json.dumps({"keys": point_keys(spec), **{k: spec[k] for k in ("text", "threshold", "max_objects")}}, sort_keys=True), e)
 
 
 def shot_mask(path: str, analysis: dict, start: int, length: int, spec: dict) -> dict:
@@ -1268,8 +1283,8 @@ def shot_mask(path: str, analysis: dict, start: int, length: int, spec: dict) ->
         frames = _read_frames(path, src[idx], (w, h), stage="Reading the shot")
         imgs = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
         _status(f"Segmenting {len(frames)} frames with SAM 3", force=True)
-        what = f"{len(spec.get('points') or [])} points on frame {int(spec.get('key') or 0)}" if spec.get("points") \
-            else f"'{spec.get('text', '')}'"
+        keys = point_keys(spec)
+        what = (", ".join(f"{len(p)} points on frame {k}" for k, p in keys)) if keys else f"'{spec.get('text', '')}'"
         print(f"[BFS Shot] SAM 3: segmenting {what} on {len(frames)} frames ({w}x{h}, timeline {start}-{start + length - 1})…",
               flush=True)
         t0 = time.time()
@@ -1480,13 +1495,15 @@ def uncrop(result: torch.Tensor, shot: dict, edge_hardness: float = 0.0, match_c
 
 def mask_preview(path: str, analysis: dict, start: int, length: int, spec: dict, count: int = 6,
                  color: str = "#ff283c", opacity: float = 0.55) -> dict:
-    """A few frames of the shot with the selected region tinted and the crop box, as data URLs."""
+    """`count` frames of the shot (0 = every frame, smaller, for the points window's player) with the selected region
+    tinted and the crop box, as data URLs."""
     import cv2
     r = shot_mask(path, analysis, start, length, spec)
     masks, (w, h), box = r["masks"], r["size"], r["box"]
     src = _timeline(analysis["n_src"], analysis["fps_src"], float(analysis["fps"]))
-    picks = sorted(set(int(round(i)) for i in np.linspace(0, length - 1, min(count, length))))
+    picks = list(range(length)) if count <= 0 else sorted(set(int(round(i)) for i in np.linspace(0, length - 1, min(count, length))))
     frames = _read_frames(path, src[np.clip(np.array(picks) + start, 0, analysis["n"] - 1)], (w, h))
+    small = 384 / max(w, h) if count <= 0 and max(w, h) > 384 else 1.0   # every frame: ~10 KB each
     try:
         tint = np.array([int(color[i:i + 2], 16) for i in (1, 3, 5)], dtype=np.float32)
         alpha = min(0.8, max(0.05, float(opacity)))
@@ -1500,7 +1517,9 @@ def mask_preview(path: str, analysis: dict, start: int, length: int, spec: dict,
         if box:
             x0, y0, x1, y1 = box_px(box, w, h)
             cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), (255, 210, 90), 2)
-        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if small < 1.0:
+            img = cv2.resize(img, (int(w * small) // 2 * 2, int(h * small) // 2 * 2), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 80 if small == 1.0 else 70])
         out.append({"f": start + i, "src": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()})
     cover = float(masks.float().mean()) if masks.numel() else 0.0
     return {"box": box, "frames": out, "coverage": cover, "empty": box is None}
@@ -1519,7 +1538,8 @@ TARGET_Q = ("Describe the main subject in this picture (a person, an animal, a c
 def target_crop(path: str, analysis: dict, start: int, length: int, spec: dict, pad: float = 0.12):
     """The selected subject (the shot's SAM 3 points / text, on its key frame) cropped from that frame, RGB uint8."""
     src = _timeline(analysis["n_src"], analysis["fps_src"], float(analysis["fps"]))
-    key = max(0, min(length - 1, int(spec.get("key") or length // 2)))
+    keys = point_keys(spec)
+    key = max(0, min(length - 1, keys[0][0] if keys else int(spec.get("key") or length // 2)))
     fr = _read_frames(path, src[np.clip(np.array([start + key]), 0, analysis["n"] - 1)], None)[0]
     if spec.get("ext"):
         sm = shot_mask(path, analysis, start, length, spec)["masks"]
@@ -3965,8 +3985,8 @@ def color_marks(plan: dict, m: dict) -> list[dict]:
                    "key": m.get("color_guide_key2")}] if m.get("color_guide_text2") or m.get("color_guide_points2") else [])
     marks = [{"picture": max(1, int(m.get("color_guide_picture") or 1))}]
     marks += [{"picture": max(1, int(r.get("picture") or 2)), "text": str(r.get("text") or "").strip(),
-               "points": list(r.get("points") or []), "key": int(r.get("key") or 0)}
-              for r in extra if isinstance(r, dict) and (str(r.get("text") or "").strip() or r.get("points"))]
+               "points": list(r.get("points") or []), "key": int(r.get("key") or 0), "keys": list(r.get("keys") or [])}
+              for r in extra if isinstance(r, dict) and (str(r.get("text") or "").strip() or r.get("points") or r.get("keys"))]
     for x in marks:
         x["color"] = picture_color(plan, x["picture"])
     return marks
@@ -3985,6 +4005,7 @@ def extra_mark_masks(shot: dict, log: str = "") -> list[tuple]:
     out = []
     for x in extra:
         spec = dict(DEFAULT_MASK, text=x.get("text") or "", points=x.get("points") or [], key=x.get("key") or 0,
+                    keys=x.get("keys") or [],
                     max_objects=1)
         out.append((shot_mask(ms["path"], ms["analysis"], ms["start"], ms["length"], spec)["masks"], x))
     return out

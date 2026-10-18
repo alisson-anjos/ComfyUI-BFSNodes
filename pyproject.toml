@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
 description = "Custom ComfyUI nodes for reference-guided video: BFS Sampler (guide-driven IC-LoRAs, auto crop, mask inpainting, temporal chunking), LTX Multiple Controls / Identity Transfer / Edit Anything, Head-Swap and Anime2Real conditioning, MiniMax-H3 latent guides, RoPE layouts and loaders, LoRA Surgery, and Shot Planner / Shot Loop (tabbed panel): split long videos into shots at camera cuts, face-tracked cast, SAM 3 mask per shot with full frame, paste, mask, crop and crop + mask generation modes, optional translucent Colored Mark overlay for manually selected regions, optional Qwen3-VL to suggest settings, describe references ({details}) and the person to replace ({target}), continuity between shots, H3 conditioning with an optional duet and prompt writer, join with the original timing, audio and a side-by-side comparison. H3 Duet: pin a source clip beside the video, training-free."
-version = "1.115.1"
+version = "1.116.0"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",
