@@ -2,7 +2,7 @@ import { reactive, onMounted, onBeforeUnmount } from '../vendor/vue.esm-browser.
 import { h } from './common.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
+  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false;
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
@@ -11,6 +11,7 @@ export function createAgent(c, io, app) {
   }
   function apply(j) {
     if(!a.task){a.task=j.task||'';Object.assign(a.settings,j.settings||{});}
+    a.previewHistory=j.preview_history||[];
     a.vlmInfo=j.vlm_info||null;
     a.requiresNewTask=!!j.requires_new_task||String(j.observation?.error||'').includes('Workflow VAE loader rejected');
     a.checklist=j.checklist||[];a.id=j.id;a.status=j.status;a.events=j.events||[];a.observation=j.observation||{};a.preview=j.preview;a.combined=j.combined;
@@ -131,9 +132,21 @@ export function agentTab(c) {
       h('img',{src:f.src,style:'max-width:220px;max-height:200px'}),h('figcaption',f.label||`latent ${f.latent_index??f.f??''}`)]))),
     a.preview?.review?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(a.preview.review,null,2)):null,
     a.combined?h('a',{href:c.api.apiURL(`/view?filename=${encodeURIComponent(a.combined.filename)}&subfolder=${encodeURIComponent(a.combined.subfolder||'')}&type=output`),target:'_blank'},'Open assembled video'):null,
+    h('details',[h('summary','Render history · approximate previews'),...a.previewHistory.slice().reverse().map(t=>h('details',[
+      h('summary',`Render ${t.render} · ${t.status}`),
+      t.reason?h('div',t.reason):null,
+      t.render_status?.status_str!=='success'&&t.render_status?h('details',[h('summary','Render error details'),h('pre',{style:'white-space:pre-wrap'},JSON.stringify(t.render_status,null,2))]):null,
+      ...(t.captures||[]).map(v=>h('div',[
+        h('div',`Shot ${v.shot??'?'} · step ${v.step}/${v.total_steps} · approximate`),
+        h('div',{class:'row',style:'flex-wrap:wrap'},(v.frames||[]).map(f=>h('img',{src:f.src.startsWith('/view?')?c.api.apiURL(f.src):f.src,style:'max-width:180px;max-height:180px;margin:4px',loading:'lazy'}))),
+        v.review?h('div',v.review.reason||''):null,
+      ])),
+      !(t.captures||[]).length?h('div','No preview captured before this render ended.'):null,
+    ]))]),
     h('details',{open:true},[h('summary','Activity and tool calls'),h('div',{style:'max-height:420px;overflow:auto'},a.events.slice(-60).reverse().map(e=>h('div',{style:'padding:6px;border-bottom:1px solid #444'},[
       h('b',`${new Date(e.time*1000).toLocaleTimeString()} · ${e.tool||e.kind}`),
       h('div',e.summary||e.error||''),
+      ...[['observed','Observed'],['reason','Reason'],['expected','Expected'],['uncertainty','Uncertainty']].filter(([k])=>e[k]).map(([k,label])=>h('div',`${label}: ${e[k]}`)),
       e.arguments?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(e.arguments,null,2)):null,
     ])))]),
     h('details',[h('summary','Latest observation'),h('pre',{style:'white-space:pre-wrap;max-height:300px;overflow:auto'},JSON.stringify(a.observation,(k,v)=>k==='src'?'[image]':v,2))]),

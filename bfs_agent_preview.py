@@ -198,6 +198,8 @@ class PreviewSampler:
                         ],
                     }
                     s.preview = preview
+                    if s.record_preview:
+                        s.record_preview(preview)
                     p._notify("bfs-agent-preview", {"id": s.id, "preview": preview})
                     # Review is synchronous at a sampler boundary; restore diffusion models before the next step.
                     if self.review and (step + 1) / max(1, total) >= 0.35:
@@ -234,6 +236,8 @@ class PreviewSampler:
                         ).args[0]
                         decision = p._parse_json(str(out))
                         preview["review"] = decision
+                        if s.record_preview:
+                            s.record_preview(preview)
                         s.event(
                             "preview", step=step + 1, total_steps=total, review=decision
                         )

@@ -128,7 +128,7 @@ class SessionTests(unittest.TestCase):
         with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
             runtime.Runtime(planner).decide(session)
         self.assertEqual(generate.call_count, 1)
-        self.assertEqual(session.events, [])
+        self.assertEqual([e["phase"] for e in session.events], ["thinking"])
 
     def test_no_second_call_when_thinking_is_disabled(self):
         fake = types.ModuleType("comfy_extras.nodes_textgen")
@@ -167,7 +167,7 @@ class SessionTests(unittest.TestCase):
             )
         self.assertEqual(len(calls), 1)
         self.assertEqual(session.error_count, 0)
-        self.assertEqual(session.events, [])
+        self.assertEqual([e["phase"] for e in session.events], ["thinking"])
 
     def test_finalization_does_not_bypass_registered_tool_validation(self):
         fake = types.ModuleType("comfy_extras.nodes_textgen")
@@ -1064,6 +1064,82 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         self.assertFalse(
             runtime.invalid_vae_failure({"status_str": "error", "messages": []})
         )
+
+
+class PreviewHistoryTests(unittest.TestCase):
+    def test_capture_survives_restore_and_failure_keeps_review(self):
+        with tempfile.TemporaryDirectory() as folder:
+            planner = types.SimpleNamespace(
+                folder_paths=types.SimpleNamespace(get_output_directory=lambda: folder),
+                _notify=lambda *args: None,
+            )
+            rt = runtime.Runtime(planner)
+            session = core.Session("swap", {}, {})
+            session.renders = 1
+            session.pending_render = {"prompt_id": "test-prompt", "kind": "render"}
+            rt.attach(session)
+            image = runtime.image_url(torch.zeros(1, 8, 8, 3))
+            capture = {
+                "shot": 0,
+                "step": 7,
+                "total_steps": 8,
+                "fraction": 0.875,
+                "approximate": True,
+                "frames": [{"src": image}],
+            }
+            session.record_preview(capture)
+            files = list((Path(folder) / "bfs_agent" / session.id).rglob("*.jpg"))
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].read_bytes().startswith(b"\xff\xd8"))
+            saved = json.loads(
+                (Path(folder) / "bfs_agent" / (session.id + ".json")).read_text()
+            )
+            self.assertNotIn("base64", json.dumps(saved["preview_history"]))
+            capture["review"] = {"decision": "retry", "reason": "Wrong composition"}
+            session.record_preview(capture)
+            self.assertEqual(len(session.preview_history[0]["captures"]), 1)
+            rt.render_outcome(session, {"status_str": "error"})
+            self.assertEqual(session.preview_history[0]["status"], "visually_rejected")
+            restored = rt.get(session.id)
+            try:
+                self.assertEqual(
+                    restored.preview_history[0]["reason"], "Wrong composition"
+                )
+            finally:
+                runtime.SESSIONS.pop(session.id, None)
+
+    def test_failure_without_preview_does_not_invent_images(self):
+        with tempfile.TemporaryDirectory() as folder:
+            rt = runtime.Runtime(
+                types.SimpleNamespace(
+                    folder_paths=types.SimpleNamespace(
+                        get_output_directory=lambda: folder
+                    )
+                )
+            )
+            session = core.Session("swap", {}, {})
+            session.pending_render = {"prompt_id": "failed", "kind": "render"}
+            rt.render_outcome(session, {"status_str": "error"})
+            self.assertEqual(session.preview_history[0]["status"], "technical_failure")
+            self.assertEqual(session.preview_history[0]["captures"], [])
+
+    def test_public_explanation_is_bounded_and_private_output_is_discarded(self):
+        result = core.parse_action(
+            "<think>private reasoning</think>"
+            + json.dumps(
+                {
+                    "tool": "inspect_source",
+                    "arguments": {"shot": 0},
+                    "observed": "Source not inspected",
+                    "reason": "Check movement",
+                    "expected": "x" * 900,
+                    "uncertainty": "Identity unverified",
+                }
+            )
+        )
+        self.assertEqual(result["reason"], "Check movement")
+        self.assertEqual(len(result["expected"]), 500)
+        self.assertNotIn("private reasoning", json.dumps(result))
 
 
 if __name__ == "__main__":

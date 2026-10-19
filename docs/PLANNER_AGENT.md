@@ -206,3 +206,22 @@ writing, reference descriptions and preview review), not only Agent decisions. T
 a repeated-generation failure mode reported upstream in ComfyUI issue #16441:
 https://github.com/Comfy-Org/ComfyUI/issues/16441
 Repeated-generation GPU stability still needs verification on the affected installation.
+
+### Decision explanations and render evidence
+
+Actions may include concise public `observed`, `reason`, `expected`, and
+`uncertainty` explanations. The activity panel displays these alongside the tool
+and arguments. A decision-start event reports the current phase and token budget;
+private model reasoning is not displayed or persisted.
+
+Intermediate captures are written as JPEGs under
+`output/bfs_agent/<session>/previews/<attempt>/` before VLM review. Session JSON
+stores the capture URLs, reviews, and render outcomes. Render history preserves
+captures across retries, distinguishes technical failures from preview rejection,
+and explicitly labels approximate previews. Failed renders with no captured
+preview are recorded without invented images. A completed render is not a visual
+quality approval. Persistence errors disable the optional preview adapter using
+its existing error path. Captures survive later failures; nothing can recover a
+preview that was never decoded and saved. Existing sessions without these fields
+remain readable. This history is session-specific, not automatic cross-video
+memory or context summarization. No external classifier service is enabled.

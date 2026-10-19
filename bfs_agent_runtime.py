@@ -202,6 +202,7 @@ class Runtime:
             s.reviewed = set(d.get("reviewed", []))
             s.combined = d.get("combined")
             s.preview = d.get("preview")
+            s.preview_history = d.get("preview_history", [])
             s.vlm_info = d.get("vlm_info")
             s.requires_new_task = bool(
                 d.get("requires_new_task")
@@ -221,12 +222,96 @@ class Runtime:
         return SESSIONS[sid]
 
     def attach(self, s):
+        s.record_preview = lambda preview: self.record_preview(s, preview)
         s.notify = lambda event: self.p._notify(
             "bfs-agent-event", {"id": s.id, "event": event}
         )
 
     def save(self, s):
         s.persist(self.folder())
+
+    def record_preview(self, s, preview):
+        """Write CPU JPEG captures before calling the reviewer; keep URLs in session JSON."""
+        pending = s.pending_render or {}
+        attempt = str(pending.get("prompt_id") or f"render-{s.renders}")
+        import hashlib
+
+        key = hashlib.sha256(attempt.encode()).hexdigest()[:20]
+        record = next((x for x in s.preview_history if x["id"] == key), None)
+        if record is None:
+            record = {
+                "id": key,
+                "render": s.renders,
+                "revision": s.revision,
+                "status": "capturing",
+                "captures": [],
+                "time": time.time(),
+            }
+            s.preview_history.append(record)
+        capture = copy.deepcopy(preview)
+        capture["time"] = time.time()
+        folder = self.folder() / s.id / "previews" / key
+        folder.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(capture.get("frames", [])):
+            src = frame.get("src", "")
+            if not src.startswith("data:image/jpeg;base64,"):
+                continue
+            filename = f"shot-{preview.get('shot', 'unknown')}-step-{preview.get('step', 0)}-{i}.jpg"
+            (folder / filename).write_bytes(
+                base64.b64decode(src.split(",", 1)[1], validate=True)
+            )
+            subfolder = folder.relative_to(self.folder().parent).as_posix()
+            frame["src"] = "/view?" + urllib.parse.urlencode(
+                {"filename": filename, "subfolder": subfolder, "type": "output"}
+            )
+        captures = record["captures"]
+        match = next(
+            (
+                i
+                for i, x in enumerate(captures)
+                if x.get("step") == capture.get("step")
+                and x.get("shot") == capture.get("shot")
+            ),
+            None,
+        )
+        if match is None:
+            captures.append(capture)
+        else:
+            captures[match] = capture
+        review = capture.get("review") or {}
+        if review.get("decision") == "retry" and capture.get("fraction", 0) >= 0.65:
+            record.update(
+                status="visually_rejected", reason=str(review.get("reason", ""))[:1000]
+            )
+        self.save(s)
+
+    def render_outcome(self, s, status):
+        pending = s.pending_render or {}
+        if pending.get("kind") == "context":
+            return
+        import hashlib
+
+        key = hashlib.sha256(
+            str(pending.get("prompt_id") or f"render-{s.renders}").encode()
+        ).hexdigest()[:20]
+        record = next((x for x in s.preview_history if x["id"] == key), None)
+        if record is None:
+            record = {
+                "id": key,
+                "render": s.renders,
+                "revision": s.revision,
+                "captures": [],
+                "time": time.time(),
+            }
+            s.preview_history.append(record)
+        if record.get("status") != "visually_rejected":
+            record["status"] = (
+                "render_completed"
+                if status.get("status_str") == "success"
+                else "technical_failure"
+            )
+        record["render_status"] = status
+        self.save(s)
 
     def context(self, s):
         p = self.p
@@ -362,6 +447,12 @@ class Runtime:
                 )
             )
 
+        s.event(
+            "decision",
+            phase="thinking" if thinking else "select_action",
+            summary="Evaluating observations and choosing the next action.",
+            token_budget=budget,
+        )
         with GPU_LOCK:
             output = generate(prompt, budget - reserve, thinking)
             text = str(output.args[0] or "").strip()
@@ -760,6 +851,26 @@ class Runtime:
                 (backup / "render.json").write_text(
                     json.dumps(s.render_snapshot), encoding="utf-8"
                 )
+                record = next(
+                    (
+                        x
+                        for x in reversed(s.preview_history)
+                        if x.get("revision") == s.rendered_revision
+                        and x.get("status") in ("render_completed", "visually_rejected")
+                    ),
+                    None,
+                )
+                if record is not None:
+                    record["status"] = "visually_rejected"
+                    record["reason"] = next(
+                        (
+                            e.get("reason") or e.get("summary", "")
+                            for e in reversed(s.events)
+                            if e.get("tool") == "retry_shot"
+                        ),
+                        "Retry requested",
+                    )
+                    self.save(s)
                 out = p.redo_shots(s.plan, [ri], True)
                 out["archived_take"] = backup.name
             else:
@@ -1110,6 +1221,7 @@ def register(planner):
                         await asyncio.sleep(2)
                         continue
                     st = entry.get("status", {})
+                    rt.render_outcome(s, st)
                     preview_review = (s.preview or {}).get("review")
                     kind = s.pending_render.get("kind", "render")
                     revision = s.pending_render.get("revision", -1)

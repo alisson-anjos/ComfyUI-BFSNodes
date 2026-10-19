@@ -132,7 +132,8 @@ TABS = {
     "inspect_preview": "run",
 }
 SYSTEM = """You operate the BFS Shot Planner using tools, not prose promises. Fulfil the user's video task.
-Return exactly one JSON object: {"tool":"tool_name","arguments":{},"summary":"short user-facing action explanation"}.
+Return exactly one JSON object: {"tool":"tool_name","arguments":{},"summary":"short user-facing action explanation","observed":"brief evidence","reason":"brief decision justification","expected":"what this action should verify or change","uncertainty":"remaining doubt, or empty"}.
+These are concise public explanations, never a transcript of internal thinking. Distinguish observed facts from hypotheses.
 Choose one action per turn. Inspect the plan, publish a step-by-step checklist and keep it updated. Observe source and references before editing. Inspect SAM overlays before rendering.
 Loading VLM context is not a video render. When current_plan_rendered is false, call render before inspect_result or combine.
 Inspect results for identity, motion, background preservation, mask edges, temporal continuity and requested changes.
@@ -168,11 +169,15 @@ def parse_action(text):
         raise ValueError("Expected an action with a registered tool")
     if not isinstance(action.get("arguments", {}), dict):
         raise ValueError("Tool arguments must be an object")
-    return {
+    result = {
         "tool": action["tool"],
         "arguments": action.get("arguments", {}),
         "summary": str(action.get("summary", ""))[:500],
     }
+    for key in ("observed", "reason", "expected", "uncertainty"):
+        if isinstance(action.get(key), str):
+            result[key] = action[key][:500]
+    return result
 
 
 def bounded_path(roots, root, relative):
@@ -223,6 +228,8 @@ class Session:
         self.lock = threading.Lock()
         self.error_count = 0
         self.preview = None
+        self.preview_history = []
+        self.record_preview = None
         self.updated = time.time()
         self.workflow = None
         self.planner_id = None
@@ -259,6 +266,7 @@ class Session:
             "checklist": self.checklist,
             "combined": self.combined,
             "preview": self.preview,
+            "preview_history": self.preview_history,
             "vlm_info": self.vlm_info,
             "requires_new_task": self.requires_new_task,
             "updated": self.updated,
