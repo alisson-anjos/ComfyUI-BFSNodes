@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import time
+import json
 import math
 
 from .bfs_agent_inference import cuda_context_fault, mark_cuda_fault
@@ -239,6 +240,8 @@ class PreviewSampler:
                         prompt = (
                             "Evaluate this APPROXIMATE intermediate video preview against the task: "
                             + s.task
+                            + "\nUser feedback: "
+                            + json.dumps(s.feedback, ensure_ascii=False)
                             + f"\nProgress {(step + 1) / total:.0%}. Early previews cannot establish fine identity. "
                             'Images: intermediate generated previews first (may include continuity head and end padding), then source frames strictly inside the current shot, then references when connected. Do not treat head/padding outside the shot as a failure. Return JSON only: {"decision":"continue" or "retry", "reason":"brief observed evidence"}. '
                             "Choose retry only for an unmistakable major composition failure after 65% progress. "

@@ -54,3 +54,40 @@ test('invalid VAE workflow disables Resume and permits starting a fresh task', a
   assert.equal(resume.props.disabled, true);
   assert.equal(start.props.disabled, false);
 });
+
+test('feedback survives polling, sends separately from task, and clears only on success', async () => {
+  const c = context();
+  c.agent.a.status = 'complete';
+  let sent;
+  c.api.fetchApi = async (url, options) => {
+    if(options)sent=JSON.parse(options.body);
+    return {ok:true,json:async()=>({id:'test',status:'running',events:[],feedback:[{text:'Preserve the other person'}]})};
+  };
+  const input=find(agentTab(c),n=>n.tag==='textarea'&&n.props.maxLength===4000);
+  input.props.onInput({target:{value:'Preserve the other person'}});
+  await c.agent.poll();
+  assert.equal(c.agent.a.feedback,'Preserve the other person');
+  c.agent.a.status='complete';
+  assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,false);
+  await c.agent.sendFeedback();
+  assert.equal(sent.action,'feedback');
+  assert.equal(sent.feedback,'Preserve the other person');
+  assert.equal(c.agent.a.task,'existing task');
+  assert.equal(c.agent.a.feedback,'');
+  assert.equal(c.agent.a.feedbackHistory.length,1);
+  c.agent.a.feedback='Retry this correction';
+  c.api.fetchApi=async()=>({ok:false,json:async()=>({error:'Wait for current action'})});
+  await c.agent.sendFeedback();
+  assert.equal(c.agent.a.feedback,'Retry this correction');
+  assert.match(c.agent.a.error,/Wait for current action/);
+});
+
+test('feedback requires pausing active sessions and cannot bypass invalid workflow',()=>{
+  const c=context();c.agent.a.feedback='Fix only the target';
+  for(const status of ['running','waiting_render','stopped']){
+    c.agent.a.status=status;
+    assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
+  }
+  c.agent.a.status='paused';c.agent.a.requiresNewTask=true;
+  assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
+});

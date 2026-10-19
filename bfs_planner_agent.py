@@ -137,6 +137,8 @@ These are concise public explanations, never a transcript of internal thinking. 
 Choose one action per turn. Inspect the plan, publish a step-by-step checklist and keep it updated. Observe source and references before editing. Inspect SAM overlays before rendering.
 Loading VLM context is not a video render. When current_plan_rendered is false, call render before inspect_result or combine.
 Inspect results for identity, motion, background preservation, mask edges, temporal continuity and requested changes.
+USER FEEDBACK is a correction to the task and remains relevant across subsequent decisions. Inspect the rejected result and affected source shots, update the checklist, then correct only affected shots. Do not simply repeat an unchanged render or claim success from the previous combined output.
+For a single-target swap in a multi-person scene, identify the requested person and preserve every other person. If the swap affected multiple people, use segment with specific text/positive and negative points as needed, inspect the mask overlay, and consider crop/inpaint/paste for localized editing. Verify target identity AND preservation of other people across the shot before finishing. Do not assume a color mark alone guarantees isolation.
 Use all relevant reference pictures. Reference pictures define identity; source video defines movement unless asked otherwise.
 Intermediate previews are approximate: early steps support composition checks, not reliable fine identity judgement.
 Do not claim perfection. Prefer concrete criteria, preserve good takes, correct only failed shots and respect budgets.
@@ -214,6 +216,7 @@ class Session:
         }
         self.status = "running"
         self.events = []
+        self.feedback = []
         self.renders = 0
         self.revision = 0
         self.rendered_revision = -1
@@ -247,10 +250,49 @@ class Session:
         if self.notify:
             self.notify(self.events[-1])
 
+    def validate_feedback(self, text):
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Write feedback describing what should be corrected")
+        text = text.strip()
+        if len(text) > 4000:
+            raise ValueError("Feedback must be at most 4000 characters")
+        if (
+            len(self.feedback) >= 40
+            or sum(len(x["text"]) for x in self.feedback) + len(text) > 16000
+        ):
+            raise ValueError(
+                "Session feedback limit reached; start a new task with consolidated instructions"
+            )
+        return text
+
+    def add_feedback(self, text):
+        text = self.validate_feedback(text)
+        item = {
+            "text": text,
+            "time": time.time(),
+            "revision": self.revision,
+            "render": self.renders,
+        }
+        self.feedback.append(item)
+        self.reviewed.clear()
+        self.combined = None
+        for attempt in reversed(self.preview_history):
+            if attempt.get("revision") == self.rendered_revision:
+                attempt.setdefault("user_feedback", []).append(item.copy())
+                break
+        self.observation = {
+            "user_feedback": text,
+            "message": "Inspect the rejected result and source, update the checklist, and correct the affected shots. Previous approval is withdrawn.",
+        }
+        self.event(
+            "feedback", summary=text, revision=self.revision, render=self.renders
+        )
+
     def public(self):
         return {
             "id": self.id,
             "task": self.task,
+            "feedback": self.feedback,
             "plan": self.plan,
             "settings": self.settings,
             "status": self.status,

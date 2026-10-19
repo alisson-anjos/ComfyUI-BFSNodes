@@ -2,7 +2,7 @@ import { reactive, onMounted, onBeforeUnmount } from '../vendor/vue.esm-browser.
 import { h } from './common.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
+  const a = reactive({ task:'', feedback:'', feedbackHistory:[], id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false;
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
@@ -11,6 +11,7 @@ export function createAgent(c, io, app) {
   }
   function apply(j) {
     if(!a.task){a.task=j.task||'';Object.assign(a.settings,j.settings||{});}
+    a.feedbackHistory=j.feedback||[];
     a.previewHistory=j.preview_history||[];
     a.vlmInfo=j.vlm_info||null;
     a.requiresNewTask=!!j.requires_new_task||String(j.observation?.error||'').includes('Workflow VAE loader rejected');
@@ -46,6 +47,15 @@ export function createAgent(c, io, app) {
       apply(await post('/start',{task:a.task,plan:JSON.parse(JSON.stringify(c.plan)),settings:{...a.settings},workflow:graph.output,planner_id:plannerId,client_id:c.api.clientId}));
     } catch(e){a.error=String(e.message||e);}finally{a.working=false;}
   }
+  async function sendFeedback() {
+    a.error='';a.working=true;
+    try {
+      const text=a.feedback.trim();
+      if(!text)throw new Error('Describe what should be corrected first.');
+      apply(await post('/control',{id:a.id,action:'feedback',feedback:text,settings:{...a.settings},plan:JSON.parse(JSON.stringify(c.plan))}));
+      a.feedback='';
+    }catch(e){a.error=String(e.message||e);}finally{a.working=false;}
+  }
   async function control(action) {
     a.error='';try{apply(await post('/control',{id:a.id,action,settings:{...a.settings},plan:JSON.parse(JSON.stringify(c.plan))}));}catch(e){a.error=String(e.message||e);}
   }
@@ -63,7 +73,7 @@ export function createAgent(c, io, app) {
     c.api.addEventListener('bfs-agent-event',event);c.api.addEventListener('bfs-agent-preview',preview);
   });
   onBeforeUnmount(()=>{dead=true;clearInterval(timer);c.api.removeEventListener('bfs-agent-event',event);c.api.removeEventListener('bfs-agent-preview',preview);});
-  return {a,start,control,poll};
+  return {a,start,control,poll,sendFeedback};
 }
 
 export function agentBar(c) {
@@ -89,7 +99,7 @@ export function agentBar(c) {
 }
 
 export function agentTab(c) {
-  const {a,start,control}=c.agent;
+  const {a,start,control,sendFeedback}=c.agent;
   const setting=(name,label,type='number')=>h('label',{style:'display:flex;gap:8px;align-items:center'},[
     label,h('input',{type,min:type==='number'?(name==='max_tokens'?512:1):undefined,max:type==='number'?({max_tokens:16384,max_actions:200,max_renders:20}[name]):undefined,value:a.settings[name],checked:!!a.settings[name],onInput:type==='checkbox'?undefined:e=>{a.settings[name]=type==='number'&&e.target.value!==''?Number(e.target.value):e.target.value;},onChange:type==='checkbox'?e=>{a.settings[name]=e.target.checked;}:undefined})]);
   const frames=a.preview?.frames||a.observation.frames||[];
@@ -123,6 +133,13 @@ export function agentTab(c) {
       h('button',{onClick:()=>control('stop'),disabled:!a.id},'Stop'),
     ]),
     h('div',{class:'hint'},'Runs on the server, including when this tab is closed. Pause stops after the current tool; a queued render may finish. Stop cancels this session’s render. For intermediate H3 previews, connect BFS Agent Preview Sampler between sampler selection and SamplerCustom; session binding is automatic.'),
+    a.id?h('div',{style:'display:grid;gap:8px'},[
+      h('label','Feedback for this session'),
+      h('textarea',{value:a.feedback,rows:3,maxLength:4000,placeholder:'What went wrong? Identify the shot/person, what must change and what must stay unchanged.',style:'width:100%;box-sizing:border-box',onInput:e=>{a.feedback=e.target.value;}}),
+      h('button',{onClick:sendFeedback,disabled:a.working||!a.feedback.trim()||a.requiresNewTask||!['paused','error','budget_exhausted','complete'].includes(a.status)},'Send feedback and continue'),
+      h('div',{class:'hint'},'Pause and wait for the current action before sending. Completed sessions can continue with feedback. History is preserved; action and render limits still apply.'),
+      a.feedbackHistory.length?h('details',[h('summary',`Previous feedback (${a.feedbackHistory.length})`),...a.feedbackHistory.map(f=>h('div',{style:'white-space:pre-wrap;padding:6px'},f.text))]):null,
+    ]):null,
     a.checklist.length?h('ol',a.checklist.map(step=>h('li',`${{pending:'○',in_progress:'▶',done:'✓'}[step.status]} ${step.title}`))):null,
     a.error?h('div',{class:'err'},a.error):null,
     a.requiresNewTask?h('div',{class:'err'},'Fix the VAE loader/connections in the workflow, then click Start automatic task. Resume uses the old snapshot and is unavailable for this error.'):null,
@@ -135,6 +152,7 @@ export function agentTab(c) {
     h('details',[h('summary','Render history · approximate previews'),...a.previewHistory.slice().reverse().map(t=>h('details',[
       h('summary',`Render ${t.render} · ${t.status}`),
       t.reason?h('div',t.reason):null,
+      ...(t.user_feedback||[]).map(f=>h('div',`User feedback: ${f.text}`)),
       t.render_status?.status_str!=='success'&&t.render_status?h('details',[h('summary','Render error details'),h('pre',{style:'white-space:pre-wrap'},JSON.stringify(t.render_status,null,2))]):null,
       ...(t.captures||[]).map(v=>h('div',[
         h('div',`Shot ${v.shot??'?'} · step ${v.step}/${v.total_steps} · approximate`),

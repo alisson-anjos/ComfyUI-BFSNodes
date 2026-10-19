@@ -795,6 +795,40 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                     "recursive",
                 )
                 self.assertEqual(s.rendered_revision, s.revision)
+                invalid_feedback = await registered[
+                    ("POST", "/bfs/shotloop/agent/control")
+                ](
+                    types.SimpleNamespace(
+                        json=lambda: asyncio.sleep(
+                            0, result={"id": sid, "action": "feedback", "feedback": " "}
+                        )
+                    )
+                )
+                self.assertEqual(invalid_feedback.status, 400)
+                self.assertEqual(s.status, "complete")
+                self.assertEqual(s.feedback, [])
+                # A completed session accepts correction without a new session or lost take.
+                feedback_response = await registered[
+                    ("POST", "/bfs/shotloop/agent/control")
+                ](
+                    types.SimpleNamespace(
+                        json=lambda: asyncio.sleep(
+                            0,
+                            result={
+                                "id": sid,
+                                "action": "feedback",
+                                "feedback": "Preserve the second person",
+                            },
+                        )
+                    )
+                )
+                self.assertEqual(feedback_response.status, 200, feedback_response.text)
+                self.assertEqual(s.id, sid)
+                self.assertEqual(s.feedback[-1]["text"], "Preserve the second person")
+                self.assertEqual(s.reviewed, set())
+                self.assertIsNone(s.combined)
+                self.assertEqual(s.renders, 1)
+                s.cancel.set()
                 s.status = "paused"
                 controls = {
                     "id": sid,
@@ -1064,6 +1098,76 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         self.assertFalse(
             runtime.invalid_vae_failure({"status_str": "error", "messages": []})
         )
+
+
+class FeedbackTests(unittest.TestCase):
+    def test_feedback_withdraws_approval_preserves_render_and_survives_restore(self):
+        with tempfile.TemporaryDirectory() as folder:
+            rt = runtime.Runtime(
+                types.SimpleNamespace(
+                    folder_paths=types.SimpleNamespace(
+                        get_output_directory=lambda: folder
+                    ),
+                    _notify=lambda *args: None,
+                )
+            )
+            s = core.Session("Replace only the soldier", {"video": "source.mp4"})
+            s.status = "complete"
+            s.reviewed = {0, 1}
+            s.combined = {"filename": "old.mp4"}
+            s.rendered_revision = s.revision
+            s.render_snapshot = {"plan": "original"}
+            s.preview_history = [{"id": "take", "revision": s.revision, "captures": []}]
+            s.add_feedback(
+                "Only change the left soldier; the second person must stay unchanged"
+            )
+            self.assertEqual(s.reviewed, set())
+            self.assertIsNone(s.combined)
+            self.assertEqual(s.rendered_revision, s.revision)
+            self.assertEqual(s.render_snapshot, {"plan": "original"})
+            self.assertEqual(s.renders, 0)
+            self.assertEqual(s.events[-1]["kind"], "feedback")
+            self.assertEqual(
+                s.preview_history[0]["user_feedback"][0]["text"], s.feedback[0]["text"]
+            )
+            rt.save(s)
+            restored = rt.get(s.id)
+            try:
+                self.assertEqual(restored.feedback, s.feedback)
+            finally:
+                runtime.SESSIONS.pop(s.id, None)
+
+    def test_feedback_reaches_model_after_activity_history_rolls_over(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        prompts = []
+
+        def generate(*args, **kw):
+            prompts.append(kw["prompt"])
+            return types.SimpleNamespace(
+                args=(action("inspect_result", shot=0), "private")
+            )
+
+        s = core.Session("swap", {}, {})
+        s.add_feedback("Do not change the person on the right")
+        for _ in range(20):
+            s.event("status", summary="old activity")
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            runtime.Runtime(planner).decide(s)
+        self.assertIn("Do not change the person on the right", prompts[0])
+        self.assertNotIn("private", json.dumps(s.public()))
+
+    def test_invalid_feedback_does_not_withdraw_approval(self):
+        s = core.Session("swap", {}, {})
+        s.combined = {"filename": "keep.mp4"}
+        for text in (None, " ", "x" * 4001):
+            with self.assertRaises(ValueError):
+                s.add_feedback(text)
+        self.assertEqual(s.feedback, [])
+        self.assertIsNotNone(s.combined)
 
 
 class SourceReviewTests(unittest.TestCase):

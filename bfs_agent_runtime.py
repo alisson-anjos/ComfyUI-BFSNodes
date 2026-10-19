@@ -189,6 +189,7 @@ class Runtime:
             d = json.loads(f.read_text())
             s = Session(d["task"], d["plan"], d["settings"], sid)
             s.events = d.get("events", [])
+            s.feedback = d.get("feedback", [])
             s.renders = d.get("renders", 0)
             s.workflow = d.get("workflow")
             s.planner_id = d.get("planner_id")
@@ -408,6 +409,9 @@ class Runtime:
             + s.task
             + "\nCURRENT PLAN:\n"
             + json.dumps(s.plan)[:24000]
+        )
+        prompt += "\nUSER FEEDBACK (chronological corrections):\n" + json.dumps(
+            s.feedback, ensure_ascii=False
         )
         prompt += "\nHISTORY:\n" + json.dumps(history, ensure_ascii=False)[-20000:]
         prompt += (
@@ -1364,7 +1368,7 @@ def register(planner):
 
                         nodes.interrupt_processing(True)
                     s.pending_render = None
-            elif action == "resume":
+            elif action in ("resume", "feedback"):
                 if s.requires_new_task or "Workflow VAE loader rejected" in str(
                     s.observation.get("error", "")
                 ):
@@ -1372,10 +1376,20 @@ def register(planner):
                         "This session contains the invalid VAE workflow snapshot. Fix the workflow, then use Start automatic task; Resume cannot refresh graph connections."
                     )
                 ensure_cuda_healthy()
-                if s.status not in ("paused", "error", "budget_exhausted"):
+                allowed = (
+                    ("paused", "error", "budget_exhausted", "complete")
+                    if action == "feedback"
+                    else ("paused", "error", "budget_exhausted")
+                )
+                if s.status not in allowed:
                     raise ValueError(
-                        "Only paused, errored or budget-limited sessions can resume"
+                        "Pause the session and wait for the current action before continuing; completed sessions accept feedback"
                     )
+                feedback = (
+                    s.validate_feedback(b.get("feedback"))
+                    if action == "feedback"
+                    else None
+                )
                 settings = b.get("settings") or {}
                 for key in ("thinking", "web"):
                     if key in settings:
@@ -1410,6 +1424,10 @@ def register(planner):
                         rt.invalidate(s)
                 if s.context_ready:
                     rt.diagnose_vlm(s)
+                if feedback is not None:
+                    s.add_feedback(feedback)
+                    # Persist the correction before launching another decision.
+                    rt.save(s)
                 s.cancel.clear()
                 s.error_count = 0
                 s.status = "waiting_render" if s.pending_render else "running"

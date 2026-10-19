@@ -225,3 +225,27 @@ its existing error path. Captures survive later failures; nothing can recover a
 preview that was never decoded and saved. Existing sessions without these fields
 remain readable. This history is session-specific, not automatic cross-video
 memory or context summarization. No external classifier service is enabled.
+
+### Correcting a result with feedback
+
+In the Agent tab, write a correction under **Feedback for this session** and click
+**Send feedback and continue**. If the agent is running, pause and wait for the
+current action to finish first. Completed sessions accept feedback directly.
+Identify the affected shot/person, the incorrect change, and what must remain
+unchanged. For example: “Only replace the soldier on the left. You changed both
+people. Segment the left soldier, check the mask, and preserve the person on the
+right.”
+
+Feedback is saved in the same session, included in every subsequent decision and
+preview review, and linked to the last rendered revision's evidence. It clears
+previous result approvals and the current combined-output approval while keeping
+render snapshots, cached takes, previews, settings, and the original task. The
+agent is instructed to inspect the rejected result and correct affected shots,
+including checking the SAM overlay and other people's preservation for a
+single-target swap. These instructions do not guarantee visual success.
+
+Action/render counters are preserved: raise the existing limits when necessary.
+Feedback cannot bypass a CUDA fault, invalid workflow snapshot, or another active
+agent session. Stopped sessions need a new task. Each message is limited to 4000
+characters; a session accepts at most 40 messages / 16000 total feedback characters.
+This is persistent session feedback, not automatic learning across videos.
