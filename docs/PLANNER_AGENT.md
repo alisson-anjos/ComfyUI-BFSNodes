@@ -249,3 +249,26 @@ Feedback cannot bypass a CUDA fault, invalid workflow snapshot, or another activ
 agent session. Stopped sessions need a new task. Each message is limited to 4000
 characters; a session accepts at most 40 messages / 16000 total feedback characters.
 This is persistent session feedback, not automatic learning across videos.
+
+### Comparing generation parameters
+
+`inspect_generation` lists the editable controls on existing workflow nodes,
+including the installed sampler/scheduler choices and inputs connected to other
+nodes. `update_sampler` now also supports sampler and scheduler names, standard
+LoRA model/CLIP strengths, BFS LoRA Surgery overall strength, and controls on
+standard sigma scheduler nodes (Karras, exponential, polyexponential, Laplace,
+beta, VP, SD Turbo). An existing ManualSigmas node accepts a descending schedule
+ending in zero, as a string or numeric list. Unsupported custom nodes are not
+modified. Connected values must be adjusted at a supported source node; graph
+connections and node types are preserved. Numeric values must be finite and
+respect both agent limits and installed schema limits. LoRA files are not changed.
+
+Before changing generation parameters, the agent archives current successful
+active takes and the full plan/workflow snapshot. `list_takes` exposes the saved
+settings and video paths for review; `restore_take` can choose a specific
+`take_id` rather than only the latest archive. A restored take must be reconciled
+with the cache and reviewed before combining. Each comparison still consumes
+normal action/render budgets. Keep seed, prompt, references, shot ranges and
+other controls fixed, change one variable at a time, inspect the candidates and
+reserve budget for restoring the selected take. The VLM judges visual quality;
+this is not a standardized benchmark or a guarantee of the best parameters.

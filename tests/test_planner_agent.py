@@ -1100,6 +1100,124 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         )
 
 
+class GenerationParameterTests(unittest.TestCase):
+    def setUp(self):
+        self.params = sys.modules[PACKAGE + ".bfs_agent_parameters"]
+
+    def test_installed_enum_choices_and_connections(self):
+        node = {
+            "class_type": "KSampler",
+            "inputs": {"sampler_name": "euler", "scheduler": "normal", "cfg": 1},
+        }
+        with patch.object(
+            self.params,
+            "schema_inputs",
+            return_value={
+                "sampler_name": (["euler", "heun"],),
+                "scheduler": (["normal", "simple"],),
+            },
+        ):
+            self.assertEqual(
+                self.params.validated_changes(
+                    node, {"sampler_name": "heun", "scheduler": "simple"}
+                ),
+                {"sampler_name": "heun", "scheduler": "simple"},
+            )
+            with self.assertRaises(ValueError):
+                self.params.validated_changes(node, {"sampler_name": "invented"})
+            node["inputs"]["cfg"] = ["source", 0]
+            with self.assertRaisesRegex(ValueError, "connected"):
+                self.params.validated_changes(node, {"cfg": 2})
+
+    def test_lora_strength_schema_limits_and_atomic_validation(self):
+        node = {
+            "class_type": "LoraLoader",
+            "inputs": {"strength_model": 1, "strength_clip": 1},
+        }
+        with patch.object(self.params, "schema_inputs", return_value={}):
+            self.assertEqual(
+                self.params.validated_changes(node, {"strength_model": 0.75})[
+                    "strength_model"
+                ],
+                0.75,
+            )
+            for value in (float("nan"), float("inf"), True, 100):
+                with self.assertRaises(ValueError):
+                    self.params.validated_changes(node, {"strength_model": value})
+            with self.assertRaises(ValueError):
+                self.params.validated_changes(
+                    node, {"strength_model": 0.5, "lora_name": "other"}
+                )
+            self.assertEqual(node["inputs"]["strength_model"], 1)
+        turbo = {"class_type": "SDTurboScheduler", "inputs": {"steps": 1}}
+        with patch.object(
+            self.params, "schema_inputs", return_value={"steps": ("INT", {"max": 10})}
+        ):
+            with self.assertRaises(ValueError):
+                self.params.validated_changes(turbo, {"steps": 11})
+
+    def test_manual_sigmas_are_finite_descending_and_decimal(self):
+        self.assertEqual(
+            self.params.manual_sigmas([1, 0.5, 0.001, 0]), "1.0, 0.5, 0.001, 0.0"
+        )
+        self.assertNotIn("e-", self.params.manual_sigmas("1, 1e-8, 0"))
+        for value in (
+            [1, 2, 0],
+            [1, -1, 0],
+            [1, float("nan"), 0],
+            [1, 0.5],
+            [True, 0],
+            [],
+            "garbage",
+            [1, 0.5, 0.5, 0],
+        ):
+            with self.assertRaises(ValueError):
+                self.params.manual_sigmas(value)
+        node = {
+            "class_type": "KarrasScheduler",
+            "inputs": {"steps": 8, "sigma_min": 0.01, "sigma_max": 1, "rho": 7},
+        }
+        with patch.object(self.params, "schema_inputs", return_value={}):
+            with self.assertRaises(ValueError):
+                self.params.validated_changes(node, {"sigma_min": 2})
+            self.assertEqual(
+                self.params.validated_changes(node, {"rho": 3}), {"rho": 3}
+            )
+
+    def test_parameter_edit_archives_baseline_and_can_restore_selected_take(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "cache"
+            folder.mkdir()
+            (folder / "shot_0000.pt").write_bytes(b"original take")
+            planner = types.SimpleNamespace(
+                folder_paths=types.SimpleNamespace(get_output_directory=lambda: root),
+                cache_status=lambda plan: {"folder": str(folder), "ok": [True]},
+            )
+            rt = runtime.Runtime(planner)
+            s = core.Session("compare", {"video": "source.mp4"})
+            s.workflow = {"9": {"class_type": "CFGGuider", "inputs": {"cfg": 1}}}
+            s.render_snapshot = {
+                "plan": dict(s.plan),
+                "workflow": json.loads(json.dumps(s.workflow)),
+            }
+            s.rendered_revision = s.revision
+            rt.context = lambda session: ("source", {}, [{"run": True}])
+            with patch.object(self.params, "schema_inputs", return_value={}):
+                result, _ = rt.execute(
+                    s, "update_sampler", {"node_id": "9", "changes": {"cfg": 2}}
+                )
+            take_id = result["archived_takes"][0]["take_id"]
+            takes, _ = rt.execute(s, "list_takes", {"shot": 0})
+            self.assertEqual(takes["takes"][0]["take_id"], take_id)
+            (folder / "shot_0000.pt").write_bytes(b"worse take")
+            result, _ = rt.execute(s, "restore_take", {"shot": 0, "take_id": take_id})
+            self.assertEqual(s.workflow["9"]["inputs"]["cfg"], 1)
+            self.assertEqual((folder / "shot_0000.pt").read_bytes(), b"original take")
+            self.assertEqual(result["take_id"], take_id)
+            with self.assertRaisesRegex(ValueError, "Invalid take_id"):
+                rt.execute(s, "restore_take", {"shot": 0, "take_id": "../other"})
+
+
 class FeedbackTests(unittest.TestCase):
     def test_feedback_withdraws_approval_preserves_render_and_survives_restore(self):
         with tempfile.TemporaryDirectory() as folder:

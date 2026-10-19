@@ -152,6 +152,7 @@ export function agentTab(c) {
     h('details',[h('summary','Render history · approximate previews'),...a.previewHistory.slice().reverse().map(t=>h('details',[
       h('summary',`Render ${t.render} · ${t.status}`),
       t.reason?h('div',t.reason):null,
+      t.generation_nodes?h('details',[h('summary','Generation settings'),h('pre',{style:'white-space:pre-wrap'},JSON.stringify(t.generation_nodes,null,2))]):null,
       ...(t.user_feedback||[]).map(f=>h('div',`User feedback: ${f.text}`)),
       t.render_status?.status_str!=='success'&&t.render_status?h('details',[h('summary','Render error details'),h('pre',{style:'white-space:pre-wrap'},JSON.stringify(t.render_status,null,2))]):null,
       ...(t.captures||[]).map(v=>h('div',[

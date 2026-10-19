@@ -80,7 +80,18 @@ TOOLS = {
     },
     "restore_take": {
         "description": "Restore an archived take and its full render plan/workflow snapshot; then render to reconcile caches and review again.",
+        "arguments": {
+            "shot": "integer",
+            "take_id": "optional id from list_takes; default latest",
+        },
+    },
+    "list_takes": {
+        "description": "List archived takes and generation settings for a shot; inspect_media can review their videos.",
         "arguments": {"shot": "integer"},
+    },
+    "inspect_generation": {
+        "description": "List existing generation nodes, editable controls, installed sampler/scheduler options and connected source nodes.",
+        "arguments": {},
     },
     "combine": {
         "description": "Assemble completed shots to an MP4; requires every active shot to be current.",
@@ -95,7 +106,7 @@ TOOLS = {
         "arguments": {"root": "input|output|project", "path": "relative media path"},
     },
     "update_sampler": {
-        "description": "Adjust seed, steps or cfg on a generation node in the workflow snapshot.",
+        "description": "Adjust supported sampler/scheduler choices, sigma schedule, LoRA strengths, seed, steps, CFG or denoise on an existing node. Inspect_generation lists actual controls. Archives current successful takes before changing settings.",
         "arguments": {"node_id": "string", "changes": "object"},
     },
     "read_file": {
@@ -139,6 +150,7 @@ Loading VLM context is not a video render. When current_plan_rendered is false, 
 Inspect results for identity, motion, background preservation, mask edges, temporal continuity and requested changes.
 USER FEEDBACK is a correction to the task and remains relevant across subsequent decisions. Inspect the rejected result and affected source shots, update the checklist, then correct only affected shots. Do not simply repeat an unchanged render or claim success from the previous combined output.
 For a single-target swap in a multi-person scene, identify the requested person and preserve every other person. If the swap affected multiple people, use segment with specific text/positive and negative points as needed, inspect the mask overlay, and consider crop/inpaint/paste for localized editing. Verify target identity AND preservation of other people across the shot before finishing. Do not assume a color mark alone guarantees isolation.
+For parameter comparisons, inspect_generation first. Keep seed, prompt, references, shot ranges and non-tested controls fixed; change one variable at a time unless the user asks for a combination. Render and inspect each candidate, record concrete visual evidence in action explanations/checklist. Changing generation settings archives current successful takes automatically. Use list_takes and inspect_media to compare older candidates; restore_take with take_id selects an earlier candidate. Reserve action/render budget to reconcile and review the selected take. Do not claim a universal best sampler from one shot. Never invent enum values or rewire connected controls.
 Use all relevant reference pictures. Reference pictures define identity; source video defines movement unless asked otherwise.
 Intermediate previews are approximate: early steps support composition checks, not reliable fine identity judgement.
 Do not claim perfection. Prefer concrete criteria, preserve good takes, correct only failed shots and respect budgets.

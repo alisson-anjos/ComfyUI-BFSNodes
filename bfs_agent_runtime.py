@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .bfs_planner_agent import Session, SYSTEM, TOOLS, bounded_path
 from .bfs_agent_inference import run_inference, ensure_cuda_healthy
+from .bfs_agent_parameters import generation_nodes, validated_changes
 
 SESSIONS = {}
 GPU_LOCK = threading.RLock()
@@ -246,6 +247,7 @@ class Runtime:
                 "revision": s.revision,
                 "status": "capturing",
                 "captures": [],
+                "generation_nodes": generation_nodes(s.workflow),
                 "time": time.time(),
             }
             s.preview_history.append(record)
@@ -302,6 +304,7 @@ class Runtime:
                 "render": s.renders,
                 "revision": s.revision,
                 "captures": [],
+                "generation_nodes": generation_nodes(s.workflow),
                 "time": time.time(),
             }
             s.preview_history.append(record)
@@ -313,6 +316,34 @@ class Runtime:
             )
         record["render_status"] = status
         self.save(s)
+
+    def archive_current_takes(self, s):
+        """Preserve a successful comparison baseline before changing generation parameters."""
+        if not s.render_snapshot or s.rendered_revision != s.revision:
+            return []
+        import uuid
+
+        status = self.p.cache_status(s.plan)
+        source = Path(status["folder"])
+        _, _, segs = self.context(s)
+        archived = []
+        ri = 0
+        for i, seg in enumerate(segs):
+            if not seg.get("run"):
+                continue
+            files = [f for f in source.glob(f"shot_{ri:04d}*") if f.is_file()]
+            if ri < len(status["ok"]) and status["ok"][ri] and files:
+                take = uuid.uuid4().hex
+                folder = self.folder() / s.id / "takes" / f"{i:04d}" / take
+                folder.mkdir(parents=True, exist_ok=True)
+                for f in files:
+                    shutil.copy2(f, folder / f.name)
+                (folder / "render.json").write_text(
+                    json.dumps(s.render_snapshot), encoding="utf-8"
+                )
+                archived.append({"shot": i, "take_id": take})
+            ri += 1
+        return archived
 
     def context(self, s):
         p = self.p
@@ -520,6 +551,8 @@ class Runtime:
                 for step in steps
             ]
             return {"checklist": s.checklist}, []
+        if tool == "inspect_generation":
+            return {"nodes": generation_nodes(s.workflow)}, []
         if tool == "inspect_plan":
             _, a, segs = self.context(s)
             return {
@@ -531,19 +564,7 @@ class Runtime:
                 "rendered_revision": s.rendered_revision,
                 "reviewed_shots": sorted(s.reviewed),
                 "cache": p.cache_status(s.plan),
-                "generation_nodes": {
-                    k: v
-                    for k, v in (s.workflow or {}).items()
-                    if v.get("class_type")
-                    in (
-                        "KSampler",
-                        "KSamplerAdvanced",
-                        "RandomNoise",
-                        "BasicScheduler",
-                        "CFGGuider",
-                        "BFSAgentPreviewSampler",
-                    )
-                },
+                "generation_nodes": generation_nodes(s.workflow),
             }, []
         if tool == "inspect_source":
             labels, imgs = self.source_images(s, args)
@@ -830,6 +851,30 @@ class Runtime:
             return s.preview, [
                 image_tensor(x["src"]) for x in s.preview.get("frames", [])
             ]
+        if tool == "list_takes":
+            _, _, _, i, _ = self.shot(s, args)
+            root = self.folder() / s.id / "takes" / f"{i:04d}"
+            takes = []
+            for folder in (
+                sorted(root.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[
+                    :40
+                ]
+                if root.exists()
+                else []
+            ):
+                if not folder.is_dir() or not (folder / "render.json").exists():
+                    continue
+                snapshot = json.loads((folder / "render.json").read_text())
+                takes.append(
+                    {
+                        "take_id": folder.name,
+                        "shot": i,
+                        "path": folder.relative_to(self.folder().parent).as_posix(),
+                        "generation_nodes": generation_nodes(snapshot.get("workflow")),
+                        "files": [f.name for f in folder.iterdir() if f.is_file()],
+                    }
+                )
+            return {"takes": takes}, []
         if tool in ("retry_shot", "restore_take"):
             _, _, segs, i, seg = self.shot(s, args)
             status = p.cache_status(s.plan)
@@ -885,7 +930,19 @@ class Runtime:
                 )
                 if not archives:
                     raise ValueError("No archived take")
-                backup = archives[-1]
+                take_id = args.get("take_id")
+                if take_id is not None:
+                    if (
+                        not isinstance(take_id, str)
+                        or len(take_id) != 32
+                        or any(c not in "0123456789abcdef" for c in take_id)
+                    ):
+                        raise ValueError("Invalid take_id; use list_takes")
+                    backup = backup_root / take_id
+                    if backup not in archives:
+                        raise ValueError("Unknown take_id; use list_takes")
+                else:
+                    backup = archives[-1]
                 snapshot = json.loads((backup / "render.json").read_text())
                 for f in backup.iterdir():
                     if f.name != "render.json":
@@ -920,36 +977,15 @@ class Runtime:
             if not s.workflow or node_id not in s.workflow:
                 raise ValueError("Unknown workflow node")
             node = s.workflow[node_id]
-            kind = node.get("class_type")
-            allowed = {
-                "KSampler": {"seed", "steps", "cfg"},
-                "KSamplerAdvanced": {"noise_seed", "steps", "cfg"},
-                "RandomNoise": {"noise_seed"},
-                "BasicScheduler": {"steps", "denoise"},
-                "CFGGuider": {"cfg"},
-            }
-            if kind not in allowed or not changes or set(changes) - allowed[kind]:
-                raise ValueError("Unsupported sampler change")
-            for k, v in changes.items():
-                if isinstance(v, bool) or not isinstance(v, (int, float)):
-                    raise ValueError("Numeric settings required")
-                if k in ("seed", "noise_seed") and (
-                    not isinstance(v, int) or not 0 <= v < 2**64
-                ):
-                    raise ValueError("Invalid seed")
-                if k == "steps" and (not isinstance(v, int) or not 1 <= v <= 200):
-                    raise ValueError("Invalid steps")
-                if k == "cfg" and not 0 <= v <= 30:
-                    raise ValueError("Invalid cfg")
-                if k == "denoise" and not 0 < v <= 1:
-                    raise ValueError("Invalid denoise")
-                if isinstance(node.get("inputs", {}).get(k), list):
-                    raise ValueError(
-                        "Setting is connected; change its source node instead"
-                    )
+            changes = validated_changes(node, changes)
+            archives = self.archive_current_takes(s)
             node["inputs"].update(changes)
             self.invalidate(s)
-            return {"node_id": node_id, "changed": changes}, []
+            return {
+                "node_id": node_id,
+                "changed": changes,
+                "archived_takes": archives,
+            }, []
         if tool in ("list_directory", "read_file", "inspect_media"):
             roots = {
                 "input": p.folder_paths.get_input_directory(),
