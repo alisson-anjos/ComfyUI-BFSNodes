@@ -572,6 +572,22 @@ class Session:
             except Exception as exc:
                 self.error_count += 1
                 self.observation = {"error": f"{type(exc).__name__}: {exc}"}
+                if (
+                    action
+                    and action.get("tool") == "update_shot"
+                    and "Unsupported shot changes" in str(exc)
+                    and "mask" in (action.get("arguments", {}).get("changes") or {})
+                ):
+                    self.observation["recovery"] = {
+                        "tool": "segment",
+                        "instruction": (
+                            "Do not retry update_shot with mask. No changes were applied. "
+                            "Inspect the source at the intended key frame, then call segment "
+                            "with shot, text, key, points, keyframes and settings. "
+                            "Use positive points on the target and negative points on protected people. "
+                            "Submit any prompt or refs changes separately via update_shot."
+                        ),
+                    }
                 self.event(
                     "error",
                     **self.observation,

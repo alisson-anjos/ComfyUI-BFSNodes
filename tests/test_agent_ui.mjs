@@ -161,3 +161,21 @@ test('polling retains activity that rolls out of the server event window',async(
   assert.equal(c.agent.a.historyEvents[0].summary,'older');
   assert.equal(c.agent.a.events.at(-1).summary,'new');
 });
+
+test('copy exports unloaded history and tool failures without changing the visible filter', async () => {
+  const c=context();let copied='';
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{clipboard:{writeText:async text=>{copied=text;}}}});
+  c.api.fetchApi=async url=>({ok:true,json:async()=>url.includes('/history/')?{before:0,events:[{time:1,kind:'action',tool:'segment',arguments:{shot:0}}]}:{id:'test',task:'Swap only one person',event_count:2,messages:[{time:1.5,text:'Preserve the other person',kind:'feedback'}],events:[{time:2,kind:'error',tool:'segment',error:'Example failure'}]}});
+  await c.agent.copyTranscript('tools');
+  assert.match(copied,/"shot": 0/);assert.match(copied,/Example failure/);
+  assert.equal(c.agent.a.logFilter,'all');assert.equal(c.agent.a.copying,false);
+  await c.agent.copyTranscript('conversation');assert.match(copied,/Preserve the other person/);
+  await c.agent.copyTranscript('errors');assert.match(copied,/Example failure/);assert.doesNotMatch(copied,/"shot": 0/);
+});
+
+test('copy reports failed history retrieval instead of copying an incomplete transcript', async () => {
+  const c=context();let writes=0;
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{clipboard:{writeText:async()=>{writes++;}}}});
+  c.api.fetchApi=async url=>({ok:!url.includes('/history/'),json:async()=>url.includes('/history/')?{error:'History unavailable'}:{event_count:2,events:[]}});
+  await c.agent.copyTranscript('all');assert.equal(writes,0);assert.match(c.agent.a.error,/History unavailable/);assert.equal(c.agent.a.copying,false);
+});

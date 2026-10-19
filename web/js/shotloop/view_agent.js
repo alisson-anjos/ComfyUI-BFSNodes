@@ -3,7 +3,7 @@ import { h } from './common.js';
 import { AGENT_CSS } from './agent_styles.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', feedback:'', feedbackHistory:[], reviewCoverage:{}, messages:[], attachments:[], pendingMessages:[], contextUsage:null, contextSummary:null, tokenUsage:null, resources:null, resourceError:'', view:'chat', logFilter:'all', inputKind:'feedback', lightbox:null, followChat:true, actions:0, renders:0, created:0, historyEvents:[], historyBefore:0, eventCount:0, pendingRender:null, id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,review_fps:2,context_window:32768,project_root:''}, follow:false, error:'', working:false, combined:null });
+  const a = reactive({ task:'', feedback:'', feedbackHistory:[], reviewCoverage:{}, messages:[], attachments:[], pendingMessages:[], contextUsage:null, contextSummary:null, tokenUsage:null, resources:null, resourceError:'', view:'chat', logFilter:'all', inputKind:'feedback', lightbox:null, followChat:true, actions:0, renders:0, created:0, copying:false, copyNotice:'', historyEvents:[], historyBefore:0, eventCount:0, pendingRender:null, id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,review_fps:2,context_window:32768,project_root:''}, follow:false, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false, resourcesAt = 0, resourcePolling = false;
   let fileInput = null;
   const endpoint = '/bfs/shotloop/agent';
@@ -80,6 +80,49 @@ export function createAgent(c, io, app) {
     if(!a.id||!a.historyBefore)return;
     try{const r=await c.api.fetchApi(`${endpoint}/history/${encodeURIComponent(a.id)}?before=${a.historyBefore}&count=100`);const j=await r.json();if(!r.ok||j.error)throw new Error(j.error||r.statusText);a.historyEvents=[...(j.events||[]),...a.historyEvents];a.historyBefore=j.before;}catch(e){a.error=String(e.message||e);}
   }
+  async function copyTranscript(mode='conversation'){
+    if(a.copying)return;
+    a.copying=true;a.copyNotice='';a.error='';
+    try{
+      // Read a bounded snapshot of the entire persisted history, including unloaded pages.
+      const sessionId=a.id;
+      let snapshot={task:a.task,messages:a.messages,feedback:a.feedbackHistory,events:a.events,event_count:a.eventCount};
+      if(sessionId){
+        const r=await c.api.fetchApi(`${endpoint}/session/${encodeURIComponent(sessionId)}`);
+        snapshot=await r.json();if(!r.ok||snapshot.error)throw new Error(snapshot.error||r.statusText);
+      }
+      let events=[...(snapshot.events||[])];
+      let before=Math.max(0,(snapshot.event_count||events.length)-events.length);
+      while(before>0){
+        const r=await c.api.fetchApi(`${endpoint}/history/${encodeURIComponent(sessionId)}?before=${before}&count=100`);
+        const page=await r.json();if(!r.ok||page.error)throw new Error(page.error||r.statusText);
+        if(!Number.isInteger(page.before)||page.before<0||page.before>=before)throw new Error('Could not load the complete history.');
+        events=[...(page.events||[]),...events];before=page.before;
+      }
+      const clean=(key,value)=>typeof value==='string'&&value.startsWith('data:image/')?'[image omitted]':value;
+      const stamp=time=>time?new Date(time*1000).toISOString():'';
+      const lines=[`BFS Agent · ${mode} · session ${sessionId||'not started'}`,`Task: ${snapshot.task||''}`];
+      if(mode==='conversation'){
+        const entries=(snapshot.messages||[]).map(m=>({time:m.time,text:`You (${m.kind||'feedback'}, ${m.status||'applied'}): ${m.text||''}`+(m.attachments?.length?'\nAttachments: '+m.attachments.map(f=>f.name||f.src).join(', '):'')}));
+        for(const e of events){
+          if(['action','reply','error','context'].includes(e.kind))entries.push({time:e.time,text:JSON.stringify(e,clean,2)});
+          else if(e.kind==='feedback'&&!(snapshot.messages||[]).some(m=>m.text===e.summary))entries.push({time:e.time,text:'You: '+e.summary});
+        }
+        entries.sort((x,y)=>x.time-y.time);lines.push(...entries.map(e=>`[${stamp(e.time)}] ${e.text}`));
+      }else{
+        const selected=events.filter(e=>mode==='errors'?e.kind==='error':mode==='tools'?['action','observation'].includes(e.kind)||(e.kind==='error'&&e.tool):true);
+        lines.push(...selected.map(e=>`[${stamp(e.time)}] ${JSON.stringify(e,clean,2)}`));
+      }
+      const text=lines.join('\n\n');
+      try{await navigator.clipboard.writeText(text);}catch{
+        const field=document.createElement('textarea');field.value=text;field.style.cssText='position:fixed;left:-10000px';document.body.appendChild(field);
+        const focus=document.activeElement;
+        try{field.select();if(!document.execCommand('copy'))throw new Error('Clipboard access failed. Allow clipboard access and try again.');}
+        finally{field.remove();focus?.focus();}
+      }
+      a.copyNotice=mode==='conversation'?'Conversation copied':`${mode[0].toUpperCase()+mode.slice(1)} log copied`;
+    }catch(e){a.error=String(e.message||e);}finally{a.copying=false;}
+  }
   async function pollResources(force=false){
     if(dead||resourcePolling||(!force&&Date.now()-resourcesAt<5000))return;
     if(!force&&c.tab&&c.tab.value!=='agent')return;
@@ -126,7 +169,7 @@ export function createAgent(c, io, app) {
     c.api.addEventListener('bfs-agent-event',event);c.api.addEventListener('bfs-agent-preview',preview);
   });
   onBeforeUnmount(()=>{dead=true;clearInterval(timer);c.api.removeEventListener('bfs-agent-event',event);c.api.removeEventListener('bfs-agent-preview',preview);});
-  return {a,start,control,poll,sendFeedback,pollResources,addFiles,paste,pickImages,setFileInput,newTask,loadHistory};
+  return {a,start,control,poll,sendFeedback,pollResources,addFiles,paste,pickImages,setFileInput,newTask,loadHistory,copyTranscript};
 }
 
 export function agentBar(c) {
@@ -255,7 +298,7 @@ export function agentTab(c) {
     h('label',{class:'ag-row'},[h('input',{type:'checkbox',checked:a.follow,onChange:e=>{a.follow=e.target.checked;}}),'Follow tool tabs']),
   ]);
   const trace=h('div',{class:'ag-content'},[
-    h('div',{class:'ag-log-filter'},['all','tools','errors'].map(filter=>h('button',{'aria-pressed':a.logFilter===filter,onClick:()=>{a.logFilter=filter;}},filter[0].toUpperCase()+filter.slice(1)))),
+    h('div',{class:'ag-log-filter'},['all','tools','errors'].map(filter=>h('button',{'aria-pressed':a.logFilter===filter,onClick:()=>{a.logFilter=filter;}},filter[0].toUpperCase()+filter.slice(1))).concat([h('button',{disabled:a.copying,onClick:()=>agent.copyTranscript(a.logFilter)},a.copying?'Copying…':'Copy log')])),
     h('div',{class:'ag-log'},events.filter(e=>a.logFilter==='errors'?e.kind==='error':a.logFilter==='tools'?e.kind==='action':!['decision','observation'].includes(e.kind)).slice().reverse().map(e=>
       e.kind==='action'?eventCard(e,events):h('div',{class:e.kind==='error'?'ag-error':'ag-note'},[h('small',`${timeLabel(e.time)} · ${e.kind}`),h('div',e.summary||e.error||JSON.stringify(e.review||{}))]))),
     a.historyBefore>0?h('button',{onClick:agent.loadHistory},'Load earlier activity'):null,
@@ -320,10 +363,11 @@ export function agentTab(c) {
     ]),
     h('nav',{class:'ag-nav',role:'tablist','aria-label':'Agent views'},[
       ...[['chat','Conversation'],['plan','Plan'],['renders','Renders'],['activity','Activity'],['settings','Settings']].map(([view,label])=>h('button',{class:'ag-tab',role:'tab','aria-selected':a.view===view,onClick:()=>{a.view=view;}},label)),
-      h('span',{class:'ag-nav-spacer'}),a.pendingMessages.length?h('span',{class:'ag-pending'},`${a.pendingMessages.length} queued`):null,
+      h('span',{class:'ag-nav-spacer'}),h('button',{class:'ag-tab',disabled:a.copying,onClick:()=>agent.copyTranscript('conversation')},a.copying?'Copying…':'Copy conversation'),a.pendingMessages.length?h('span',{class:'ag-pending'},`${a.pendingMessages.length} queued`):null,
       h('button',{class:'ag-tab',onClick:()=>agent.pollResources(true),title:a.resourceError||'Refresh resource snapshot'},a.resourceError?'↻ Unavailable':a.resources?.time?`↻ ${timeLabel(a.resources.time)}`:'↻ Resources'),
     ]),
     a.requiresNewTask?h('div',{class:'ag-error',style:'margin:12px 22px'},'Fix the VAE loader/connections, then start a new task. Resume uses the old workflow snapshot.'):null,
+    a.copyNotice?h('div',{class:'ag-note',role:'status',style:'margin:8px 22px'},a.copyNotice):null,
     a.error?h('div',{class:'ag-error',role:'alert',style:'margin:12px 22px'},a.error):null,
     a.view==='chat'?conversation:a.view==='settings'?settings:a.view==='activity'?trace:a.view==='renders'?evidence:plan,
     a.view==='chat'&&frames.length?h('details',{class:'ag-details',style:'margin:0 22px 14px'},[h('summary',a.observation.frames?'Latest result inspection':'Latest approximate preview'),h('div',{class:'ag-detail-content'},frameGrid(frames))]):null,
