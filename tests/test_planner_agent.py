@@ -28,6 +28,7 @@ def load(name):
 
 
 core = load("bfs_planner_agent")
+inference = sys.modules[PACKAGE + ".bfs_agent_inference"]
 runtime = load("bfs_agent_runtime")
 preview = load("bfs_agent_preview")
 diagnostics = load("bfs_agent_diagnostics")
@@ -89,6 +90,7 @@ class SessionTests(unittest.TestCase):
         final = action("inspect_source", shot=0)
 
         def generate(*args, **kwargs):
+            self.assertTrue(torch.is_inference_mode_enabled())
             calls.append(kwargs)
             return (
                 types.SimpleNamespace(args=("", "private reasoning"))
@@ -422,8 +424,16 @@ class PreviewTests(unittest.TestCase):
     def test_preview_decode_failure_preserves_generation(self):
         self.run_preview_case(bad_decode=True)
 
+    def test_fatal_preview_cuda_error_skips_model_reload(self):
+        self.run_preview_case(fatal_cuda=True)
+
     def run_preview_case(
-        self, full_vae=False, bad_shape=False, bad_decode=False, retry=False
+        self,
+        full_vae=False,
+        bad_shape=False,
+        bad_decode=False,
+        retry=False,
+        fatal_cuda=False,
     ):
         sid = "a" * 32
         session = core.Session("task", {}, session_id=sid)
@@ -463,6 +473,10 @@ class PreviewTests(unittest.TestCase):
 
         def decode(z):
             decoded.append(z.clone())
+            if fatal_cuda:
+                raise RuntimeError(
+                    "CUDA error: an illegal memory access was encountered"
+                )
             if bad_decode:
                 raise ValueError("decoder failed")
             return torch.zeros(1, 8, 8, 3)
@@ -484,6 +498,13 @@ class PreviewTests(unittest.TestCase):
             wrapper = preview.PreviewSampler(
                 types.SimpleNamespace(sample=sample), sid, 1, 0, 3, retry, vae
             )
+            if fatal_cuda:
+                with patch.object(inference, "CUDA_FAULTED", False):
+                    with self.assertRaisesRegex(RuntimeError, "illegal memory access"):
+                        wrapper.sample(model, [1, 0.5, 0.1, 0], {}, None, packed)
+                    self.assertTrue(inference.CUDA_FAULTED)
+                self.assertEqual(restored, [])
+                return
             if retry:
                 with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
                     with self.assertRaises(preview.PreviewRetry):
@@ -655,7 +676,14 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                         action("finish", summary="done"),
                     ]
                 )
-                rt.decide = lambda s: script.popleft()
+                worker_threads = set()
+
+                def decide(s):
+                    worker_threads.add(__import__("threading").get_ident())
+                    self.assertTrue(torch.is_inference_mode_enabled())
+                    return script.popleft()
+
+                rt.decide = decide
 
                 def execute(s, tool, args):
                     if tool == "inspect_result":
@@ -694,6 +722,7 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                         break
                     await asyncio.sleep(0.01)
                 self.assertEqual(s.status, "complete", s.observation)
+                self.assertEqual(len(worker_threads), 1)
                 context = next(
                     e["result"]
                     for e in s.events
@@ -822,6 +851,100 @@ class VLMDiagnosticsTests(unittest.TestCase):
         ):
             report = diagnostics.inspect_vlm(clip, self.settings)
         self.assertIsNone(report["kv_estimate"])
+
+
+class InferenceLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.fault_patch = patch.object(inference, "CUDA_FAULTED", False)
+        self.fault_patch.start()
+        self.addCleanup(self.fault_patch.stop)
+
+    def test_inference_context_and_cleanup_for_each_call(self):
+        records = []
+
+        def work():
+            records.append(
+                ("work", torch.is_inference_mode_enabled(), torch.is_grad_enabled())
+            )
+            return "result"
+
+        def cleanup():
+            records.append(("cleanup", torch.is_inference_mode_enabled()))
+
+        original_mode = torch.is_inference_mode_enabled()
+        with patch.object(inference, "cleanup_inference", cleanup):
+            self.assertEqual(inference.run_inference(work), "result")
+            self.assertEqual(inference.run_inference(work), "result")
+        self.assertEqual(
+            records,
+            [
+                ("work", True, False),
+                ("cleanup", True),
+                ("work", True, False),
+                ("cleanup", True),
+            ],
+        )
+        self.assertEqual(torch.is_inference_mode_enabled(), original_mode)
+
+    def test_ordinary_error_cleans_up_but_does_not_poison_context(self):
+        from unittest.mock import Mock
+
+        cleanup = Mock()
+
+        def work():
+            raise ValueError("invalid JSON")
+
+        with patch.object(inference, "cleanup_inference", cleanup):
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                inference.run_inference(work)
+        cleanup.assert_called_once()
+        self.assertFalse(inference.CUDA_FAULTED)
+
+    def test_fatal_cuda_error_blocks_retry_and_skips_allocator_cleanup(self):
+        from unittest.mock import Mock
+
+        cleanup = Mock()
+
+        def work():
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        with patch.object(inference, "cleanup_inference", cleanup):
+            with self.assertRaisesRegex(RuntimeError, "illegal memory"):
+                inference.run_inference(work)
+            with self.assertRaisesRegex(RuntimeError, "restart ComfyUI"):
+                inference.run_inference(lambda: self.fail("must not retry GPU"))
+        cleanup.assert_not_called()
+        self.assertTrue(inference.CUDA_FAULTED)
+
+    def test_session_does_not_retry_cuda_fault_three_times(self):
+        session = core.Session("task", {})
+
+        def work(_):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        session.tick(work, None)
+        self.assertEqual(session.status, "error")
+        self.assertEqual(session.error_count, 1)
+        self.assertTrue(session.observation["restart_required"])
+
+    def test_dynamic_cleanup_matches_native_order_without_changing_settings(self):
+        calls = []
+        modules = {
+            "comfy.memory_management": types.SimpleNamespace(aimdo_enabled=True),
+            "comfy.model_prefetch": types.SimpleNamespace(
+                cleanup_prefetch_queues=lambda: calls.append("prefetch")
+            ),
+            "comfy.model_management": types.SimpleNamespace(
+                reset_cast_buffers=lambda: calls.append("cast")
+            ),
+            "comfy_aimdo.model_vbar": types.SimpleNamespace(
+                vbars_reset_watermark_limits=lambda: calls.append("vbar")
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            inference.cleanup_inference()
+        self.assertEqual(calls, ["prefetch", "cast", "vbar"])
+        self.assertTrue(modules["comfy.memory_management"].aimdo_enabled)
 
 
 if __name__ == "__main__":

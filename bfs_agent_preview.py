@@ -4,6 +4,8 @@ from __future__ import annotations
 import time
 import math
 
+from .bfs_agent_inference import cuda_context_fault, mark_cuda_fault
+
 
 class PreviewRetry(RuntimeError):
     """An explicit VLM retry must still interrupt the render."""
@@ -149,6 +151,7 @@ class PreviewSampler:
                 return
             with GPU_LOCK, torch.inference_mode():
                 loaded = mm.loaded_models(only_currently_used=True)
+                failed_cuda = False
                 try:
                     latent = video_latent(x0, latent_shapes)
                     picks = sorted(
@@ -250,8 +253,15 @@ class PreviewSampler:
                 except PreviewRetry:
                     raise
                 except Exception as exc:
-                    if s.status == "stopped" or isinstance(
-                        exc, getattr(mm, "InterruptProcessingException", ())
+                    failed_cuda = cuda_context_fault(exc)
+                    if failed_cuda:
+                        mark_cuda_fault()
+                    if (
+                        failed_cuda
+                        or s.status == "stopped"
+                        or isinstance(
+                            exc, getattr(mm, "InterruptProcessingException", ())
+                        )
                     ):
                         raise
                     preview_failed = True
@@ -270,7 +280,8 @@ class PreviewSampler:
                     )
                     p._notify("bfs-agent-preview", {"id": s.id, "preview": s.preview})
                 finally:
-                    mm.load_models_gpu(loaded)
+                    if not failed_cuda:
+                        mm.load_models_gpu(loaded)
                     last = time.monotonic()
 
         return self.sampler.sample(

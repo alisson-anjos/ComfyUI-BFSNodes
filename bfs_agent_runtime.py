@@ -14,11 +14,14 @@ import time
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor
 
 from .bfs_planner_agent import Session, SYSTEM, TOOLS, bounded_path
+from .bfs_agent_inference import run_inference, ensure_cuda_healthy
 
 SESSIONS = {}
 GPU_LOCK = threading.RLock()
+AGENT_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bfs-agent")
 
 
 class PageText(HTMLParser):
@@ -316,21 +319,23 @@ class Runtime:
         images = visual_batch(s.images)
 
         def generate(text, limit, use_thinking):
-            return p._textgenerate_execute(
-                TextGenerate,
-                clip=clip,
-                prompt=text,
-                max_length=limit,
-                sampling_mode={
-                    "sampling_mode": "on",
-                    "temperature": 0.6 if use_thinking else 0.2,
-                    "top_k": 20,
-                    "top_p": 0.95,
-                    "min_p": 0.0,
-                    "seed": len(s.events),
-                },
-                thinking=use_thinking,
-                image=images,
+            return run_inference(
+                lambda: p._textgenerate_execute(
+                    TextGenerate,
+                    clip=clip,
+                    prompt=text,
+                    max_length=limit,
+                    sampling_mode={
+                        "sampling_mode": "on",
+                        "temperature": 0.6 if use_thinking else 0.2,
+                        "top_k": 20,
+                        "top_p": 0.95,
+                        "min_p": 0.0,
+                        "seed": len(s.events),
+                    },
+                    thinking=use_thinking,
+                    image=images,
+                )
             )
 
         with GPU_LOCK:
@@ -903,7 +908,9 @@ def register(planner):
     tasks = {}
 
     async def off(fn):
-        return await asyncio.to_thread(fn)
+        return await asyncio.get_running_loop().run_in_executor(
+            AGENT_WORKER, run_inference, fn
+        )
 
     async def queue(s):
         import execution
@@ -1142,6 +1149,7 @@ def register(planner):
     @routes.post("/bfs/shotloop/agent/start")
     async def start(request):
         try:
+            ensure_cuda_healthy()
             b = await request.json()
             if any(
                 x.status in ("running", "waiting_render") for x in SESSIONS.values()
@@ -1211,6 +1219,7 @@ def register(planner):
                         nodes.interrupt_processing(True)
                     s.pending_render = None
             elif action == "resume":
+                ensure_cuda_healthy()
                 if s.status not in ("paused", "error", "budget_exhausted"):
                     raise ValueError(
                         "Only paused, errored or budget-limited sessions can resume"

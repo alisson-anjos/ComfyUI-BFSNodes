@@ -10,6 +10,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .bfs_agent_inference import cuda_context_fault, mark_cuda_fault
+
 TOOLS = {
     "set_checklist": {
         "description": "Publish or update the visible step-by-step task plan.",
@@ -336,7 +338,15 @@ class Session:
                 self.error_count += 1
                 self.observation = {"error": f"{type(exc).__name__}: {exc}"}
                 self.event("error", **self.observation)
-                if self.error_count >= 3 and self.status == "running":
+                if cuda_context_fault(exc):
+                    mark_cuda_fault()
+                    self.status = "error"
+                    self.observation["restart_required"] = True
+                    self.event(
+                        "status",
+                        summary="CUDA context fault: automatic retries stopped. Restart ComfyUI before continuing.",
+                    )
+                elif self.error_count >= 3 and self.status == "running":
                     self.status = "error"
             return self.public()
         finally:

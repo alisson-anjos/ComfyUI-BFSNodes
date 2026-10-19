@@ -168,3 +168,21 @@ Preview shape/decode/review errors log a visible warning and disable intermediat
 for that render while generation continues. Explicit VLM retry decisions and user stop/interrupt
 still interrupt sampling. These paths have CPU contract tests; full-VAE and taeh3 GPU fidelity
 and memory behavior still require local validation.
+
+## Agent inference lifecycle and CUDA faults
+
+Agent background work uses a dedicated single-thread executor and enters `torch.inference_mode()`
+in that thread. Each direct TextGenerate call, including Thinking finalization, runs the
+native per-node cleanup for ComfyUI's dynamic allocator when available: prefetch/compiler
+state, cast buffers and vbar watermarks. This fixes differences from ordinary queued nodes;
+it does not prove that a particular checkpoint/driver/kernel combination is stable on a GPU.
+
+A detected illegal-address/device-assert CUDA fault stops automatic retries immediately.
+Further Agent starts/resumes are blocked until the process is restarted. Preview faults of
+this kind are fatal too: the preview adapter must not attempt to reload models or continue
+sampling with a poisoned context. Non-CUDA preview errors still degrade to a visible warning.
+Native CUDA aborts can terminate Python before any Python error handler can run.
+
+VRAM pressure and illegal CUDA accesses are separate diagnoses. Dynamic model loading logs
+do not establish peak memory use. CPU tests cover lifecycle/order, inference context and fault
+handling; reproduction on the user's actual GPU/backend is still needed.
