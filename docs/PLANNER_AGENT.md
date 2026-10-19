@@ -228,9 +228,10 @@ memory or context summarization. No external classifier service is enabled.
 
 ### Correcting a result with feedback
 
-In the Agent tab, write a correction under **Feedback for this session** and click
-**Send feedback and continue**. If the agent is running, pause and wait for the
-current action to finish first. Completed sessions accept feedback directly.
+In the Agent conversation, write a correction and click **Send feedback and continue**.
+Messages can be sent while the agent is working; they are queued for the next safe
+tool boundary. Completed sessions can continue from feedback directly. Choose
+**Question** to request an answer without withdrawing result approvals.
 Identify the affected shot/person, the incorrect change, and what must remain
 unchanged. For example: “Only replace the soldier on the left. You changed both
 people. Segment the left soldier, check the mask, and preserve the person on the
@@ -327,3 +328,53 @@ configuration. Explicit references replace old per-shot reference overrides.
 The agent can then inspect and refine the plan. Loading paths does not build model,
 conditioning, sampler, or output nodes: the workflow must already be connected.
 Use a new Start to select a different guide or refresh graph connections.
+
+### Conversation, resources and context
+
+The Agent tab now has Conversation, Plan, Renders, Activity and Settings views.
+Public decision explanations appear as assistant messages; tool cards distinguish
+requests from completed and failed operations, with arguments and evidence in
+expandable details. Earlier saved activity can be paged back into the conversation.
+The compact Agent bar remains available in other Planner tabs. Following tool tabs
+is optional and starts off so the conversation stays visible.
+
+Send corrections or questions while the agent works. Inputs are persisted
+immediately, then applied between tools. A render is allowed to finish. If input
+arrives while the VLM is choosing an action, that stale action is discarded before
+execution and the next decision uses the new input. Pause/Stop still take priority.
+A correction withdraws previous visual approvals; a Question leaves them intact.
+`reply` answers without ending the autonomous task. Messages cannot bypass invalid
+workflow snapshots, CUDA faults or execution budgets. A stopped session needs a
+new task. At most 16 messages may be queued and 100 messages stored per session;
+the existing correction text budget still applies.
+
+Attach screenshots with the file picker, drag/drop, or paste. Up to four images per
+message are resized to at most 1280px, stored as JPEG under
+`output/bfs_agent/<session>/feedback/`, and supplied to the VLM when the input is
+applied. Screenshots may also accompany the initial task. `inspect_feedback` reopens
+saved screenshots later. Text inside an image is visual data, not authority to
+execute instructions. Failed sends retain the local draft and attachments.
+
+Resource cards show read-only GPU/RAM snapshots, execution budgets, current context
+and cumulative tracked token estimates. GPU information is unavailable until CUDA
+is already initialized; sampling resources never loads a model or initializes
+CUDA. A fallback VLM-load snapshot is labelled as such. Resource snapshots refresh
+while the Agent tab is visible. Token accounting uses text bytes/3 and a heuristic
+512 tokens per supplied image: these are **estimates**, not exact tokenizer counts,
+billing usage or measured KV memory. Returned final/reasoning text contributes only
+a numeric output estimate; raw private reasoning is never saved. Calls without
+returned output or failed calls mark the accumulated figure as incomplete (`+`).
+Legacy calls made before tracking was introduced cannot be reconstructed.
+
+The working **Context window** defaults to 32768 and is capped by the detected
+backend limit when available. Input estimates, reserved decision output and a
+safety margin share that window. Session cumulative usage is separate and is not
+subtracted from it. When activity grows, the harness writes a grounded, bounded
+summary of recorded requests, observations and failures, keeps recent events and
+live state, and continues. This compaction requires no additional GPU generation.
+The original task and latest input remain intact; full events and evidence remain
+saved and can be recovered through `inspect_history`/`inspect_feedback`. Very long
+optional sections are explicitly marked as excerpts. If fixed instructions and
+images cannot fit even after compaction, execution stops with a clear context
+error instead of silently exceeding the working limit. Increasing this setting
+does not extend the model's capabilities or guarantee VRAM fit.

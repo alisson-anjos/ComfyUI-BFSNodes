@@ -128,6 +128,9 @@ class SessionTests(unittest.TestCase):
         with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
             runtime.Runtime(planner).decide(session)
         self.assertEqual(generate.call_count, 1)
+        self.assertEqual(session.token_usage["calls"], 1)
+        self.assertGreater(session.token_usage["input_tokens"], 0)
+        self.assertGreater(session.token_usage["output_tokens"], 0)
         self.assertEqual([e["phase"] for e in session.events], ["thinking"])
 
     def test_no_second_call_when_thinking_is_disabled(self):
@@ -614,7 +617,12 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_task_paths_are_loaded_before_context_queue(self):
         await self.run_server_cycle(task_media=True)
 
-    async def run_server_cycle(self, invalid_vae=False, task_media=False):
+    async def test_running_session_accepts_message_without_cancelling_render(self):
+        await self.run_server_cycle(chat_case=True)
+
+    async def run_server_cycle(
+        self, invalid_vae=False, task_media=False, chat_case=False
+    ):
         import asyncio
         from collections import deque
 
@@ -815,6 +823,35 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                     "recursive",
                 )
                 self.assertEqual(s.rendered_revision, s.revision)
+                if chat_case:
+                    s.status = "running"
+                    original = s.rendered_revision
+                    response = await registered[
+                        ("POST", "/bfs/shotloop/agent/message")
+                    ](
+                        types.SimpleNamespace(
+                            json=lambda: asyncio.sleep(
+                                0,
+                                result={
+                                    "id": sid,
+                                    "text": "Inspect the other soldier near frame 179",
+                                    "kind": "feedback",
+                                    "settings": {"max_actions": 80},
+                                },
+                            )
+                        )
+                    )
+                    self.assertEqual(response.status, 200, response.text)
+                    self.assertEqual(s.status, "running")
+                    self.assertTrue(s.pending_messages)
+                    self.assertEqual(s.renders, 1)
+                    self.assertEqual(s.rendered_revision, original)
+                    rt.consume_messages(s)
+                    self.assertFalse(s.pending_messages)
+                    self.assertEqual(s.messages[-1]["status"], "applied")
+                    self.assertEqual(s.settings["max_actions"], 80)
+                    s.status = "complete"
+                feedback_before = list(s.feedback)
                 invalid_feedback = await registered[
                     ("POST", "/bfs/shotloop/agent/control")
                 ](
@@ -826,7 +863,7 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(invalid_feedback.status, 400)
                 self.assertEqual(s.status, "complete")
-                self.assertEqual(s.feedback, [])
+                self.assertEqual(s.feedback, feedback_before)
                 # A completed session accepts correction without a new session or lost take.
                 feedback_response = await registered[
                     ("POST", "/bfs/shotloop/agent/control")
@@ -1124,6 +1161,130 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         self.assertFalse(
             runtime.invalid_vae_failure({"status_str": "error", "messages": []})
         )
+
+
+class ChatContextTests(unittest.TestCase):
+    def test_input_arriving_during_decision_discards_stale_action(self):
+        s = core.Session("swap", {}, {})
+
+        def decide(session):
+            session.queue_message("Preserve the second soldier")
+            return action("render")
+
+        s.tick(decide, lambda *_: self.fail("stale tool must not execute"))
+        self.assertEqual(s.renders, 0)
+        self.assertTrue(s.pending_messages)
+        self.assertFalse(any(e["kind"] == "action" for e in s.events))
+
+    def test_messages_apply_at_boundary_and_questions_do_not_withdraw_approval(self):
+        with tempfile.TemporaryDirectory() as root:
+            p = types.SimpleNamespace(
+                folder_paths=types.SimpleNamespace(get_output_directory=lambda: root),
+                _notify=lambda *args: None,
+            )
+            rt = runtime.Runtime(p)
+            s = core.Session("swap", {}, {"max_actions": 1})
+            rt.attach(s)
+            s.reviewed = {0}
+            s.combined = {"filename": "keep.mp4"}
+            s.events.append({"kind": "action"})
+            message = s.queue_message(
+                "What are you checking?", kind="question", settings={"max_actions": 5}
+            )
+            self.assertIsNotNone(s.combined)
+            s.tick(
+                lambda _: action("reply", message="Checking the protected soldier"),
+                rt.execute,
+            )
+            self.assertEqual(message["status"], "applied")
+            self.assertEqual(s.settings["max_actions"], 5)
+            self.assertIsNotNone(s.combined)
+            self.assertEqual(s.reviewed, {0})
+            self.assertFalse(s.pending_messages)
+            self.assertTrue(any(e["kind"] == "reply" for e in s.events))
+            correction = s.queue_message("The right soldier's head changed")
+            self.assertEqual(s.reviewed, {0})
+            rt.consume_messages(s)
+            self.assertEqual(correction["status"], "applied")
+            self.assertFalse(s.reviewed)
+            self.assertIsNone(s.combined)
+
+    def test_screenshots_survive_restore_and_can_be_reopened(self):
+        import io
+        import base64
+        from PIL import Image
+
+        chat = sys.modules[PACKAGE + ".bfs_agent_chat"]
+        with tempfile.TemporaryDirectory() as root:
+            p = types.SimpleNamespace(
+                folder_paths=types.SimpleNamespace(get_output_directory=lambda: root),
+                _notify=lambda *args: None,
+            )
+            rt = runtime.Runtime(p)
+            s = core.Session("swap", {}, {})
+            rt.attach(s)
+            png = io.BytesIO()
+            Image.new("RGB", (20, 10), "red").save(png, format="PNG")
+            src = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
+            attachments = chat.save_attachments(
+                rt.folder() / s.id / "feedback", [{"src": src, "name": "frame 179.png"}]
+            )
+            message = s.queue_message("This face changed", attachments)
+            rt.save(s)
+            restored = rt.get(s.id)
+            try:
+                rt.consume_messages(restored)
+                self.assertEqual(len(restored.images), 1)
+                out, images = rt.execute(
+                    restored, "inspect_feedback", {"message_id": message["id"]}
+                )
+                self.assertEqual(tuple(images[0].shape), (1, 10, 20, 3))
+                self.assertEqual(out["text"], "This face changed")
+                self.assertNotIn(src, json.dumps(restored.public()))
+            finally:
+                runtime.SESSIONS.pop(s.id, None)
+            with self.assertRaises(ValueError):
+                chat.save_attachments(
+                    Path(root) / "bad", [{"src": "https://remote/private.png"}]
+                )
+            self.assertFalse((Path(root) / "bad").exists())
+
+    def test_context_compacts_recorded_failures_without_deleting_history(self):
+        ctx = sys.modules[PACKAGE + ".bfs_agent_context"]
+        s = core.Session("Swap only the left soldier", {}, {})
+        s.event(
+            "action",
+            tool="update_shot",
+            summary="Update requested",
+            arguments={"shot": 0},
+        )
+        s.event("error", error="Unsupported shot changes")
+        for _ in range(40):
+            s.event("status", summary="Working")
+        before = len(s.events)
+        prompt = ctx.prepare_context(s, core.SYSTEM, core.TOOLS, 0)
+        self.assertIsNotNone(s.context_summary)
+        self.assertGreaterEqual(len(s.events), before)
+        self.assertIn("Unsupported shot changes", prompt)
+        self.assertIn("requested_tool", json.dumps(s.context_summary))
+        self.assertLessEqual(
+            s.context_usage["total_tokens"], s.context_usage["capacity"]
+        )
+        self.assertTrue(s.context_usage["estimated"])
+        self.assertIn("Swap only the left soldier", prompt)
+
+    def test_context_block_stops_once_and_session_usage_is_not_the_window(self):
+        ctx = sys.modules[PACKAGE + ".bfs_agent_context"]
+        s = core.Session("task", {}, {"context_window": 8192, "max_tokens": 8192})
+        s.tick(
+            lambda _: ctx.prepare_context(s, core.SYSTEM, core.TOOLS, 4),
+            lambda *_: self.fail("cannot execute"),
+        )
+        self.assertEqual(s.status, "error")
+        self.assertEqual(s.error_count, 1)
+        self.assertTrue(s.context_usage["blocked"])
+        self.assertEqual(s.token_usage["calls"], 0)
+        self.assertEqual(s.token_usage["input_tokens"], 0)
 
 
 class DenseReviewTests(unittest.TestCase):

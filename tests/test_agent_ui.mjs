@@ -5,12 +5,12 @@ import test from 'node:test';
 const source = (await readFile(new URL('../web/js/shotloop/view_agent.js', import.meta.url), 'utf8'))
   .replace(/^import .*;\s*$/gm, '');
 const stubs = `const reactive = x => x; const onMounted = () => {}; const onBeforeUnmount = () => {};
-const h = (tag, props = {}, children = []) => ({tag, props, children});\n`;
+function h(tag,props={},children){if(Array.isArray(props)||typeof props==="string"){children=props;props={};}return {tag,props,children:children??[]};}\n`;
 const { createAgent, agentTab } = await import('data:text/javascript;base64,' + Buffer.from(stubs + source).toString('base64'));
 function find(node, predicate) {
   if (!node || typeof node !== 'object') return;
   if (predicate(node)) return node;
-  for (const child of Array.isArray(node.children) ? node.children : []) {
+  for (const child of Array.isArray(node.children) ? node.children : typeof node.children==='object' ? [node.children] : []) {
     const found = find(child, predicate);
     if (found) return found;
   }
@@ -22,6 +22,7 @@ function context() {
   c.agent = createAgent(c, {}, {});
   c.agent.a.task = 'existing task';
   c.agent.a.id = 'test';
+  c.agent.a.view='settings';
   return c;
 }
 test('token edits survive a poll before blur, including an empty draft', async () => {
@@ -50,9 +51,9 @@ test('invalid VAE workflow disables Resume and permits starting a fresh task', a
   await c.agent.poll();
   const tree = agentTab(c);
   const resume = find(tree, n => n.tag === 'button' && n.children === 'Resume');
-  const start = find(tree, n => n.tag === 'button' && n.children === '▶ Start automatic task');
+  const fresh = find(tree, n => n.tag === 'button' && n.children === 'New task');
   assert.equal(resume.props.disabled, true);
-  assert.equal(start.props.disabled, false);
+  assert.equal(fresh.props.disabled, false);
 });
 
 test('feedback survives polling, sends separately from task, and clears only on success', async () => {
@@ -61,20 +62,21 @@ test('feedback survives polling, sends separately from task, and clears only on 
   let sent;
   c.api.fetchApi = async (url, options) => {
     if(options)sent=JSON.parse(options.body);
-    return {ok:true,json:async()=>({id:'test',status:'running',events:[],feedback:[{text:'Preserve the other person'}]})};
+    return {ok:true,json:async()=>({id:'test',status:'running',events:[],messages:[{id:'m',text:'Preserve the other person',kind:'feedback',status:'queued'}],pending_messages:['m']})};
   };
-  const input=find(agentTab(c),n=>n.tag==='textarea'&&n.props.maxLength===4000);
+  const input=find(agentTab(c),n=>n.tag==='textarea'&&n.props['aria-label']==='Message to the agent');
   input.props.onInput({target:{value:'Preserve the other person'}});
   await c.agent.poll();
   assert.equal(c.agent.a.feedback,'Preserve the other person');
   c.agent.a.status='complete';
   assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,false);
   await c.agent.sendFeedback();
-  assert.equal(sent.action,'feedback');
-  assert.equal(sent.feedback,'Preserve the other person');
+  assert.equal(sent.kind,'feedback');
+  assert.equal(sent.text,'Preserve the other person');
   assert.equal(c.agent.a.task,'existing task');
   assert.equal(c.agent.a.feedback,'');
-  assert.equal(c.agent.a.feedbackHistory.length,1);
+  assert.equal(c.agent.a.messages.length,1);
+  assert.equal(c.agent.a.pendingMessages.length,1);
   c.agent.a.feedback='Retry this correction';
   c.api.fetchApi=async()=>({ok:false,json:async()=>({error:'Wait for current action'})});
   await c.agent.sendFeedback();
@@ -82,12 +84,14 @@ test('feedback survives polling, sends separately from task, and clears only on 
   assert.match(c.agent.a.error,/Wait for current action/);
 });
 
-test('feedback requires pausing active sessions and cannot bypass invalid workflow',()=>{
+test('chat accepts feedback during active work and cannot bypass stopped or invalid sessions',()=>{
   const c=context();c.agent.a.feedback='Fix only the target';
-  for(const status of ['running','waiting_render','stopped']){
+  for(const status of ['running','waiting_render']){
     c.agent.a.status=status;
-    assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
+    assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,false);
   }
+  c.agent.a.status='stopped';
+  assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
   c.agent.a.status='paused';c.agent.a.requiresNewTask=true;
   assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
 });
@@ -99,9 +103,61 @@ test('zero review fps survives polling and the UI prioritizes final review over 
   label.children[1].props.onInput({target:{value:'0'}});
   await c.agent.poll();
   assert.equal(c.agent.a.settings.review_fps,0);
+  c.agent.a.view='chat';
   c.agent.a.preview={frames:[{src:'old-preview'}]};
   c.agent.a.observation={frames:[{src:'final-review',label:'generated frame 179'}]};
   const tree=agentTab(c);
   assert.ok(find(tree,n=>n.tag==='img'&&n.props.src==='final-review'));
   assert.equal(find(tree,n=>n.tag==='img'&&n.props.src==='old-preview'),undefined);
+});
+
+test('attachments travel with queued feedback and failed sends preserve the draft',async()=>{
+  const c=context();c.agent.a.status='waiting_render';c.agent.a.feedback='Look at the right face';
+  c.agent.a.attachments=[{name:'frame.png',src:'data:image/png;base64,test'}];
+  let body;
+  c.api.fetchApi=async(url,options)=>{body=JSON.parse(options.body);return{ok:false,json:async()=>({error:'connection lost'})};};
+  await c.agent.sendFeedback();
+  assert.equal(body.attachments[0].name,'frame.png');
+  assert.equal(c.agent.a.attachments.length,1);
+  assert.equal(c.agent.a.feedback,'Look at the right face');
+});
+
+test('resource snapshots update without changing a numeric setting draft',async()=>{
+  const c=context();c.agent.a.settings.max_tokens='';
+  c.api.fetchApi=async()=>({ok:true,json:async()=>({time:123,ram:{percent:40},gpu:null})});
+  await c.agent.pollResources(true);
+  assert.equal(c.agent.a.resources.ram.percent,40);
+  assert.equal(c.agent.a.settings.max_tokens,'');
+  assert.equal(c.agent.a.resources.gpu,null);
+});
+
+test('new task clears a stale invalid-workflow lock and old accounting',()=>{
+  const c=context();c.agent.a.status='error';c.agent.a.requiresNewTask=true;c.agent.a.actions=80;
+  c.agent.a.contextUsage={capacity:32768};c.agent.a.tokenUsage={calls:20};
+  c.agent.newTask();
+  assert.equal(c.agent.a.requiresNewTask,false);
+  assert.equal(c.agent.a.id,'');
+  assert.equal(c.agent.a.actions,0);
+  assert.equal(c.agent.a.tokenUsage,null);
+  c.agent.a.task='Retry the fixed workflow';
+  assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='▶ Start automatic task').props.disabled,false);
+});
+
+test('typing the next message during a send does not lose the new draft',async()=>{
+  const c=context();c.agent.a.feedback='First correction';
+  let finish;
+  c.api.fetchApi=async()=>{await new Promise(resolve=>{finish=resolve;});return{ok:true,json:async()=>({id:'test',status:'running',events:[]})};};
+  const pending=c.agent.sendFeedback();
+  c.agent.a.feedback='Next correction still being written';
+  finish();await pending;
+  assert.equal(c.agent.a.feedback,'Next correction still being written');
+});
+
+test('polling retains activity that rolls out of the server event window',async()=>{
+  const c=context();
+  c.agent.a.events=[{time:1,kind:'status',summary:'older'},{time:2,kind:'status',summary:'still current'}];
+  c.api.fetchApi=async()=>({ok:true,json:async()=>({id:'test',status:'running',event_count:3,events:[{time:2,kind:'status',summary:'still current'},{time:3,kind:'status',summary:'new'}]})});
+  await c.agent.poll();
+  assert.equal(c.agent.a.historyEvents[0].summary,'older');
+  assert.equal(c.agent.a.events.at(-1).summary,'new');
 });
