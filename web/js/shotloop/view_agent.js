@@ -2,7 +2,7 @@ import { reactive, onMounted, onBeforeUnmount } from '../vendor/vue.esm-browser.
 import { h } from './common.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, vlmInfo:null, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
+  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false;
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
@@ -12,6 +12,7 @@ export function createAgent(c, io, app) {
   function apply(j) {
     if(!a.task){a.task=j.task||'';Object.assign(a.settings,j.settings||{});}
     a.vlmInfo=j.vlm_info||null;
+    a.requiresNewTask=!!j.requires_new_task||String(j.observation?.error||'').includes('Workflow VAE loader rejected');
     a.checklist=j.checklist||[];a.id=j.id;a.status=j.status;a.events=j.events||[];a.observation=j.observation||{};a.preview=j.preview;a.combined=j.combined;
     // Paused manual edits are sent back to the server on Resume.
     if (j.plan && ['running','waiting_render','complete','budget_exhausted','error'].includes(j.status)) {
@@ -74,7 +75,7 @@ export function agentBar(c) {
       h('span',{class:'grow'},last?.summary||last?.error||'Agent'),
       h('label',[h('input',{type:'checkbox',checked:a.follow,onChange:e=>{a.follow=e.target.checked;}}),' Follow tabs']),
       h('button',{onClick:()=>control('pause'),disabled:!['running','waiting_render'].includes(a.status)},'Pause'),
-      h('button',{onClick:()=>control('resume'),disabled:!['paused','error','budget_exhausted'].includes(a.status)},'Resume'),
+      h('button',{onClick:()=>control('resume'),disabled:a.requiresNewTask||!['paused','error','budget_exhausted'].includes(a.status)},'Resume'),
       h('button',{onClick:()=>control('stop'),disabled:['stopped','complete'].includes(a.status)},'Stop'),
     ]),
     a.preview ? h('details',{open:a.status==='waiting_render'},[
@@ -117,12 +118,13 @@ export function agentTab(c) {
     h('div',{class:'row'},[
       h('button',{onClick:start,disabled:a.working||!a.task.trim()||['running','waiting_render'].includes(a.status)},'▶ Start automatic task'),
       h('button',{onClick:()=>control('pause'),disabled:!a.id},'Pause'),
-      h('button',{onClick:()=>control('resume'),disabled:!a.id},'Resume'),
+      h('button',{onClick:()=>control('resume'),disabled:!a.id||a.requiresNewTask},'Resume'),
       h('button',{onClick:()=>control('stop'),disabled:!a.id},'Stop'),
     ]),
     h('div',{class:'hint'},'Runs on the server, including when this tab is closed. Pause stops after the current tool; a queued render may finish. Stop cancels this session’s render. For intermediate H3 previews, connect BFS Agent Preview Sampler between sampler selection and SamplerCustom; session binding is automatic.'),
     a.checklist.length?h('ol',a.checklist.map(step=>h('li',`${{pending:'○',in_progress:'▶',done:'✓'}[step.status]} ${step.title}`))):null,
     a.error?h('div',{class:'err'},a.error):null,
+    a.requiresNewTask?h('div',{class:'err'},'Fix the VAE loader/connections in the workflow, then click Start automatic task. Resume uses the old snapshot and is unavailable for this error.'):null,
     a.preview?h('div',`Intermediate preview · ${a.preview.step}/${a.preview.total_steps} steps · approximate`):null,
     a.preview?.error?h('div',{class:'err'},'Intermediate preview disabled; generation continues: '+a.preview.error):null,
     h('div',{class:'row',style:'flex-wrap:wrap'},frames.map(f=>h('figure',{style:'margin:4px;max-width:220px'},[

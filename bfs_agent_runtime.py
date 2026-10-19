@@ -203,6 +203,11 @@ class Runtime:
             s.combined = d.get("combined")
             s.preview = d.get("preview")
             s.vlm_info = d.get("vlm_info")
+            s.requires_new_task = bool(
+                d.get("requires_new_task")
+            ) or "Workflow VAE loader rejected" in str(
+                d.get("observation", {}).get("error", "")
+            )
             s.observation = {
                 "message": "Session restored. Inspect current plan and results before continuing."
             }
@@ -1112,6 +1117,7 @@ def register(planner):
                     s.pending_render = None
                     s.status = "running"
                     if invalid_vae_failure(st):
+                        s.requires_new_task = True
                         s.status = "error"
                         s.observation = {
                             "error": "Workflow VAE loader rejected its checkpoint. Fix the VAE checkpoint/loader and start a new task to refresh the workflow snapshot.",
@@ -1247,6 +1253,12 @@ def register(planner):
                         nodes.interrupt_processing(True)
                     s.pending_render = None
             elif action == "resume":
+                if s.requires_new_task or "Workflow VAE loader rejected" in str(
+                    s.observation.get("error", "")
+                ):
+                    raise ValueError(
+                        "This session contains the invalid VAE workflow snapshot. Fix the workflow, then use Start automatic task; Resume cannot refresh graph connections."
+                    )
                 ensure_cuda_healthy()
                 if s.status not in ("paused", "error", "budget_exhausted"):
                     raise ValueError(

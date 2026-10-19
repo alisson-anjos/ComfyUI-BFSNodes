@@ -232,6 +232,7 @@ class Session:
         self.render_snapshot = None
         self.checklist = []
         self.vlm_info = None
+        self.requires_new_task = False
 
     def event(self, kind, **data):
         self.events.append({"time": time.time(), "kind": kind, **data})
@@ -259,6 +260,7 @@ class Session:
             "combined": self.combined,
             "preview": self.preview,
             "vlm_info": self.vlm_info,
+            "requires_new_task": self.requires_new_task,
             "updated": self.updated,
             "revision": self.revision,
             "rendered_revision": self.rendered_revision,

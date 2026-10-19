@@ -42,3 +42,15 @@ test('Thinking checkbox still uses its checked state', () => {
   label.children[1].props.onChange({target: {checked: false}});
   assert.equal(c.agent.a.settings.thinking, false);
 });
+
+test('invalid VAE workflow disables Resume and permits starting a fresh task', async () => {
+  const c = context();
+  c.api.fetchApi = async () => ({ok: true, json: async () => ({id: 'test', status: 'error',
+    requires_new_task: true, observation: {error: 'Workflow VAE loader rejected its checkpoint.'}})});
+  await c.agent.poll();
+  const tree = agentTab(c);
+  const resume = find(tree, n => n.tag === 'button' && n.children === 'Resume');
+  const start = find(tree, n => n.tag === 'button' && n.children === '▶ Start automatic task');
+  assert.equal(resume.props.disabled, true);
+  assert.equal(start.props.disabled, false);
+});

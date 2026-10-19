@@ -751,6 +751,19 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                 if invalid_vae:
                     self.assertEqual(s.status, "error")
                     self.assertIn("VAE loader rejected", s.observation["error"])
+                    self.assertTrue(s.requires_new_task)
+                    response = await registered[
+                        ("POST", "/bfs/shotloop/agent/control")
+                    ](
+                        types.SimpleNamespace(
+                            json=lambda: asyncio.sleep(
+                                0, result={"id": sid, "action": "resume"}
+                            )
+                        )
+                    )
+                    self.assertEqual(response.status, 400)
+                    self.assertIn("Start automatic task", response.text)
+                    self.assertEqual(s.status, "error")
                     self.assertEqual(
                         len(script), 3
                     )  # no inspect_result/combine/finish decisions after loader failure
