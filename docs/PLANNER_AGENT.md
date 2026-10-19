@@ -186,3 +186,23 @@ Native CUDA aborts can terminate Python before any Python error handler can run.
 VRAM pressure and illegal CUDA accesses are separate diagnoses. Dynamic model loading logs
 do not establish peak memory use. CPU tests cover lifecycle/order, inference context and fault
 handling; reproduction on the user's actual GPU/backend is still needed.
+
+## Kijai's decoder-only taeh3 checkpoint
+
+The 9.79 MB Kijai `MiniMax-H3-TAE/vae_approx/taeh3.safetensors` is a 2D decoder-only
+checkpoint (24 latent channels, 96/64-wide blocks, four spatial upsamples). It is not
+a normal VAE checkpoint and the stock VAELoader may reject it. For Agent previews, keep
+it in `models/vae_approx`, disconnect the stock loader from `preview_vae`, and let the
+Agent sampler load it automatically. The adapter strictly loads all 81 tensors and decodes
+independent snapshots, one at a time. Other temporal/native VAE formats still use ComfyUI's
+VAE loader. Keep the full H3 video VAE on the final video decode branch.
+
+An invalid-VAE error from the workflow is treated as a configuration failure: the Agent
+stops instead of asking the VLM to repair a loader/model pairing it cannot change. Fix
+the graph and start a new task so its workflow snapshot includes the change.
+
+The per-call lifecycle guard also covers the common Planner TextGenerate helper (prompt
+writing, reference descriptions and preview review), not only Agent decisions. This addresses
+a repeated-generation failure mode reported upstream in ComfyUI issue #16441:
+https://github.com/Comfy-Org/ComfyUI/issues/16441
+Repeated-generation GPU stability still needs verification on the affected installation.

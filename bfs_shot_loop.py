@@ -1734,14 +1734,21 @@ def _textgenerate_execute(TextGenerate, **kwargs):
     if supports_mtp:
         # MTP is speculative decoding. It is optional and off preserves the planner's prior behavior.
         call_kwargs["mtp"] = "off"
-    try:
-        return TextGenerate.execute(**call_kwargs)
-    except TypeError as e:
-        # Some wrappers advertise **kwargs but forward to an older execute() implementation.
-        if "mtp" not in call_kwargs or "unexpected keyword argument 'mtp'" not in str(e):
-            raise
-        call_kwargs.pop("mtp")
-        return TextGenerate.execute(**call_kwargs)
+    def generate():
+        try:
+            return TextGenerate.execute(**call_kwargs)
+        except TypeError as e:
+            # Some wrappers advertise **kwargs but forward to an older execute() implementation.
+            if "mtp" not in call_kwargs or "unexpected keyword argument 'mtp'" not in str(e):
+                raise
+            call_kwargs.pop("mtp")
+            return TextGenerate.execute(**call_kwargs)
+
+    if __package__:
+        from .bfs_agent_inference import run_inference
+    else:  # standalone CPU test harness
+        from bfs_agent_inference import run_inference
+    return run_inference(generate)
 
 
 def vlm_generate(clip, prompt: str, images: torch.Tensor, max_tokens: int, temperature: float = 0.0, seed: int = 0,

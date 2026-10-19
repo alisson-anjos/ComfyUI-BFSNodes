@@ -32,6 +32,7 @@ inference = sys.modules[PACKAGE + ".bfs_agent_inference"]
 runtime = load("bfs_agent_runtime")
 preview = load("bfs_agent_preview")
 diagnostics = load("bfs_agent_diagnostics")
+tae = load("bfs_agent_tae")
 
 
 def action(tool, **args):
@@ -605,6 +606,12 @@ class PreviewTests(unittest.TestCase):
 
 class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_server_cycle_without_browser_requeue(self):
+        await self.run_server_cycle()
+
+    async def test_invalid_vae_render_stops_before_another_vlm_decision(self):
+        await self.run_server_cycle(invalid_vae=True)
+
+    async def run_server_cycle(self, invalid_vae=False):
         import asyncio
         from collections import deque
 
@@ -625,7 +632,27 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
 
                 def put(self, item):
                     self.graphs.append(item[2])
-                    self.history[item[1]] = {"status": {"status_str": "success"}}
+                    is_context = any(
+                        n.get("class_type") == "BFSAgentContext"
+                        for n in item[2].values()
+                    )
+                    self.history[item[1]] = {
+                        "status": (
+                            {
+                                "status_str": "error",
+                                "messages": [
+                                    [
+                                        "execution_error",
+                                        {
+                                            "exception_message": "ERROR: VAE is invalid: None"
+                                        },
+                                    ]
+                                ],
+                            }
+                            if invalid_vae and not is_context
+                            else {"status_str": "success"}
+                        )
+                    }
 
                 def get_history(self, prompt_id):
                     return (
@@ -721,6 +748,15 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                     if s.status in ("complete", "error", "budget_exhausted"):
                         break
                     await asyncio.sleep(0.01)
+                if invalid_vae:
+                    self.assertEqual(s.status, "error")
+                    self.assertIn("VAE loader rejected", s.observation["error"])
+                    self.assertEqual(
+                        len(script), 3
+                    )  # no inspect_result/combine/finish decisions after loader failure
+                    self.assertEqual(len(queue.graphs), 2)
+                    runtime.SESSIONS.pop(sid)
+                    return
                 self.assertEqual(s.status, "complete", s.observation)
                 self.assertEqual(len(worker_threads), 1)
                 context = next(
@@ -945,6 +981,76 @@ class InferenceLifecycleTests(unittest.TestCase):
             inference.cleanup_inference()
         self.assertEqual(calls, ["prefetch", "cast", "vbar"])
         self.assertTrue(modules["comfy.memory_management"].aimdo_enabled)
+
+
+class TinyPreviewLoaderTests(unittest.TestCase):
+    def test_kijai_2d_format_is_not_confused_with_temporal_vae(self):
+        self.assertTrue(
+            tae.is_2d_h3(
+                {
+                    "1.weight": torch.empty(96, 24, 3, 3),
+                    "23.weight": torch.empty(3, 64, 3, 3),
+                }
+            )
+        )
+        self.assertFalse(tae.is_2d_h3({"decoder.1.weight": torch.empty(256, 24, 3, 3)}))
+        self.assertFalse(
+            tae.is_2d_h3(
+                {
+                    "1.weight": torch.empty(64, 4, 3, 3),
+                    "23.weight": torch.empty(3, 64, 3, 3),
+                }
+            )
+        )
+
+    def test_partial_checkpoint_is_rejected_before_decode(self):
+        with self.assertRaises(RuntimeError):
+            tae.build_h3_decoder({"1.weight": torch.empty(96, 24, 3, 3)})
+
+    def test_tiny_adapter_decodes_one_image_at_a_time_and_clamps_output(self):
+        calls = []
+        mm = types.ModuleType("comfy.model_management")
+        mm.load_models_gpu = lambda models: None
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.model_management = mm
+        vae = tae.H3TinyPreviewVAE.__new__(tae.H3TinyPreviewVAE)
+        vae.device, vae.dtype, vae.patcher = (
+            torch.device("cpu"),
+            torch.float32,
+            object(),
+        )
+
+        def decoder(z):
+            calls.append(tuple(z.shape))
+            return torch.full((1, 3, 32, 48), 2.0)
+
+        vae.first_stage_model = decoder
+        with patch.dict(sys.modules, {"comfy": comfy, "comfy.model_management": mm}):
+            output = vae.decode(torch.zeros(1, 24, 2, 2, 3))
+        self.assertEqual(calls, [(1, 24, 2, 3)] * 2)
+        self.assertEqual(tuple(output.shape), (2, 32, 48, 3))
+        self.assertTrue(torch.all(output == 1))
+        self.assertTrue(vae.single_latent_preview)
+
+    def test_invalid_vae_loader_failure_is_a_configuration_error(self):
+        failure = {
+            "status_str": "error",
+            "messages": [
+                [
+                    "execution_error",
+                    {
+                        "node_type": "VAELoader",
+                        "exception_message": "ERROR: VAE is invalid: None",
+                    },
+                ]
+            ],
+        }
+        self.assertTrue(runtime.invalid_vae_failure(failure))
+        self.assertFalse(runtime.invalid_vae_failure({"status_str": "success"}))
+        self.assertFalse(
+            runtime.invalid_vae_failure({"status_str": "error", "messages": []})
+        )
 
 
 if __name__ == "__main__":

@@ -86,6 +86,20 @@ class TextGenerateCompatibilityTest(unittest.TestCase):
         self.assertEqual(result, "generated")
         return calls[0]
 
+    def test_each_textgenerate_call_cleans_up_before_the_next(self):
+        import bfs_agent_inference as inference
+        records = []
+        def execute(**kwargs):
+            self.assertTrue(torch.is_inference_mode_enabled())
+            records.append("generate")
+            return types.SimpleNamespace(args=("generated",))
+        generator = types.SimpleNamespace(execute=execute)
+        with patch.object(inference, "cleanup_inference", lambda: records.append("cleanup")):
+            for _ in range(2):
+                SL._textgenerate_execute(generator, clip=object(), prompt="inspect", max_length=32,
+                                         sampling_mode={"sampling_mode": "off"})
+        self.assertEqual(records, ["generate", "cleanup", "generate", "cleanup"])
+
     def test_old_textgenerate_signature_does_not_receive_mtp(self):
         def execute(clip, prompt, max_length, sampling_mode, image=None):
             return types.SimpleNamespace(args=("generated",))

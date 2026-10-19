@@ -24,6 +24,25 @@ GPU_LOCK = threading.RLock()
 AGENT_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bfs-agent")
 
 
+def invalid_vae_failure(status):
+    if status.get("status_str") == "success":
+        return False
+    for event in status.get("messages", []):
+        if (
+            isinstance(event, (list, tuple))
+            and len(event) == 2
+            and event[0] == "execution_error"
+        ):
+            details = event[1]
+            if (
+                isinstance(details, dict)
+                and "vae is invalid"
+                in str(details.get("exception_message", "")).lower()
+            ):
+                return True
+    return False
+
+
 class PageText(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -1092,6 +1111,15 @@ def register(planner):
                     snapshot = s.pending_render.get("snapshot")
                     s.pending_render = None
                     s.status = "running"
+                    if invalid_vae_failure(st):
+                        s.status = "error"
+                        s.observation = {
+                            "error": "Workflow VAE loader rejected its checkpoint. Fix the VAE checkpoint/loader and start a new task to refresh the workflow snapshot.",
+                            "render_status": st,
+                        }
+                        s.event("error", **s.observation)
+                        rt.save(s)
+                        break  # model reasoning cannot repair an unsupported loader/checkpoint pairing
                     if st.get("status_str") == "success":
                         if kind == "context":
                             s.context_ready = True

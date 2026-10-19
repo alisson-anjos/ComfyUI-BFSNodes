@@ -101,7 +101,7 @@ class PreviewSampler:
         s.preview = None
         vae = self.vae
         if vae is None:
-            import comfy.sd
+            from .bfs_agent_tae import load_preview_vae
             import comfy.utils
             import folder_paths
 
@@ -117,7 +117,7 @@ class PreviewSampler:
                 raise ValueError(
                     "Agent preview needs taeh3 in models/vae_approx, or a compatible preview_vae input"
                 )
-            vae = comfy.sd.VAE(
+            vae = load_preview_vae(
                 comfy.utils.load_torch_file(
                     folder_paths.get_full_path("vae_approx", name)
                 )
@@ -129,7 +129,7 @@ class PreviewSampler:
         latent_shapes = getattr(
             getattr(model_wrap, "inner_model", None), "latent_shapes", None
         )
-        full_vae = any(
+        full_vae = getattr(vae, "single_latent_preview", False) or any(
             cls.__name__ == "MiniMaxH3VideoVAE"
             for cls in type(vae.first_stage_model).__mro__
         )
