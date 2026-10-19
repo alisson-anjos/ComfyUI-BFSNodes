@@ -91,3 +91,17 @@ test('feedback requires pausing active sessions and cannot bypass invalid workfl
   c.agent.a.status='paused';c.agent.a.requiresNewTask=true;
   assert.equal(find(agentTab(c),n=>n.tag==='button'&&n.children==='Send feedback and continue').props.disabled,true);
 });
+
+test('zero review fps survives polling and the UI prioritizes final review over stale previews',async()=>{
+  const c=context();
+  const label=find(agentTab(c),n=>n.tag==='label'&&n.children[0]==='Review fps (0 = every frame)');
+  assert.equal(label.children[1].props.min,0);
+  label.children[1].props.onInput({target:{value:'0'}});
+  await c.agent.poll();
+  assert.equal(c.agent.a.settings.review_fps,0);
+  c.agent.a.preview={frames:[{src:'old-preview'}]};
+  c.agent.a.observation={frames:[{src:'final-review',label:'generated frame 179'}]};
+  const tree=agentTab(c);
+  assert.ok(find(tree,n=>n.tag==='img'&&n.props.src==='final-review'));
+  assert.equal(find(tree,n=>n.tag==='img'&&n.props.src==='old-preview'),undefined);
+});

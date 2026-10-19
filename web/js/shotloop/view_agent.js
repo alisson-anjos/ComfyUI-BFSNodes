@@ -2,7 +2,7 @@ import { reactive, onMounted, onBeforeUnmount } from '../vendor/vue.esm-browser.
 import { h } from './common.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', feedback:'', feedbackHistory:[], id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
+  const a = reactive({ task:'', feedback:'', feedbackHistory:[], reviewCoverage:{}, id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,review_fps:2,project_root:''}, follow:true, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false;
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
@@ -11,6 +11,7 @@ export function createAgent(c, io, app) {
   }
   function apply(j) {
     if(!a.task){a.task=j.task||'';Object.assign(a.settings,j.settings||{});}
+    a.reviewCoverage=j.review_coverage||{};
     a.feedbackHistory=j.feedback||[];
     a.previewHistory=j.preview_history||[];
     a.vlmInfo=j.vlm_info||null;
@@ -18,7 +19,11 @@ export function createAgent(c, io, app) {
     a.checklist=j.checklist||[];a.id=j.id;a.status=j.status;a.events=j.events||[];a.observation=j.observation||{};a.preview=j.preview;a.combined=j.combined;
     // Paused manual edits are sent back to the server on Resume.
     if (j.plan && ['running','waiting_render','complete','budget_exhausted','error'].includes(j.status)) {
+      const sourceChanged=j.plan.video!==c.plan.video;
+      const refsChanged=JSON.stringify(j.plan.global_refs)!==JSON.stringify(c.plan.global_refs);
       Object.assign(c.plan,j.plan);c.save();
+      if(sourceChanged||refsChanged)c.refreshFiles?.();
+      if(sourceChanged)c.analyze?.();
     }
     const last=[...(j.events||[])].reverse().find(e=>e.kind==='action');
     if(last && ['segment','preview_mask'].includes(last.tool) && j.observation?.frames) {
@@ -101,13 +106,14 @@ export function agentBar(c) {
 export function agentTab(c) {
   const {a,start,control,sendFeedback}=c.agent;
   const setting=(name,label,type='number')=>h('label',{style:'display:flex;gap:8px;align-items:center'},[
-    label,h('input',{type,min:type==='number'?(name==='max_tokens'?512:1):undefined,max:type==='number'?({max_tokens:16384,max_actions:200,max_renders:20}[name]):undefined,value:a.settings[name],checked:!!a.settings[name],onInput:type==='checkbox'?undefined:e=>{a.settings[name]=type==='number'&&e.target.value!==''?Number(e.target.value):e.target.value;},onChange:type==='checkbox'?e=>{a.settings[name]=e.target.checked;}:undefined})]);
-  const frames=a.preview?.frames||a.observation.frames||[];
+    label,h('input',{type,min:type==='number'?(name==='review_fps'?0:name==='max_tokens'?512:1):undefined,max:type==='number'?({max_tokens:16384,max_actions:200,max_renders:20,review_fps:24}[name]):undefined,value:a.settings[name],checked:!!a.settings[name],onInput:type==='checkbox'?undefined:e=>{a.settings[name]=type==='number'&&e.target.value!==''?Number(e.target.value):e.target.value;},onChange:type==='checkbox'?e=>{a.settings[name]=e.target.checked;}:undefined})]);
+  const frames=a.observation.frames||a.preview?.frames||[];
   return h('div',{style:'padding:12px;display:grid;gap:12px'},[
     h('h3','Agent · experimental'),
-    h('textarea',{value:a.task,placeholder:'Describe the complete video task, references, what must change and what must be preserved.',rows:5,style:'width:100%;box-sizing:border-box',onInput:e=>{a.task=e.target.value;}}),
+    h('textarea',{value:a.task,placeholder:'Describe the task. Optional server paths on separate lines:\nGuide: /path/video.mp4\nRef 1: /path/reference.png',rows:5,style:'width:100%;box-sizing:border-box',onInput:e=>{a.task=e.target.value;}}),
     h('div',{class:'row',style:'gap:16px;flex-wrap:wrap'},[
       setting('thinking','Thinking','checkbox'),setting('web','Web context','checkbox'),
+      setting('review_fps','Review fps (0 = every frame)'),
       setting('max_actions','Action limit'),setting('max_renders','Render limit'),setting('max_tokens','Decision token budget'),
     ]),
     setting('project_root','Project context folder (optional)','text'),
@@ -141,13 +147,15 @@ export function agentTab(c) {
       a.feedbackHistory.length?h('details',[h('summary',`Previous feedback (${a.feedbackHistory.length})`),...a.feedbackHistory.map(f=>h('div',{style:'white-space:pre-wrap;padding:6px'},f.text))]):null,
     ]):null,
     a.checklist.length?h('ol',a.checklist.map(step=>h('li',`${{pending:'○',in_progress:'▶',done:'✓'}[step.status]} ${step.title}`))):null,
+    h('div',{class:'hint'},'Review uses up to 6 matched result/source frame pairs per page. Higher review fps takes more actions; 0 requires every frame. Sampling may miss brief defects. Server paths load media into the existing workflow; its generation/model nodes must already be connected.'),
+    ...Object.entries(a.reviewCoverage).map(([shot,v])=>h('div',`Shot ${shot}: reviewed ${v.covered_count}/${v.required_count} required frames${v.complete?' · coverage complete':''}`)),
     a.error?h('div',{class:'err'},a.error):null,
     a.requiresNewTask?h('div',{class:'err'},'Fix the VAE loader/connections in the workflow, then click Start automatic task. Resume uses the old snapshot and is unavailable for this error.'):null,
-    a.preview?h('div',`Intermediate preview · ${a.preview.step}/${a.preview.total_steps} steps · approximate`):null,
+    a.preview&&!a.observation.frames?h('div',`Intermediate preview · ${a.preview.step}/${a.preview.total_steps} steps · approximate`):null,
     a.preview?.error?h('div',{class:'err'},'Intermediate preview disabled; generation continues: '+a.preview.error):null,
     h('div',{class:'row',style:'flex-wrap:wrap'},frames.map(f=>h('figure',{style:'margin:4px;max-width:220px'},[
       h('img',{src:f.src,style:'max-width:220px;max-height:200px'}),h('figcaption',f.label||`latent ${f.latent_index??f.f??''}`)]))),
-    a.preview?.review?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(a.preview.review,null,2)):null,
+    a.preview?.review&&!a.observation.frames?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(a.preview.review,null,2)):null,
     a.combined?h('a',{href:c.api.apiURL(`/view?filename=${encodeURIComponent(a.combined.filename)}&subfolder=${encodeURIComponent(a.combined.subfolder||'')}&type=output`),target:'_blank'},'Open assembled video'):null,
     h('details',[h('summary','Render history · approximate previews'),...a.previewHistory.slice().reverse().map(t=>h('details',[
       h('summary',`Render ${t.render} · ${t.status}`),
@@ -163,7 +171,7 @@ export function agentTab(c) {
       !(t.captures||[]).length?h('div','No preview captured before this render ended.'):null,
     ]))]),
     h('details',{open:true},[h('summary','Activity and tool calls'),h('div',{style:'max-height:420px;overflow:auto'},a.events.slice(-60).reverse().map(e=>h('div',{style:'padding:6px;border-bottom:1px solid #444'},[
-      h('b',`${new Date(e.time*1000).toLocaleTimeString()} · ${e.tool||e.kind}`),
+      h('b',`${new Date(e.time*1000).toLocaleTimeString()} · ${e.tool||e.kind}${e.kind==='action'?' · requested':''}`),
       h('div',e.summary||e.error||''),
       ...[['observed','Observed'],['reason','Reason'],['expected','Expected'],['uncertainty','Uncertainty']].filter(([k])=>e[k]).map(([k,label])=>h('div',`${label}: ${e[k]}`)),
       e.arguments?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(e.arguments,null,2)):null,

@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from .bfs_agent_inference import cuda_context_fault, mark_cuda_fault
+from .bfs_agent_review import review_rate
 
 TOOLS = {
     "set_checklist": {
@@ -25,7 +26,14 @@ TOOLS = {
     },
     "inspect_source": {
         "description": "See ordered source frames and assigned reference pictures.",
-        "arguments": {"shot": "zero-based integer"},
+        "arguments": {
+            "shot": "zero-based integer",
+            "frame_indices": "optional 1..6 shot-relative integers",
+            "start_frame": "optional inclusive relative frame",
+            "end_frame": "optional inclusive relative frame",
+            "count": "optional 1..6",
+            "region": "optional normalized [left,top,right,bottom]",
+        },
     },
     "update_plan": {
         "description": "Adjust global prompt, shot duration, splitting or generation size.",
@@ -33,7 +41,21 @@ TOOLS = {
     },
     "update_shot": {
         "description": "Set shot prompt, refs, target, crop/inpaint/paste, strength, continuity or enabled.",
-        "arguments": {"shot": "integer", "changes": "object"},
+        "arguments": {
+            "shot": "integer",
+            "changes": {
+                "prompt": "optional generation prompt string",
+                "target": "optional SOURCE person description, never a reference filename",
+                "refs": "optional list of reference filenames (not ref/ref2)",
+                "crop": "optional boolean",
+                "inpaint": "optional boolean",
+                "paste": "optional boolean",
+                "strength": "optional number .05..1",
+                "chain": "optional off|head|history",
+                "chain_history": "optional integer 1..1000",
+                "enabled": "optional boolean",
+            },
+        },
     },
     "split_shot": {
         "description": "Split a shot at an absolute timeline frame, preserving its settings.",
@@ -46,7 +68,18 @@ TOOLS = {
             "text": "string",
             "key": "relative frame integer",
             "points": "list of {x,y,label}",
-            "settings": "optional mask settings object",
+            "settings": {
+                "max_objects": "optional integer; use 1 for a single-person replacement",
+                "threshold": "optional 0..1",
+                "invert": "optional boolean; false selects target",
+                "fill_holes": "optional boolean",
+                "temporal_expand": "optional integer",
+                "blockify": "optional integer",
+                "padding": "optional number",
+                "expand": "optional pixel expansion",
+                "feather": "optional pixels",
+                "paste": "optional box|mask",
+            },
             "keyframes": "optional list of {key: relative frame, points: normalized point list, text: optional string}",
         },
     },
@@ -67,8 +100,15 @@ TOOLS = {
         "arguments": {},
     },
     "inspect_result": {
-        "description": "See generated frames next to source and references for a completed shot.",
-        "arguments": {"shot": "integer"},
+        "description": "Review a page of generated/source frame pairs plus references. Repeat until coverage.complete. Select exact frames/ranges or crop a suspicious region; cropped reviews do not approve full-frame coverage.",
+        "arguments": {
+            "shot": "integer",
+            "frame_indices": "optional 1..6 shot-relative integers",
+            "start_frame": "optional inclusive relative frame",
+            "end_frame": "optional inclusive relative frame",
+            "count": "optional 1..6 for a range",
+            "region": "optional normalized [left,top,right,bottom] for closer inspection",
+        },
     },
     "inspect_preview": {
         "description": "See the latest intermediate x0 preview if a preview sampler is connected.",
@@ -144,12 +184,15 @@ TABS = {
 }
 SYSTEM = """You operate the BFS Shot Planner using tools, not prose promises. Fulfil the user's video task.
 Return exactly one JSON object: {"tool":"tool_name","arguments":{},"summary":"short user-facing action explanation","observed":"brief evidence","reason":"brief decision justification","expected":"what this action should verify or change","uncertainty":"remaining doubt, or empty"}.
-These are concise public explanations, never a transcript of internal thinking. Distinguish observed facts from hypotheses.
+These are concise public explanations, never a transcript of internal thinking. Describe actions as requests/intent until a successful tool observation confirms the change. A failed action did not update the plan. Distinguish observed facts from hypotheses.
+CURRENT PLAN segs are saved overrides, not necessarily the current timeline. Use inspect_plan.shots as the authoritative resolved shot boundaries; do not infer overlapping active shots from old metadata.
 Choose one action per turn. Inspect the plan, publish a step-by-step checklist and keep it updated. Observe source and references before editing. Inspect SAM overlays before rendering.
 Loading VLM context is not a video render. When current_plan_rendered is false, call render before inspect_result or combine.
 Inspect results for identity, motion, background preservation, mask edges, temporal continuity and requested changes.
+inspect_result is PAGED: repeatedly call it without frame_indices to see the next unreviewed page until coverage.complete. Generated and original frames are paired at the same shot-relative times. Verify the target AND every protected person on each page. For a questionable face, request exact neighboring frame_indices or an inclusive frame range; use region to magnify that person's head. Cropped views are extra evidence, not a substitute for full-frame coverage. At review_fps=0 every frame is required. Sampling can miss brief defects: do not claim all frames were checked when review_fps>0. Never finish after only the first page.
 USER FEEDBACK is a correction to the task and remains relevant across subsequent decisions. Inspect the rejected result and affected source shots, update the checklist, then correct only affected shots. Do not simply repeat an unchanged render or claim success from the previous combined output.
-For a single-target swap in a multi-person scene, identify the requested person and preserve every other person. If the swap affected multiple people, use segment with specific text/positive and negative points as needed, inspect the mask overlay, and consider crop/inpaint/paste for localized editing. Verify target identity AND preservation of other people across the shot before finishing. Do not assume a color mark alone guarantees isolation.
+update_shot accepts ONLY the documented changes keys; do not copy an entire resolved shot. mask belongs to segment, not update_shot. Inspect the source at the SAME shot-relative key frame before placing SAM points; do not invent coordinates. Segment coordinates always refer to the full source frame, not a cropped review. Source images show the ORIGINAL; inspect_result is required to locate actual generated swap defects. Reference pictures go in refs:[filename], never ref/ref2. target is the SOURCE person description, not a picture filename. After an argument error, follow the recovery instructions and change the tool/arguments; do not repeat a rejected shape.
+For a single-target swap in a multi-person scene, identify the requested person and preserve every other person. If the swap affected multiple people, use segment with text describing the REPLACEMENT TARGET, positive points on that target and negative points on protected people as needed (never negative-only points on the protected person), set max_objects=1 for a single-target swap, inspect the mask overlay, and consider crop/inpaint/paste for localized editing. Verify target identity AND preservation of other people across the shot before finishing. Do not assume a color mark alone guarantees isolation.
 For parameter comparisons, inspect_generation first. Keep seed, prompt, references, shot ranges and non-tested controls fixed; change one variable at a time unless the user asks for a combination. Render and inspect each candidate, record concrete visual evidence in action explanations/checklist. Changing generation settings archives current successful takes automatically. Use list_takes and inspect_media to compare older candidates; restore_take with take_id selects an earlier candidate. Reserve action/render budget to reconcile and review the selected take. Do not claim a universal best sampler from one shot. Never invent enum values or rewire connected controls.
 Use all relevant reference pictures. Reference pictures define identity; source video defines movement unless asked otherwise.
 Intermediate previews are approximate: early steps support composition checks, not reliable fine identity judgement.
@@ -220,6 +263,7 @@ class Session:
         self.plan = copy.deepcopy(plan)
         self.settings = {
             "thinking": bool(settings.get("thinking", True)),
+            "review_fps": review_rate(settings.get("review_fps", 2)),
             "max_actions": max(1, min(200, int(settings.get("max_actions", 40)))),
             "max_renders": max(1, min(20, int(settings.get("max_renders", 4)))),
             "max_tokens": max(512, min(16384, int(settings.get("max_tokens", 4096)))),
@@ -238,6 +282,7 @@ class Session:
         }
         self.images = []
         self.reviewed = set()
+        self.review_coverage = {}
         self.combined = None
         self.cancel = threading.Event()
         self.lock = threading.Lock()
@@ -287,6 +332,7 @@ class Session:
         }
         self.feedback.append(item)
         self.reviewed.clear()
+        self.review_coverage.clear()
         self.combined = None
         for attempt in reversed(self.preview_history):
             if attempt.get("revision") == self.rendered_revision:
@@ -317,6 +363,7 @@ class Session:
             ),
             "observation": self.observation,
             "reviewed": sorted(self.reviewed),
+            "review_coverage": self.review_coverage,
             "checklist": self.checklist,
             "combined": self.combined,
             "preview": self.preview,

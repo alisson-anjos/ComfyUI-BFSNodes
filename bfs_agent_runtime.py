@@ -19,6 +19,15 @@ from concurrent.futures import ThreadPoolExecutor
 from .bfs_planner_agent import Session, SYSTEM, TOOLS, bounded_path
 from .bfs_agent_inference import run_inference, ensure_cuda_healthy
 from .bfs_agent_parameters import generation_nodes, validated_changes
+from .bfs_agent_media import prepare_media, LABEL as MEDIA_LABEL
+from .bfs_agent_review import (
+    review_rate,
+    review_grid,
+    select_frames,
+    review_region,
+    crop_review,
+    text_context,
+)
 
 SESSIONS = {}
 GPU_LOCK = threading.RLock()
@@ -202,7 +211,10 @@ class Runtime:
             s.revision = d.get("revision", 0)
             s.rendered_revision = d.get("rendered_revision", -1)
             s.reviewed = set(d.get("reviewed", []))
-            s.combined = d.get("combined")
+            s.review_coverage = d.get("review_coverage", {})
+            if "review_coverage" not in d:
+                s.reviewed.clear()
+            s.combined = d.get("combined") if "review_coverage" in d else None
             s.preview = d.get("preview")
             s.preview_history = d.get("preview_history", [])
             s.vlm_info = d.get("vlm_info")
@@ -364,6 +376,7 @@ class Runtime:
 
     def invalidate(self, s):
         s.reviewed.clear()
+        s.review_coverage.clear()
         s.combined = None
         s.revision += 1
 
@@ -378,18 +391,33 @@ class Runtime:
         import numpy as np
 
         path, a, segs, i, seg = self.shot(s, args)
-        picks = np.linspace(seg["start"], seg["end"] - 1, 4).astype(int)
+        region = review_region(args.get("region"))
+        if any(k in args for k in ("frame_indices", "start_frame", "end_frame")):
+            picks = (
+                np.array(
+                    select_frames(seg["end"] - seg["start"], [], set(), args), dtype=int
+                )
+                + seg["start"]
+            )
+        else:
+            picks = np.linspace(seg["start"], seg["end"] - 1, 4).astype(int)
         src = self.p._timeline(a["n_src"], a["fps_src"], float(a["fps"]))
         frames = self.p._read_frames(
             path,
             src[np.clip(picks, 0, a["n"] - 1)],
-            (
+            None
+            if region
+            else (
                 max(2, round(a["width"] * min(1, 512 / max(a["width"], a["height"])))),
                 max(2, round(a["height"] * min(1, 512 / max(a["width"], a["height"])))),
             ),
         )
-        images = [image_tensor(f) for f in frames]
-        labels = [f"source frame {n}, {n / a['fps']:.3f}s" for n in picks]
+        images = [crop_review(image_tensor(f), region) for f in frames]
+        labels = [
+            f"source frame {n}, shot-relative frame {n - seg['start']}, {n / a['fps']:.3f}s"
+            + (" cropped region" if region else "")
+            for n in picks
+        ]
         if include_refs:
             names = self.p.shot_ref_names(seg["refs"], s.plan["global_refs"])
             for n in names[: self.p.MAX_REFS]:
@@ -444,16 +472,24 @@ class Runtime:
         prompt += "\nUSER FEEDBACK (chronological corrections):\n" + json.dumps(
             s.feedback, ensure_ascii=False
         )
-        prompt += "\nHISTORY:\n" + json.dumps(history, ensure_ascii=False)[-20000:]
+        prompt += (
+            "\nHISTORY:\n"
+            + json.dumps(text_context(history), ensure_ascii=False)[-20000:]
+        )
         prompt += (
             "\nLATEST OBSERVATION:\n"
-            + json.dumps(s.observation, ensure_ascii=False)[:24000]
+            + json.dumps(text_context(s.observation), ensure_ascii=False)[:24000]
         )
         prompt += "\nGENERATION STATE: " + json.dumps(
             {
                 "current_revision": s.revision,
                 "rendered_revision": s.rendered_revision,
                 "current_plan_rendered": s.rendered_revision == s.revision,
+                "review_fps": s.settings["review_fps"],
+                "review_coverage": {
+                    key: {k: v for k, v in item.items() if k != "seen"}
+                    for key, item in s.review_coverage.items()
+                },
             }
         )
         prompt += f"\nBUDGET: renders {s.renders}/{s.settings['max_renders']}. Images are in the order specified by the observation. Return one tool action JSON."
@@ -620,8 +656,18 @@ class Runtime:
                 "chain_history",
                 "enabled",
             }
-            if not changes or set(changes) - allowed:
-                raise ValueError("Unsupported shot changes")
+            if not isinstance(changes, dict) or not changes or set(changes) - allowed:
+                unknown = (
+                    sorted(set(changes) - allowed) if isinstance(changes, dict) else []
+                )
+                raise ValueError(
+                    "Unsupported shot changes: "
+                    + ", ".join(unknown)
+                    + ". Allowed: "
+                    + ", ".join(sorted(allowed))
+                    + ". Submit only changed fields. For mask use segment with {shot, text, key, points, keyframes, settings}; use label=1 on the target, label=0 on protected people. "
+                    'For pictures use refs:["file.png"], not ref/ref2. target must describe the source person, not a reference file. No changes were applied.'
+                )
             for k in ("crop", "inpaint", "paste", "enabled"):
                 if k in changes and not isinstance(changes[k], bool):
                     raise ValueError(k + " must be boolean")
@@ -630,6 +676,12 @@ class Runtime:
                     not isinstance(changes[k], str) or len(changes[k]) > 16000
                 ):
                     raise ValueError("Invalid " + k)
+            if "target" in changes and changes["target"].lower().endswith(
+                (".png", ".jpg", ".jpeg", ".webp")
+            ):
+                raise ValueError(
+                    'target describes the SOURCE person (e.g. "soldier on the left"); put reference files in refs:["file.png"]. No changes were applied.'
+                )
             if "strength" in changes and not 0.05 <= float(changes["strength"]) <= 1:
                 raise ValueError("Strength must be .05..1")
             if "chain" in changes and changes["chain"] not in (
@@ -692,6 +744,10 @@ class Runtime:
                         or q.get("label", 1) not in (0, 1)
                     ):
                         raise ValueError("Invalid normalized point")
+                if points and not any(q.get("label", 1) == 1 for q in points):
+                    raise ValueError(
+                        "Select the replacement TARGET with at least one positive point (label=1). Add negative points (label=0) on protected people in the SAME selection. text must describe the target, not the protected soldier. No mask changes were applied."
+                    )
                 keyframes = args.get("keyframes", [])
                 if not isinstance(keyframes, list) or len(keyframes) > 8:
                     raise ValueError("Use at most eight SAM correction keyframes")
@@ -810,33 +866,95 @@ class Runtime:
             status = p.cache_status(s.plan)
             if ri >= len(status["ok"]) or not status["ok"][ri]:
                 raise ValueError("This shot has no current rendered take")
+            length = int(seg["end"] - seg["start"])
+            fps = float(a["fps"])
+            rate = s.settings["review_fps"]
+            required = review_grid(length, fps, rate)
+            seen = set(s.review_coverage.get(str(i), {}).get("seen", []))
+            picks = select_frames(length, required, seen, args)
+            region = review_region(args.get("region"))
             cached_video = Path(status["folder"]) / f"shot_{ri:04d}.mkv"
             if cached_video.exists():
                 probe = p._probe(str(cached_video))
-                picks = np.linspace(
-                    0, probe["n_src"] - 1, min(6, probe["n_src"])
-                ).astype(int)
+                generated_indices = np.minimum(picks, probe["n_src"] - 1)
                 scale = min(1, 512 / max(probe["width"], probe["height"]))
-                frames = p._read_frames(
-                    str(cached_video),
-                    picks,
-                    (
+                size = (
+                    None
+                    if region
+                    else (
                         max(2, round(probe["width"] * scale)),
                         max(2, round(probe["height"] * scale)),
-                    ),
+                    )
                 )
-                imgs = [image_tensor(f) for f in frames]
+                generated = [
+                    image_tensor(f)
+                    for f in p._read_frames(str(cached_video), generated_indices, size)
+                ]
             else:
-                frames, meta = p.load_shot(status["folder"], ri)
-                picks = np.linspace(0, len(frames) - 1, min(6, len(frames))).astype(int)
-                imgs = [image_tensor(frames[j]) for j in picks]
-            labels = [f"generated frame {j}" for j in picks]
-            lab, src = self.source_images(s, args)
-            imgs += src
-            labels += lab
-            s.reviewed.add(i)
+                frames, _ = p.load_shot(status["folder"], ri)
+                generated = [
+                    image_tensor(frames[min(j, len(frames) - 1)]) for j in picks
+                ]
+            # Match every generated frame to its original timeline frame, never a separate sparse sample.
+            path = p._input_path(s.plan["video"])
+            timeline = p._timeline(a["n_src"], a["fps_src"], fps)
+            source_indices = timeline[
+                np.clip(np.array(picks) + seg["start"], 0, len(timeline) - 1)
+            ]
+            scale = min(1, 512 / max(a["width"], a["height"]))
+            size = (
+                None
+                if region
+                else (
+                    max(2, round(a["width"] * scale)),
+                    max(2, round(a["height"] * scale)),
+                )
+            )
+            originals = [
+                image_tensor(f) for f in p._read_frames(path, source_indices, size)
+            ]
+            imgs, labels = [], []
+            for j, generated_frame, original in zip(picks, generated, originals):
+                imgs.extend(
+                    [
+                        crop_review(generated_frame, region),
+                        crop_review(original, region),
+                    ]
+                )
+                labels.extend(
+                    [
+                        f"generated shot {i}, frame {j}, {j / fps:.3f}s"
+                        + (" cropped region" if region else ""),
+                        f"source shot {i}, frame {j}, timeline frame {seg['start'] + j}, {j / fps:.3f}s"
+                        + (" cropped region" if region else ""),
+                    ]
+                )
+            names = p.shot_ref_names(seg["refs"], s.plan["global_refs"])
+            for name in names[: min(p.MAX_REFS, 12)]:
+                imgs.append(p._load_image(name))
+                labels.append("reference " + name)
+            if region is None:
+                seen.update(picks)
+            remaining = [j for j in required if j not in seen]
+            coverage = {
+                "seen": sorted(seen),
+                "required_count": len(required),
+                "covered_count": len(required) - len(remaining),
+                "complete": not remaining,
+                "review_fps": rate,
+                "next_frames": remaining[:6],
+                "total_shot_frames": length,
+            }
+            s.review_coverage[str(i)] = coverage
+            if coverage["complete"]:
+                s.reviewed.add(i)
+            else:
+                s.reviewed.discard(i)
             return {
                 "shot": i,
+                "frame_indices": picks,
+                "region": region,
+                "coverage": {k: v for k, v in coverage.items() if k != "seen"},
                 "image_order": labels,
                 "frames": [
                     {"src": image_url(x), "label": label}
@@ -1365,7 +1483,20 @@ def register(planner):
                 raise ValueError(
                     "Disconnect or clear the optional Planner prompt input; the agent writes prompts in the plan."
                 )
+            if any(MEDIA_LABEL.match(line) for line in s.task.splitlines()):
+                imported_plan, imported = prepare_media(
+                    s.task, s.plan, planner.folder_paths.get_input_directory()
+                )
+                s.plan = planner._load_plan(json.dumps(imported_plan))
+            else:
+                imported = []
             rt.attach(s)
+            for media in imported:
+                s.event(
+                    "media",
+                    summary="Loaded " + media["role"] + " from task path",
+                    **media,
+                )
             SESSIONS[s.id] = s
             s.event("status", summary="Agent session started")
             rt.save(s)
@@ -1442,6 +1573,13 @@ def register(planner):
                         s.settings[key] = value
                 if s.lock.locked():
                     raise ValueError("Wait for current action to finish")
+                if "review_fps" in settings:
+                    rate = review_rate(settings["review_fps"])
+                    if rate != s.settings["review_fps"]:
+                        s.reviewed.clear()
+                        s.review_coverage.clear()
+                        s.combined = None
+                    s.settings["review_fps"] = rate
                 if any(
                     x.id != s.id and x.status in ("running", "waiting_render")
                     for x in SESSIONS.values()

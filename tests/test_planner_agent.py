@@ -611,7 +611,10 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_vae_render_stops_before_another_vlm_decision(self):
         await self.run_server_cycle(invalid_vae=True)
 
-    async def run_server_cycle(self, invalid_vae=False):
+    async def test_task_paths_are_loaded_before_context_queue(self):
+        await self.run_server_cycle(task_media=True)
+
+    async def run_server_cycle(self, invalid_vae=False, task_media=False):
         import asyncio
         from collections import deque
 
@@ -683,7 +686,8 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
             }
             p = types.SimpleNamespace(
                 folder_paths=types.SimpleNamespace(
-                    get_output_directory=lambda: directory
+                    get_output_directory=lambda: directory,
+                    get_input_directory=lambda: str(Path(directory) / "input"),
                 ),
                 _load_plan=json.loads,
                 _notify=lambda *_: None,
@@ -735,6 +739,16 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                     "workflow": graph,
                     "planner_id": "1",
                 }
+                if task_media:
+                    from PIL import Image
+
+                    guide = Path(directory) / "guide.mp4"
+                    guide.write_bytes(b"test guide")
+                    reference = Path(directory) / "goblin.png"
+                    Image.new("RGB", (8, 8)).save(reference)
+                    body["task"] = (
+                        f"Guide: {guide}\nRef 1: {reference}\nSwap only the left soldier"
+                    )
                 request = types.SimpleNamespace(
                     json=lambda: asyncio.sleep(0, result=body)
                 )
@@ -744,6 +758,12 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status, 200, response.text)
                 sid = json.loads(response.text)["id"]
                 s = runtime.SESSIONS[sid]
+                if task_media:
+                    self.assertTrue(s.plan["video"].startswith("bfs_agent_imports/"))
+                    self.assertEqual(len(s.plan["global_refs"]), 1)
+                    self.assertEqual(
+                        len([e for e in s.events if e["kind"] == "media"]), 2
+                    )
                 for _ in range(250):
                     if s.status in ("complete", "error", "budget_exhausted"):
                         break
@@ -833,7 +853,12 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                 controls = {
                     "id": sid,
                     "action": "resume",
-                    "settings": {"thinking": False, "web": False, "max_tokens": 8192},
+                    "settings": {
+                        "thinking": False,
+                        "web": False,
+                        "max_tokens": 8192,
+                        "review_fps": 0,
+                    },
                 }
                 control_response = await registered[
                     ("POST", "/bfs/shotloop/agent/control")
@@ -842,6 +867,7 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(s.settings["thinking"])
                 self.assertFalse(s.settings["web"])
                 self.assertEqual(s.settings["max_tokens"], 8192)
+                self.assertEqual(s.settings["review_fps"], 0)
                 s.cancel.set()
                 s.status = "stopped"
                 runtime.SESSIONS.pop(sid)
@@ -1098,6 +1124,212 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         self.assertFalse(
             runtime.invalid_vae_failure({"status_str": "error", "messages": []})
         )
+
+
+class DenseReviewTests(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source_reads = []
+        analysis = {
+            "fps": 24.0,
+            "fps_src": 30.0,
+            "n_src": 180,
+            "n": 144,
+            "width": 16,
+            "height": 16,
+        }
+        self.seg = {"start": 48, "end": 72, "refs": [], "run": True}
+
+        def read(path, picks, size):
+            self.source_reads.append([int(x) for x in picks])
+            return [np.full((16, 16, 3), int(x), dtype=np.uint8) for x in picks]
+
+        self.p = types.SimpleNamespace(
+            MAX_REFS=12,
+            _input_path=lambda name: "source.mp4",
+            _read_frames=read,
+            _timeline=lambda n, fs, fps: np.round(np.arange(144) * fs / fps).astype(
+                int
+            ),
+            load_shot=lambda folder, ri: (
+                torch.arange(24).view(24, 1, 1, 1).expand(24, 16, 16, 3).float() / 255,
+                {},
+            ),
+            shot_ref_names=lambda own, glob: [],
+            cache_status=lambda plan: {"ok": [True], "folder": self.tmp.name},
+        )
+        self.rt = runtime.Runtime(self.p)
+        self.rt.context = lambda session: ("source.mp4", analysis, [self.seg])
+        self.s = core.Session(
+            "Only swap left soldier",
+            {"video": "source.mp4", "global_refs": []},
+            {"review_fps": 0},
+        )
+        self.s.rendered_revision = self.s.revision
+
+    def test_full_review_is_paged_and_uses_matching_source_times(self):
+        for page in range(4):
+            out, images = self.rt.execute(self.s, "inspect_result", {"shot": 0})
+            self.assertEqual(out["frame_indices"], list(range(page * 6, page * 6 + 6)))
+            expected = [round((48 + j) * 30 / 24) for j in out["frame_indices"]]
+            self.assertEqual(self.source_reads[-1], expected)
+            self.assertEqual(len(images), 12)
+            self.assertAlmostEqual(float(images[0][0, 0, 0, 0]), page * 6 / 255)
+            self.assertAlmostEqual(float(images[1][0, 0, 0, 0]), expected[0] / 255)
+            self.assertEqual(out["coverage"]["complete"], page == 3)
+            self.assertEqual(0 in self.s.reviewed, page == 3)
+        self.assertEqual(self.s.review_coverage["0"]["covered_count"], 24)
+
+    def test_exact_frames_and_zoom_do_not_falsely_approve_full_frame_coverage(self):
+        out, images = self.rt.execute(
+            self.s,
+            "inspect_result",
+            {"shot": 0, "frame_indices": [13, 14], "region": [0.5, 0, 1, 0.5]},
+        )
+        self.assertEqual(out["frame_indices"], [13, 14])
+        self.assertEqual(tuple(images[0].shape), (1, 8, 8, 3))
+        self.assertEqual(out["coverage"]["covered_count"], 0)
+        self.assertFalse(self.s.reviewed)
+        out, _ = self.rt.execute(
+            self.s,
+            "inspect_result",
+            {"shot": 0, "start_frame": 13, "end_frame": 15, "count": 3},
+        )
+        self.assertEqual(out["frame_indices"], [13, 14, 15])
+        self.assertEqual(out["coverage"]["covered_count"], 3)
+        self.rt.invalidate(self.s)
+        self.assertFalse(self.s.review_coverage)
+
+    def test_cached_video_review_matches_held_last_frame_and_source(self):
+        (Path(self.tmp.name) / "shot_0000.mkv").touch()
+        self.p._probe = lambda path: {"n_src": 20, "width": 16, "height": 16}
+        out, images = self.rt.execute(
+            self.s, "inspect_result", {"shot": 0, "frame_indices": [19, 20, 23]}
+        )
+        self.assertEqual(self.source_reads[0], [19, 19, 19])
+        self.assertEqual(
+            self.source_reads[1], [round((48 + j) * 30 / 24) for j in [19, 20, 23]]
+        )
+        self.assertEqual(out["frame_indices"], [19, 20, 23])
+        self.assertEqual(len(images), 6)
+
+    def test_source_can_be_inspected_at_the_exact_sam_key_frame(self):
+        labels, images = self.rt.source_images(
+            self.s, {"shot": 0, "frame_indices": [13], "region": [0.5, 0, 1, 0.5]}
+        )
+        self.assertEqual(self.source_reads[-1], [round(61 * 30 / 24)])
+        self.assertIn("shot-relative frame 13", labels[0])
+        self.assertEqual(tuple(images[0].shape), (1, 8, 8, 3))
+        self.rt.execute(self.s, "inspect_result", {"shot": 0})
+        with self.assertRaisesRegex(ValueError, "Inspect every active"):
+            self.rt.execute(self.s, "combine", {})
+
+    def test_grid_limits_and_prompt_do_not_contain_base64(self):
+        review = sys.modules[PACKAGE + ".bfs_agent_review"]
+        grid = review.review_grid(360, 24, 2)
+        self.assertEqual((grid[0], grid[-1]), (0, 359))
+        self.assertGreater(len(grid), 6)
+        self.assertEqual(review.review_grid(3, 24, 0), [0, 1, 2])
+        for value in (float("nan"), float("inf"), -1, True, 25):
+            with self.assertRaises(ValueError):
+                review.review_rate(value)
+        for args in (
+            {"frame_indices": [24]},
+            {"frame_indices": [True]},
+            {"start_frame": 4, "end_frame": 3},
+            {"region": [1, 0, 0, 1]},
+        ):
+            with self.assertRaises(ValueError):
+                self.rt.execute(self.s, "inspect_result", {"shot": 0, **args})
+        self.assertEqual(
+            review.text_context(
+                {
+                    "frames": [
+                        {"src": "data:image/jpeg;base64,huge", "label": "frame 179"}
+                    ]
+                }
+            ),
+            {"frames": [{"src": "[image supplied separately]", "label": "frame 179"}]},
+        )
+
+    def test_unsupported_shot_shape_returns_recovery_without_partial_changes(self):
+        before = json.loads(json.dumps(self.s.plan))
+        with self.assertRaisesRegex(ValueError, "For mask use segment"):
+            self.rt.execute(
+                self.s,
+                "update_shot",
+                {
+                    "shot": 0,
+                    "changes": {"prompt": "new", "mask": {}, "ref": "goblin.png"},
+                },
+            )
+        self.assertEqual(self.s.plan, before)
+        with self.assertRaisesRegex(ValueError, "SOURCE person"):
+            self.rt.execute(
+                self.s, "update_shot", {"shot": 0, "changes": {"target": "goblin.png"}}
+            )
+        with self.assertRaisesRegex(ValueError, "positive point"):
+            self.rt.execute(
+                self.s,
+                "segment",
+                {
+                    "shot": 0,
+                    "text": "right soldier",
+                    "points": [{"x": 0.8, "y": 0.5, "label": 0}],
+                },
+            )
+        self.assertEqual(self.s.plan, before)
+
+
+class TaskMediaTests(unittest.TestCase):
+    def test_explicit_external_paths_load_into_plan_and_preserve_original_files(self):
+        from PIL import Image
+
+        media = sys.modules[PACKAGE + ".bfs_agent_media"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            inputs = root / "input"
+            inputs.mkdir()
+            guide = root / "guide with spaces.mp4"
+            guide.write_bytes(b"video")
+            ref = root / "goblin.png"
+            Image.new("RGB", (8, 8)).save(ref)
+            plan = {
+                "video": "old.mp4",
+                "segs": [{"refs": ["old.png"]}],
+                "global_refs": [],
+                "bounds": [50],
+                "max_s": 15,
+            }
+            task = f'Guide: "{guide}"\nRef 1: "{ref}"\nReplace only the left soldier.'
+            out, imported = media.prepare_media(task, plan, inputs)
+            self.assertEqual(len(imported), 2)
+            self.assertEqual((inputs / out["video"]).read_bytes(), b"video")
+            self.assertTrue((inputs / out["global_refs"][0]).is_file())
+            self.assertEqual(out["segs"], [])
+            self.assertEqual(out["mode"], "fixed")
+            self.assertEqual(plan["video"], "old.mp4")
+            self.assertTrue(guide.is_file())
+            again, _ = media.prepare_media(task, out, inputs)
+            self.assertEqual(again["video"], out["video"])
+            self.assertEqual(len(list((inputs / "bfs_agent_imports").iterdir())), 2)
+
+    def test_unlabelled_paths_are_not_imported_and_missing_paths_are_clear(self):
+        media = sys.modules[PACKAGE + ".bfs_agent_media"]
+        with tempfile.TemporaryDirectory() as temp:
+            plan = {"video": "keep.mp4"}
+            out, imported = media.prepare_media(
+                "Read /some/path.mp4 as prose", plan, temp
+            )
+            self.assertIs(out, plan)
+            self.assertFalse(imported)
+            with self.assertRaisesRegex(ValueError, "ComfyUI server"):
+                media.prepare_media("Guide: missing.mp4", plan, temp)
+            with self.assertRaisesRegex(ValueError, "local video/image"):
+                media.prepare_media("Guide: /etc/passwd", plan, temp)
 
 
 class GenerationParameterTests(unittest.TestCase):

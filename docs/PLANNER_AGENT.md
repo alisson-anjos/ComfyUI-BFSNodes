@@ -272,3 +272,58 @@ normal action/render budgets. Keep seed, prompt, references, shot ranges and
 other controls fixed, change one variable at a time, inspect the candidates and
 reserve budget for restoring the selected take. The VLM judges visual quality;
 this is not a standardized benchmark or a guarantee of the best parameters.
+
+### Paged, targeted result review
+
+**Review fps** defaults to 2 sampled frames per second, including shot endpoints.
+Set it to **0** to require every output frame. Each `inspect_result` call returns
+up to six generated/source pairs at matching shot-relative times plus references.
+Subsequent calls automatically advance to unreviewed required frames. The panel
+reports coverage, and combining remains blocked until every active shot's required
+frames have been presented. Dense review consumes more model calls/actions;
+increase the action limit when needed. Sampling can miss brief defects, and even
+full-frame coverage does not guarantee the VLM notices every visual error.
+
+Both `inspect_source` and `inspect_result` accept exact `frame_indices` or an
+inclusive `start_frame`/`end_frame` range with `count` (1..6). Indices are relative
+to the selected shot. `region: [left,top,right,bottom]` magnifies normalized full-
+frame coordinates; these views decode at source resolution before cropping. They
+provide additional evidence without counting as full-frame review. Inspect the
+source at the same key frame before selecting SAM points. Mask coordinates always
+refer to the full source frame. The UI prioritizes final result inspection over
+an older intermediate preview. Image base64 is supplied through the image input,
+not repeated as text in the model context.
+
+`update_shot` now advertises its exact partial-update fields and returns actionable
+recovery instructions for unsupported fields. Use `segment` for masks, `refs` for
+reference filenames and `target` for a source-person description. For point-based
+SAM selection, include a positive point on the replacement target; negative points
+exclude protected people in that same selection. Negative-only point selections
+are rejected before changing the plan. These checks do not establish that a mask
+is visually correct: inspect its overlay before rendering.
+
+### Loading paths written in the task
+
+An existing connected Planner/generation workflow can load server-side media from
+labelled lines at Start:
+
+```text
+Guide: "/videos/battle scene.mp4"
+Ref 1: "/pictures/goblin.png"
+Replace only the soldier on the left. Preserve the other soldier.
+```
+
+Paths must exist on the **ComfyUI server**; a browser-local path does not upload a
+file. Relative paths resolve under ComfyUI's input folder. References support
+`Ref 1` through `Ref 12`. Quoted paths may contain spaces. Files outside input are
+registered under `input/bfs_agent_imports` with stable generated names, normally
+using symlinks (copy fallback where symlinks are unavailable); originals are kept.
+Reference images are validated before registration. These imports and the selected
+plan are recorded in session activity and reflected in the Planner UI.
+
+A different guide clears the previous source's shot/cast/timing overrides and
+uses bounded fixed shots (at most 15 seconds initially), retaining generation/model
+configuration. Explicit references replace old per-shot reference overrides.
+The agent can then inspect and refine the plan. Loading paths does not build model,
+conditioning, sampler, or output nodes: the workflow must already be connected.
+Use a new Start to select a different guide or refresh graph connections.
