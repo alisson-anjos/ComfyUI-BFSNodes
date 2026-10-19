@@ -536,6 +536,41 @@ class Session:
                     action_id=action_id,
                     tab=TABS.get(action["tool"], "agent"),
                 )
+                if action["tool"] in {"inspect_source", "segment", "preview_mask"}:
+
+                    def signature(tool, arguments):
+                        normalized = dict(arguments)
+                        if tool == "inspect_source":
+                            normalized.pop("count", None)
+                            if normalized.get("region") == [0, 0, 1, 1]:
+                                normalized.pop("region")
+                        return tool, json.dumps(normalized, sort_keys=True)
+
+                    current = signature(action["tool"], action["arguments"])
+                    matches = 0
+                    for event in reversed(self.events[:-1]):
+                        if event.get("kind") in {"feedback", "message"}:
+                            break
+                        if event.get("kind") == "action":
+                            if event.get("tool") not in {
+                                "inspect_source",
+                                "segment",
+                                "preview_mask",
+                                "inspect_plan",
+                                "reply",
+                            }:
+                                break
+                            if (
+                                signature(event.get("tool"), event.get("arguments", {}))
+                                == current
+                            ):
+                                matches += 1
+                    if matches >= 2:
+                        raise ValueError(
+                            "Repeated identical tool request blocked. The same evidence is already available. "
+                            "Choose different frames/region or change segmentation points/settings after reviewing the overlay. "
+                            "Do not repeat the same call. Inspect another shot or proceed to render only when the mask is verified."
+                        )
                 if action["tool"] == "render":
                     if self.renders >= self.settings["max_renders"]:
                         raise ValueError("Render budget exhausted")

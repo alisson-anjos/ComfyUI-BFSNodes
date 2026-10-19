@@ -43,6 +43,28 @@ class SessionTests(unittest.TestCase):
     def session(self, **settings):
         return core.Session("Transfer motion", {"video": "source.mp4"}, settings)
 
+    def test_identical_inspection_loop_is_blocked_but_new_frames_are_allowed(self):
+        session = self.session()
+        session.status = "running"
+        calls = []
+
+        def execute(s, tool, args):
+            calls.append(args)
+            return {}, []
+
+        for args in (
+            {"shot": 0, "frame_indices": [1, 2, 3]},
+            {"shot": 0, "frame_indices": [1, 2, 3], "region": [0, 0, 1, 1]},
+            {"shot": 0, "frame_indices": [1, 2, 3], "count": 3},
+        ):
+            session.tick(lambda s: action("inspect_source", **args), execute)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Repeated identical", session.observation["error"])
+        session.tick(
+            lambda s: action("inspect_source", shot=0, frame_indices=[179]), execute
+        )
+        self.assertEqual(len(calls), 3)
+
     def test_reasoning_and_strict_action(self):
         self.assertEqual(
             core.parse_action(
@@ -372,6 +394,27 @@ class ToolsTests(unittest.TestCase):
                 "mask": s.plan.get("segs", [{}])[0].get("mask", {})
                 if s.plan["segs"]
                 else {},
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "SAME segmentation key frames"):
+            self.rt.execute(
+                self.s,
+                "segment",
+                {
+                    "shot": 0,
+                    "text": "woman in red",
+                    "key": 4,
+                    "points": [{"x": 0.5, "y": 0.4, "label": 1}],
+                },
+            )
+        self.assertEqual(calls, [])
+        self.s.event(
+            "observation",
+            tool="inspect_source",
+            result={
+                "shot": 0,
+                "frame_indices": [4],
+                "region": None,
             },
         )
         out, _ = self.rt.execute(

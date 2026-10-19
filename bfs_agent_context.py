@@ -105,6 +105,11 @@ def prepare_context(s, system, tools, image_count):
         system
         + "\nTOOLS:\n"
         + json.dumps(tools, ensure_ascii=False)
+        + "\nCURRENT VISUAL INPUT (ordered, actual attached images):\n"
+        + json.dumps(
+            text_context(s.observation.get("image_order", [])), ensure_ascii=False
+        )
+        + "\nImages are letterboxed to square: coordinates for segment refer to the original image content, excluding padding. Only describe what is visible; uncertainty is allowed. Never claim an action succeeded before its observation.\n"
         + "\nTASK:\n"
         + s.task
         + "\nLATEST USER INPUT:\n"

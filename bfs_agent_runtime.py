@@ -771,7 +771,18 @@ class Runtime:
             }, []
         if tool == "inspect_source":
             labels, imgs = self.source_images(s, args)
-            return {"image_order": labels}, imgs
+            return {
+                "image_order": labels,
+                "shot": args["shot"],
+                "region": None
+                if args.get("region") == [0, 0, 1, 1]
+                else review_region(args.get("region")),
+                "frame_indices": [
+                    int(label.split("shot-relative frame ")[1].split(",")[0])
+                    for label in labels
+                    if "shot-relative frame " in label
+                ],
+            }, imgs
         if tool == "update_plan":
             changes = args.get("changes", {})
             allowed = {
@@ -945,6 +956,30 @@ class Runtime:
                             or point.get("label", 1) not in (0, 1)
                         ):
                             raise ValueError("Invalid normalized keyframe point")
+                required_frames = ({key} if points else set()) | {
+                    kf["key"] for kf in keyframes if kf.get("points")
+                }
+                inspected = set()
+                for event in reversed(s.events):
+                    if event.get("kind") == "media" or (
+                        event.get("kind") == "action"
+                        and event.get("tool") in {"split_shot", "update_plan"}
+                    ):
+                        break
+                    if (
+                        event.get("kind") == "observation"
+                        and event.get("tool") == "inspect_source"
+                    ):
+                        result = event.get("result", {})
+                        if result.get("shot") == i and not result.get("region"):
+                            inspected.update(result.get("frame_indices", []))
+                missing = sorted(required_frames - inspected)
+                if missing:
+                    raise ValueError(
+                        f"Inspect the full source at the SAME segmentation key frames first: "
+                        f'inspect_source with {{"shot":{i},"frame_indices":{missing[:6]}}}. '
+                        "Points from other frames or cropped images are unsafe. No mask changes were applied."
+                    )
                 cfg = args.get("settings", {})
                 if set(cfg) - set(p.DEFAULT_MASK) or set(cfg) & {
                     "text",
@@ -980,6 +1015,13 @@ class Runtime:
                 path, a, seg["start"], seg["end"] - seg["start"], spec, count=4
             )
             imgs = [image_tensor(x["src"]) for x in out["frames"]]
+            out["image_order"] = [
+                f"SAM mask overlay shot {i}, preview {n}; verify target selected and protected people excluded"
+                for n in range(len(imgs))
+            ]
+            out["next_step"] = (
+                "Inspect these overlays now. Change selection if wrong; otherwise configure crop/inpaint/paste as needed and render. Repeating unchanged segment/preview_mask provides no new evidence."
+            )
             return out, imgs
         if tool == "describe_refs":
             _, _, _, i, seg = self.shot(s, args)
