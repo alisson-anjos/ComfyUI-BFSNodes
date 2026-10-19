@@ -296,9 +296,10 @@ class Session:
                 )
                 return self.public()
             try:
-                action = parse_action(decide(self))
+                answer = decide(self)
                 if self.cancel.is_set() or self.status != "running":
                     return self.public()
+                action = parse_action(answer)
                 self.event("action", **action, tab=TABS.get(action["tool"], "agent"))
                 if action["tool"] == "render":
                     if self.renders >= self.settings["max_renders"]:

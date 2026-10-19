@@ -16,6 +16,9 @@ def inspect_vlm(clip, settings, checkpoint=None):
         "agent_output_cap": 16384,
         "requested_output_tokens": settings["max_tokens"],
         "thinking_enabled": settings["thinking"],
+        "finalization_reserve_tokens": min(2048, settings["max_tokens"] // 4)
+        if settings["thinking"]
+        else 0,
         "warnings": [],
         "gpu": None,
         "kv_estimate": None,

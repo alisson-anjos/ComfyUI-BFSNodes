@@ -310,34 +310,65 @@ class Runtime:
             }
         )
         prompt += f"\nBUDGET: renders {s.renders}/{s.settings['max_renders']}. Images are in the order specified by the observation. Return one tool action JSON."
-        with GPU_LOCK:
-            output = p._textgenerate_execute(
+        budget = s.settings["max_tokens"]
+        thinking = s.settings["thinking"]
+        reserve = min(2048, budget // 4) if thinking else 0
+        images = visual_batch(s.images)
+
+        def generate(text, limit, use_thinking):
+            return p._textgenerate_execute(
                 TextGenerate,
                 clip=clip,
-                prompt=prompt,
-                max_length=s.settings["max_tokens"],
+                prompt=text,
+                max_length=limit,
                 sampling_mode={
                     "sampling_mode": "on",
-                    "temperature": 0.6,
+                    "temperature": 0.6 if use_thinking else 0.2,
                     "top_k": 20,
                     "top_p": 0.95,
                     "min_p": 0.0,
                     "seed": len(s.events),
                 },
-                thinking=s.settings["thinking"],
-                image=visual_batch(s.images),
+                thinking=use_thinking,
+                image=images,
             )
-        text = str(output.args[0] or "").strip()
-        if not text:
-            reasoning_only = len(output.args) > 1 and bool(output.args[1])
-            raise ValueError(
-                "VLM returned no final action"
-                + (
-                    " (thinking output only; the token budget may have been exhausted)"
-                    if reasoning_only
-                    else " (empty response)"
+
+        with GPU_LOCK:
+            output = generate(prompt, budget - reserve, thinking)
+            text = str(output.args[0] or "").strip()
+            if not text and thinking:
+                if s.cancel.is_set() or s.status != "running":
+                    return ""  # tick checks cancellation before parsing
+                s.event(
+                    "decision",
+                    summary=(
+                        "Thinking returned no final action. Requesting action JSON with Thinking off "
+                        f"using the reserved {reserve} tokens; Thinking remains enabled for future decisions."
+                    ),
+                    phase="finalize_action",
+                    token_budget=reserve,
                 )
-                + ". Increase Max tokens or disable Thinking, then Resume."
+                # Do not persist, display or feed truncated private reasoning back as instructions.
+                # Reuse the original task, observed state and images, with an explicit final-action request.
+                output = generate(
+                    prompt
+                    + "\nFINAL ACTION REQUIRED: The previous attempt returned no final action. "
+                    "Return exactly one registered tool action JSON now, for example "
+                    '{"tool":"inspect_source","arguments":{"shot":0},"summary":"Inspect source and reference"}. '
+                    "Choose the next useful action from the actual state above. Do not repeat the example blindly. "
+                    "No prose, reasoning or Markdown. Do not claim a render happened unless the state confirms it.",
+                    reserve,
+                    False,
+                )
+                text = str(output.args[0] or "").strip()
+                if not text:
+                    raise ValueError(
+                        "VLM returned no final action even with Thinking off during finalization. "
+                        "Check the checkpoint/tokenizer compatibility or disable Thinking and Resume."
+                    )
+        if not text:
+            raise ValueError(
+                "VLM returned no final action with Thinking off. Check the checkpoint/tokenizer compatibility."
             )
         return text
 

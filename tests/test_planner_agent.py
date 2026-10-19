@@ -76,9 +76,118 @@ class SessionTests(unittest.TestCase):
         )
         session = self.session()
         with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
-            with self.assertRaisesRegex(ValueError, "thinking output only") as error:
+            with self.assertRaisesRegex(
+                ValueError, "Thinking off during finalization"
+            ) as error:
                 runtime.Runtime(planner).decide(session)
         self.assertNotIn("private reasoning", str(error.exception))
+
+    def test_thinking_finalization_respects_total_budget_and_hides_reasoning(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        calls = []
+        final = action("inspect_source", shot=0)
+
+        def generate(*args, **kwargs):
+            calls.append(kwargs)
+            return (
+                types.SimpleNamespace(args=("", "private reasoning"))
+                if len(calls) == 1
+                else types.SimpleNamespace(args=(final, ""))
+            )
+
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        session = self.session(max_tokens=8192)
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            result = runtime.Runtime(planner).decide(session)
+        self.assertEqual(core.parse_action(result)["tool"], "inspect_source")
+        self.assertEqual([c["thinking"] for c in calls], [True, False])
+        self.assertEqual([c["max_length"] for c in calls], [6144, 2048])
+        self.assertTrue(session.settings["thinking"])
+        self.assertNotIn("private reasoning", calls[1]["prompt"])
+        self.assertNotIn("private reasoning", json.dumps(session.public()))
+        self.assertEqual(session.events[-1]["phase"], "finalize_action")
+
+    def test_valid_thinking_action_needs_no_finalization(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        from unittest.mock import Mock
+
+        generate = Mock(
+            return_value=types.SimpleNamespace(args=(action("inspect_plan"), "private"))
+        )
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        session = self.session()
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            runtime.Runtime(planner).decide(session)
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(session.events, [])
+
+    def test_no_second_call_when_thinking_is_disabled(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        from unittest.mock import Mock
+
+        generate = Mock(return_value=types.SimpleNamespace(args=("", "")))
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            with self.assertRaisesRegex(ValueError, "with Thinking off"):
+                runtime.Runtime(planner).decide(self.session(thinking=False))
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(generate.call_args.kwargs["max_length"], 4096)
+
+    def test_pause_after_thinking_skips_finalization_and_parsing(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        session = self.session()
+        calls = []
+
+        def generate(*args, **kwargs):
+            calls.append(kwargs)
+            session.cancel.set()
+            session.status = "paused"
+            return types.SimpleNamespace(args=("", "private"))
+
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            session.tick(
+                runtime.Runtime(planner).decide,
+                lambda *_: self.fail("must not execute"),
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(session.error_count, 0)
+        self.assertEqual(session.events, [])
+
+    def test_finalization_does_not_bypass_registered_tool_validation(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        from unittest.mock import Mock
+
+        generate = Mock(
+            side_effect=[
+                types.SimpleNamespace(args=("", "private")),
+                types.SimpleNamespace(args=(action("shell"), "")),
+            ]
+        )
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()}, _textgenerate_execute=generate
+        )
+        session = self.session()
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            session.tick(
+                runtime.Runtime(planner).decide,
+                lambda *_: self.fail("must not execute"),
+            )
+        self.assertIn("registered tool", session.observation["error"])
+        self.assertEqual(session.renders, 0)
 
     def test_plan_is_isolated(self):
         p = {"segs": [{"prompt": "old"}]}

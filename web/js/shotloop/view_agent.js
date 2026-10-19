@@ -105,6 +105,7 @@ export function agentTab(c) {
       h('div',`Checkpoint Thinking capability: ${a.vlmInfo.thinking_checkpoint||'unknown'}`),
       h('div',`Backend context: ${a.vlmInfo.context_tokens??'unknown'} tokens · Agent output cap: ${a.vlmInfo.agent_output_cap??'unknown'} · Requested output: ${a.vlmInfo.requested_output_tokens??'unknown'}`),
       a.vlmInfo.context_source?h('div',{class:'hint'},a.vlmInfo.context_source):null,
+      a.vlmInfo.finalization_reserve_tokens?h('div',{class:'hint'},`Thinking finalization reserve: ${a.vlmInfo.finalization_reserve_tokens} tokens within the decision budget; used only if the first call returns no final action.`):null,
       a.vlmInfo.gpu?h('div',`${a.vlmInfo.gpu.name}: ${a.vlmInfo.gpu.free_gib}/${a.vlmInfo.gpu.total_gib} GiB free · VLM weights not resident: ${a.vlmInfo.gpu.vlm_weights_not_resident_gib} GiB · Reserve: ${a.vlmInfo.gpu.reserve_gib} GiB`):null,
       a.vlmInfo.kv_estimate?h('div',[
         h('div',`Estimated total KV capacity: ${a.vlmInfo.kv_estimate.total_tokens} tokens · Requested output KV: ${a.vlmInfo.kv_estimate.requested_output_cache_mib} MiB`),

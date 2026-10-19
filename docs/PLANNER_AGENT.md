@@ -141,3 +141,15 @@ The diagnostic does not load/offload models, allocate probe tensors or change se
 
 Numeric settings update during typing so periodic session polls do not overwrite an edit
 before the field loses focus.
+
+## Thinking that never produces a final action
+
+With Thinking enabled, each decision reserves up to one quarter of its output-token budget
+(capped at 2,048 tokens) for finalization. If the first call returns no final action, the Agent
+logs a `finalize_action` event and requests one action with Thinking off, using the original
+task, observations and images. It does not feed back or persist truncated private reasoning.
+The combined generation limits of both calls stay inside the configured decision budget:
+8,192 tokens means at most 6,144 for the first call and 2,048 for finalization.
+A valid first response needs no second call. The Thinking setting stays enabled for future
+decisions. Pause/Stop between calls skips finalization; tool validation and render budgets
+still apply. If finalization also fails, the Agent reports an error rather than inventing a tool action.
