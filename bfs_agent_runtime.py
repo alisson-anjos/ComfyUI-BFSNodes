@@ -180,6 +180,7 @@ class Runtime:
             s.reviewed = set(d.get("reviewed", []))
             s.combined = d.get("combined")
             s.preview = d.get("preview")
+            s.vlm_info = d.get("vlm_info")
             s.observation = {
                 "message": "Session restored. Inspect current plan and results before continuing."
             }
@@ -251,6 +252,28 @@ class Runtime:
                 images.append(self.p._load_image(n))
                 labels.append("reference " + n)
         return labels, images
+
+    def diagnose_vlm(self, s):
+        from .bfs_agent_diagnostics import inspect_vlm
+
+        try:
+            link = (s.workflow or {}).get(s.planner_id, {}).get("inputs", {}).get("vlm")
+            loader = (
+                (s.workflow or {}).get(str(link[0]), {})
+                if isinstance(link, list) and link
+                else {}
+            )
+            checkpoint = loader.get("inputs", {}).get("clip_name")
+            s.vlm_info = inspect_vlm(self.p._VLM.get("clip"), s.settings, checkpoint)
+            s.event(
+                "vlm_info",
+                summary="Connected VLM diagnostics available",
+                report=s.vlm_info,
+            )
+        except Exception as exc:
+            s.vlm_info = {
+                "warnings": ["VLM diagnostics unavailable: " + type(exc).__name__]
+            }
 
     def decide(self, s):
         p = self.p
@@ -1034,6 +1057,7 @@ def register(planner):
                     if st.get("status_str") == "success":
                         if kind == "context":
                             s.context_ready = True
+                            await off(lambda: rt.diagnose_vlm(s))
                         else:
                             s.rendered_revision = revision
                             s.render_snapshot = snapshot
@@ -1161,6 +1185,9 @@ def register(planner):
                         "Only paused, errored or budget-limited sessions can resume"
                     )
                 settings = b.get("settings") or {}
+                for key in ("thinking", "web"):
+                    if key in settings:
+                        s.settings[key] = bool(settings[key])
                 for key, maximum in (
                     ("max_actions", 200),
                     ("max_renders", 20),
@@ -1189,6 +1216,8 @@ def register(planner):
                     if old != new:
                         s.plan = candidate
                         rt.invalidate(s)
+                if s.context_ready:
+                    rt.diagnose_vlm(s)
                 s.cancel.clear()
                 s.error_count = 0
                 s.status = "waiting_render" if s.pending_render else "running"

@@ -120,3 +120,24 @@ The existing Planner suite also reports two failures reproduced against untouche
 `CastTest.test_plan_splits_assigns_and_skips_by_person` (empty cast reference under the existing test harness),
 and `FillDetailsTest.test_render_node_fills_details_with_its_vlm` (test mock accepts six arguments
 while the implementation passes seven). They are outside this experiment.
+
+## Connected VLM diagnostics
+
+After Start loads the connected VLM, the Agent tab shows its checkpoint (when exposed by the
+loader), architecture, detected vision encoder, Thinking control, backend context limit,
+requested output budget and the Agent's separate 16,384-token output cap. Resume refreshes
+the report and applies Thinking/Web changes as well as numeric budgets.
+
+Tokenizer support for a Thinking switch does not prove that a checkpoint was trained for
+reasoning. Unknown capabilities remain unknown; tokenizer padding limits are never reported
+as context limits. The backend context configuration may differ from a checkpoint's documented limit.
+
+On initialized CUDA devices, the report includes free/total VRAM, unloaded VLM weights and
+a memory reserve. Known full-attention Llama2_ backends also receive a conservative FP32
+KV-cache estimate for one sequence. This is a total context estimate shared by input text,
+images and output, not a guaranteed maximum output budget. It does not measure vision/prefill
+or workspace peaks, and custom/hybrid backends receive no token-capacity estimate.
+The diagnostic does not load/offload models, allocate probe tensors or change settings.
+
+Numeric settings update during typing so periodic session polls do not overwrite an edit
+before the field loses focus.

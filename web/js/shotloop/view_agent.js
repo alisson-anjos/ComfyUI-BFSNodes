@@ -2,7 +2,7 @@ import { reactive, onMounted, onBeforeUnmount } from '../vendor/vue.esm-browser.
 import { h } from './common.js';
 
 export function createAgent(c, io, app) {
-  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
+  const a = reactive({ task:'', id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, vlmInfo:null, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,project_root:''}, follow:true, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false;
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
@@ -11,6 +11,7 @@ export function createAgent(c, io, app) {
   }
   function apply(j) {
     if(!a.task){a.task=j.task||'';Object.assign(a.settings,j.settings||{});}
+    a.vlmInfo=j.vlm_info||null;
     a.checklist=j.checklist||[];a.id=j.id;a.status=j.status;a.events=j.events||[];a.observation=j.observation||{};a.preview=j.preview;a.combined=j.combined;
     // Paused manual edits are sent back to the server on Resume.
     if (j.plan && ['running','waiting_render','complete','budget_exhausted','error'].includes(j.status)) {
@@ -87,7 +88,7 @@ export function agentBar(c) {
 export function agentTab(c) {
   const {a,start,control}=c.agent;
   const setting=(name,label,type='number')=>h('label',{style:'display:flex;gap:8px;align-items:center'},[
-    label,h('input',{type,value:a.settings[name],checked:!!a.settings[name],onChange:e=>{a.settings[name]=type==='checkbox'?e.target.checked:type==='number'?Number(e.target.value):e.target.value;}})]);
+    label,h('input',{type,min:type==='number'?(name==='max_tokens'?512:1):undefined,max:type==='number'?({max_tokens:16384,max_actions:200,max_renders:20}[name]):undefined,value:a.settings[name],checked:!!a.settings[name],onInput:type==='checkbox'?undefined:e=>{a.settings[name]=type==='number'&&e.target.value!==''?Number(e.target.value):e.target.value;},onChange:type==='checkbox'?e=>{a.settings[name]=e.target.checked;}:undefined})]);
   const frames=a.preview?.frames||a.observation.frames||[];
   return h('div',{style:'padding:12px;display:grid;gap:12px'},[
     h('h3','Agent · experimental'),
@@ -97,6 +98,20 @@ export function agentTab(c) {
       setting('max_actions','Action limit'),setting('max_renders','Render limit'),setting('max_tokens','Decision token budget'),
     ]),
     setting('project_root','Project context folder (optional)','text'),
+    a.vlmInfo?h('details',{open:true},[
+      h('summary','Connected VLM · capabilities and memory'),
+      h('div',`Checkpoint: ${a.vlmInfo.checkpoint||'not exposed'} · Architecture: ${a.vlmInfo.architecture||'unknown'}`),
+      h('div',`Generation API: ${a.vlmInfo.generation?'available':'not detected'} · Images: ${a.vlmInfo.images||'unknown'} · Thinking control: ${a.vlmInfo.thinking_control||'unknown'}`),
+      h('div',`Checkpoint Thinking capability: ${a.vlmInfo.thinking_checkpoint||'unknown'}`),
+      h('div',`Backend context: ${a.vlmInfo.context_tokens??'unknown'} tokens · Agent output cap: ${a.vlmInfo.agent_output_cap??'unknown'} · Requested output: ${a.vlmInfo.requested_output_tokens??'unknown'}`),
+      a.vlmInfo.context_source?h('div',{class:'hint'},a.vlmInfo.context_source):null,
+      a.vlmInfo.gpu?h('div',`${a.vlmInfo.gpu.name}: ${a.vlmInfo.gpu.free_gib}/${a.vlmInfo.gpu.total_gib} GiB free · VLM weights not resident: ${a.vlmInfo.gpu.vlm_weights_not_resident_gib} GiB · Reserve: ${a.vlmInfo.gpu.reserve_gib} GiB`):null,
+      a.vlmInfo.kv_estimate?h('div',[
+        h('div',`Estimated total KV capacity: ${a.vlmInfo.kv_estimate.total_tokens} tokens · Requested output KV: ${a.vlmInfo.kv_estimate.requested_output_cache_mib} MiB`),
+        h('div',{class:'hint'},a.vlmInfo.kv_estimate.assumptions),
+      ]):null,
+      ...(a.vlmInfo.warnings||[]).map(w=>h('div',{class:'hint'},w)),
+    ]):h('div',{class:'hint'},'VLM capabilities and GPU memory diagnostics appear after Start loads the connected VLM.'),
     h('div',{class:'row'},[
       h('button',{onClick:start,disabled:a.working||!a.task.trim()||['running','waiting_render'].includes(a.status)},'▶ Start automatic task'),
       h('button',{onClick:()=>control('pause'),disabled:!a.id},'Pause'),

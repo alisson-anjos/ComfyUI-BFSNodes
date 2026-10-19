@@ -229,6 +229,7 @@ class Session:
         self.context_ready = False
         self.render_snapshot = None
         self.checklist = []
+        self.vlm_info = None
 
     def event(self, kind, **data):
         self.events.append({"time": time.time(), "kind": kind, **data})
@@ -255,6 +256,7 @@ class Session:
             "checklist": self.checklist,
             "combined": self.combined,
             "preview": self.preview,
+            "vlm_info": self.vlm_info,
             "updated": self.updated,
             "revision": self.revision,
             "rendered_revision": self.rendered_revision,
