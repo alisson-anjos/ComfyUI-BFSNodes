@@ -537,14 +537,20 @@ export function promptChips(c, names, onSet) {
     const ta = e.currentTarget.closest(".pbox")?.querySelector("textarea"); if (!ta) return;
     const v = ta.value, a = ta.selectionStart ?? v.length, b = ta.selectionEnd ?? v.length;
     const before = v.slice(0, a) + (a && !/\s$/.test(v.slice(0, a)) ? " " : "") + tag;
-    onSet(before + v.slice(b));
+    // This is an intentional edit of the focused draft. Update the DOM first
+    // so the background-refresh protection retains the inserted token too.
+    const next = before + v.slice(b);
+    ta.value = next;
+    onSet(next);
     requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(before.length, before.length); });
   };
   return h("div", { class: "pchips" }, names.map((name, k) => h("span", { class: "pchip" }, [
-    h("button", { class: "sm", title: `insert <Picture ${k + 1}> (${name})`, onMousedown: e => insert(e, `<Picture ${k + 1}>`) },
+    h("button", { class: "sm", title: `insert <Picture ${k + 1}> (${name})`, onMousedown: e => insert(e, `<Picture ${k + 1}>`),
+      onClick: e => { if (e.detail === 0) insert(e, `<Picture ${k + 1}>`); } },
       [h("img", { src: c.viewUrl(name) }), `Picture${k + 1}`]),
     h("button", { class: "sm", title: `insert {details@Picture ${k + 1}}: the description of this picture (📝 Describe refs, or the VLM at run time)`,
-      onMousedown: e => insert(e, `{details@Picture ${k + 1}}`) }, "📝"),
+      onMousedown: e => insert(e, `{details@Picture ${k + 1}}`),
+      onClick: e => { if (e.detail === 0) insert(e, `{details@Picture ${k + 1}}`); } }, "📝"),
   ])));
 }
 
