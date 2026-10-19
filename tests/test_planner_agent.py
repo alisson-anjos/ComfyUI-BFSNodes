@@ -384,6 +384,137 @@ class ToolsTests(unittest.TestCase):
 
 
 class PreviewTests(unittest.TestCase):
+    def test_packed_av_preview_extracts_only_video(self):
+        video = torch.arange(24 * 5 * 2 * 2).reshape(1, 24, 5, 2, 2)
+        audio = torch.full((1, 32, 2, 7), -99)
+        packed = torch.cat([video.reshape(1, 1, -1), audio.reshape(1, 1, -1)], dim=-1)
+        result = preview.video_latent(packed, [video.shape, audio.shape])
+        self.assertTrue(torch.equal(result, video))
+        self.assertEqual(tuple(packed.shape), (1, 1, video.numel() + audio.numel()))
+        with self.assertRaisesRegex(ValueError, "no latent_shapes"):
+            preview.video_latent(packed)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            preview.video_latent(packed, [video.shape])
+
+    def test_nested_and_dense_h3_video_preview(self):
+        video = torch.ones(1, 24, 3, 2, 2)
+        nested = types.SimpleNamespace(
+            is_nested=True, unbind=lambda: [video, torch.zeros(1, 32, 2, 7)]
+        )
+        self.assertIs(preview.video_latent(nested), video)
+        self.assertIs(preview.video_latent(video), video)
+        self.assertTrue(torch.equal(preview.video_latent(video[0]), video))
+        with self.assertRaisesRegex(ValueError, "Expected H3 video"):
+            preview.video_latent(torch.zeros(1, 16, 3, 2, 2))
+
+    def test_packed_tiny_vae_uses_temporal_neighborhoods(self):
+        self.run_preview_case()
+
+    def test_explicit_preview_retry_still_interrupts_generation(self):
+        self.run_preview_case(retry=True)
+
+    def test_full_vae_uses_single_latent_snapshots_and_preserves_callback(self):
+        self.run_preview_case(full_vae=True)
+
+    def test_preview_shape_failure_preserves_generation(self):
+        self.run_preview_case(bad_shape=True)
+
+    def test_preview_decode_failure_preserves_generation(self):
+        self.run_preview_case(bad_decode=True)
+
+    def run_preview_case(
+        self, full_vae=False, bad_shape=False, bad_decode=False, retry=False
+    ):
+        sid = "a" * 32
+        session = core.Session("task", {}, session_id=sid)
+        session.preview = {
+            "review": {"decision": "retry"},
+            "frames": [{"src": "old render"}],
+        }
+        runtime.SESSIONS[sid] = session
+        self.addCleanup(runtime.SESSIONS.pop, sid, None)
+        p = types.ModuleType(PACKAGE + ".bfs_shot_loop")
+        p._notify = lambda *a: None
+        p._VLM = {"clip": object()}
+        p._parse_json = json.loads
+        p._textgenerate_execute = lambda *a, **kw: types.SimpleNamespace(
+            args=(json.dumps({"decision": "retry", "reason": "major failure"}),)
+        )
+        mm = types.ModuleType("comfy.model_management")
+        mm.loaded_models = lambda **kw: ["diffusion"]
+        restored = []
+        mm.load_models_gpu = lambda models: restored.append(models)
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy.model_management = mm
+        video = torch.ones(1, 24, 5, 2, 2)
+        audio = torch.full((1, 32, 2, 7), 99.0)
+        packed = torch.cat([video.reshape(1, 1, -1), audio.reshape(1, 1, -1)], dim=-1)
+        shapes = None if bad_shape else [video.shape, audio.shape]
+        model = types.SimpleNamespace(
+            inner_model=types.SimpleNamespace(latent_shapes=shapes),
+            model_patcher=types.SimpleNamespace(
+                get_model_object=lambda _: types.SimpleNamespace(
+                    process_out=lambda x: x * 2
+                )
+            ),
+        )
+        decoded = []
+
+        def decode(z):
+            decoded.append(z.clone())
+            if bad_decode:
+                raise ValueError("decoder failed")
+            return torch.zeros(1, 8, 8, 3)
+
+        stage = type("MiniMaxH3VideoVAE" if full_vae else "TinyVAE", (), {})()
+        vae = types.SimpleNamespace(first_stage_model=stage, decode=decode)
+        callbacks = []
+
+        def sample(m, sigmas, args, cb, *rest):
+            for step in range(3):
+                cb(step, packed, packed * 0, 3)
+            return "generated video"
+
+        with patch.dict(
+            sys.modules, {"comfy": comfy, "comfy.model_management": mm, p.__name__: p}
+        ):
+            fake = types.ModuleType("comfy_extras.nodes_textgen")
+            fake.TextGenerate = object()
+            wrapper = preview.PreviewSampler(
+                types.SimpleNamespace(sample=sample), sid, 1, 0, 3, retry, vae
+            )
+            if retry:
+                with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+                    with self.assertRaises(preview.PreviewRetry):
+                        wrapper.sample(model, [1, 0.5, 0.1, 0], {}, None, packed)
+                self.assertEqual(len(restored), 2)
+                return
+            result = wrapper.sample(
+                model, [1, 0.5, 0.1, 0], {}, lambda *a: callbacks.append(a), packed
+            )
+        self.assertEqual(result, "generated video")
+        self.assertEqual(len(callbacks), 3)
+        self.assertTrue(all(c[1] is packed for c in callbacks))
+        if bad_shape or bad_decode:
+            self.assertIn("error", session.preview)
+            self.assertNotIn("review", session.preview)
+            self.assertEqual(
+                len([e for e in session.events if e["kind"] == "preview_error"]), 1
+            )
+            self.assertEqual(len(restored), 1)
+        else:
+            if full_vae:
+                self.assertTrue(all(z.shape[2] == 1 for z in decoded))
+            else:
+                self.assertTrue(all(1 < z.shape[2] <= 3 for z in decoded))
+            self.assertTrue(all(torch.all(z == 2) for z in decoded))
+            self.assertEqual(
+                session.preview["decode_mode"],
+                "single-latent snapshots" if full_vae else "temporal neighborhoods",
+            )
+            self.assertEqual(len(restored), 3)
+
     def test_inactive_session_is_exact_passthrough(self):
         p = types.ModuleType(PACKAGE + ".bfs_shot_loop")
         sys.modules[p.__name__] = p

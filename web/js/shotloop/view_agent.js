@@ -79,6 +79,7 @@ export function agentBar(c) {
     ]),
     a.preview ? h('details',{open:a.status==='waiting_render'},[
       h('summary',`Preview · ${a.preview.step}/${a.preview.total_steps} steps · approximate`),
+      a.preview.error?h('div',{class:'err'},'Intermediate preview disabled; generation continues: '+a.preview.error):null,
       h('div',{class:'row'},(a.preview.frames||[]).map(f=>h('img',{src:f.src,title:`latent ${f.latent_index}`,style:'max-width:140px;max-height:100px'}))),
       a.preview.review?h('div',a.preview.review.reason||''):null,
     ]):null,
@@ -123,6 +124,7 @@ export function agentTab(c) {
     a.checklist.length?h('ol',a.checklist.map(step=>h('li',`${{pending:'○',in_progress:'▶',done:'✓'}[step.status]} ${step.title}`))):null,
     a.error?h('div',{class:'err'},a.error):null,
     a.preview?h('div',`Intermediate preview · ${a.preview.step}/${a.preview.total_steps} steps · approximate`):null,
+    a.preview?.error?h('div',{class:'err'},'Intermediate preview disabled; generation continues: '+a.preview.error):null,
     h('div',{class:'row',style:'flex-wrap:wrap'},frames.map(f=>h('figure',{style:'margin:4px;max-width:220px'},[
       h('img',{src:f.src,style:'max-width:220px;max-height:200px'}),h('figcaption',f.label||`latent ${f.latent_index??f.f??''}`)]))),
     a.preview?.review?h('pre',{style:'white-space:pre-wrap'},JSON.stringify(a.preview.review,null,2)):null,

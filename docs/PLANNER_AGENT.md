@@ -153,3 +153,18 @@ The combined generation limits of both calls stay inside the configured decision
 A valid first response needs no second call. The Thinking setting stays enabled for future
 decisions. Pause/Stop between calls skips finalization; tool validation and render budgets
 still apply. If finalization also fails, the Agent reports an error rather than inventing a tool action.
+
+## H3 packed AV preview latents
+
+The Agent sampler runs before ComfyUI's outer callback unpacks AV latents. It uses the
+model's `latent_shapes` to extract the first (video) stream from flat `[B,1,N]` x0,
+validating stream sizes before decoding. Dense and nested H3 video tensors remain supported;
+audio is never decoded as video. Native callbacks and generation output retain their original tensors.
+
+Both taeh3 and the normal H3 video VAE can be connected as `preview_vae`. Known full
+`MiniMaxH3VideoVAE` decoders use their single-latent image path for approximate snapshots;
+tiny decoders use contiguous temporal neighborhoods. Full-VAE previews cost more time and VRAM.
+Preview shape/decode/review errors log a visible warning and disable intermediate preview
+for that render while generation continues. Explicit VLM retry decisions and user stop/interrupt
+still interrupt sampling. These paths have CPU contract tests; full-VAE and taeh3 GPU fidelity
+and memory behavior still require local validation.

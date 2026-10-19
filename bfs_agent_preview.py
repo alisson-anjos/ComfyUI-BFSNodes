@@ -2,6 +2,39 @@
 
 from __future__ import annotations
 import time
+import math
+
+
+class PreviewRetry(RuntimeError):
+    """An explicit VLM retry must still interrupt the render."""
+
+
+def video_latent(x0, latent_shapes=None):
+    """Read H3 video x0 from dense, nested or sampler-packed AV tensors."""
+    if getattr(x0, "is_nested", False):
+        x0 = x0.unbind()[0]
+    if x0.ndim == 3 and x0.shape[1] == 1:
+        if not latent_shapes:
+            raise ValueError(
+                f"Packed H3 preview {tuple(x0.shape)} has no latent_shapes metadata"
+            )
+        shapes = [tuple(shape) for shape in latent_shapes]
+        if any(
+            len(shape) < 2 or shape[0] != x0.shape[0] or any(d <= 0 for d in shape)
+            for shape in shapes
+        ):
+            raise ValueError("Invalid H3 latent_shapes metadata")
+        if sum(math.prod(shape[1:]) for shape in shapes) != x0.shape[-1]:
+            raise ValueError("Packed H3 preview size does not match latent_shapes")
+        shape = shapes[0]  # H3 packs video first, audio second
+        if len(shape) != 5 or shape[1] != 24:
+            raise ValueError(f"First H3 stream is not video: {shape}")
+        x0 = x0[:, :, : math.prod(shape[1:])].reshape(shape)
+    if x0.ndim == 4 and x0.shape[0] == 24:
+        x0 = x0.unsqueeze(0)
+    if x0.ndim != 5 or x0.shape[1] != 24:
+        raise ValueError(f"Expected H3 video [B,24,T,H,W], received {tuple(x0.shape)}")
+    return x0
 
 
 class PreviewSampler:
@@ -62,6 +95,8 @@ class PreviewSampler:
                 denoise_mask,
                 disable_pbar,
             )
+        # Reviews and errors from an earlier render must not describe this attempt.
+        s.preview = None
         vae = self.vae
         if vae is None:
             import comfy.sd
@@ -86,15 +121,25 @@ class PreviewSampler:
                 )
             )
         last = 0.0
+        preview_failed = False
         patcher = model_wrap.model_patcher
         latent_format = patcher.get_model_object("latent_format")
+        latent_shapes = getattr(
+            getattr(model_wrap, "inner_model", None), "latent_shapes", None
+        )
+        full_vae = any(
+            cls.__name__ == "MiniMaxH3VideoVAE"
+            for cls in type(vae.first_stage_model).__mro__
+        )
 
         def observe(step, x0, x, total):
-            nonlocal last
+            nonlocal last, preview_failed
             if callback is not None:
                 callback(step, x0, x, total)
             if s.status == "stopped":
                 raise RuntimeError("BFS agent stopped by user")
+            if preview_failed:
+                return
             now = time.monotonic()
             if ((step + 1) % self.every and step + 1 != total) or (
                 last and now - last < self.seconds and step + 1 != total
@@ -105,11 +150,7 @@ class PreviewSampler:
             with GPU_LOCK, torch.inference_mode():
                 loaded = mm.loaded_models(only_currently_used=True)
                 try:
-                    latent = x0.tensors[0] if getattr(x0, "is_nested", False) else x0
-                    if latent.ndim != 5 or latent.shape[1] != 24:
-                        raise ValueError(
-                            "This preview adapter expects H3 [B,24,T,H,W] latents"
-                        )
+                    latent = video_latent(x0, latent_shapes)
                     picks = sorted(
                         set(
                             round(i)
@@ -123,8 +164,10 @@ class PreviewSampler:
                     imgs = []
                     for j in picks:
                         # Contiguous temporal neighborhood; never concatenate unrelated latent times into a fake clip.
-                        lo = max(0, j - 1)
-                        hi = min(latent.shape[2], j + 2)
+                        # The full H3 VAE has a single-latent image path: avoid arbitrary
+                        # short temporal chunks, which differ between ComfyUI versions.
+                        lo = j if full_vae else max(0, j - 1)
+                        hi = j + 1 if full_vae else min(latent.shape[2], j + 2)
                         z = latent_format.process_out(latent[:1, :, lo:hi].detach())
                         decoded = vae.decode(z)
                         if decoded.ndim == 5:
@@ -143,6 +186,9 @@ class PreviewSampler:
                         "shot": (self.shot or {}).get("index"),
                         "approximate": True,
                         "decoder": type(vae.first_stage_model).__name__,
+                        "decode_mode": "single-latent snapshots"
+                        if full_vae
+                        else "temporal neighborhoods",
                         "frames": [
                             {"latent_index": j, "src": image_url(im)}
                             for j, im in zip(picks, imgs)
@@ -197,10 +243,32 @@ class PreviewSampler:
                                 "preview_review": decision,
                                 "message": "Generation aborted for a major observed failure. Correct the plan before rendering again.",
                             }
-                            raise RuntimeError(
+                            raise PreviewRetry(
                                 "BFS agent preview requested retry: "
                                 + str(decision.get("reason", ""))[:500]
                             )
+                except PreviewRetry:
+                    raise
+                except Exception as exc:
+                    if s.status == "stopped" or isinstance(
+                        exc, getattr(mm, "InterruptProcessingException", ())
+                    ):
+                        raise
+                    preview_failed = True
+                    message = f"{type(exc).__name__}: {exc}"
+                    s.preview = {
+                        **(s.preview or {}),
+                        "error": message,
+                        "step": step + 1,
+                        "total_steps": total,
+                        "approximate": True,
+                    }
+                    s.event(
+                        "preview_error",
+                        summary="Intermediate preview disabled for this render; generation continues.",
+                        error=message,
+                    )
+                    p._notify("bfs-agent-preview", {"id": s.id, "preview": s.preview})
                 finally:
                     mm.load_models_gpu(loaded)
                     last = time.monotonic()
