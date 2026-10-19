@@ -885,8 +885,17 @@ class Runtime:
                 for n in changes["refs"]:
                     if n:
                         p._input_path(n)
-            self.update_meta(s, i, changes)
-            return {"shot": i, "changed": changes}, []
+            changed = {k: v for k, v in changes.items() if seg.get(k) != v}
+            if changed:
+                self.update_meta(s, i, changed)
+            return {
+                "shot": i,
+                "changed": changed,
+                "already_applied": not changed,
+                "next_step": (
+                    "Requested changes are saved. " if changed else "These fields were already applied; no revision was created. "
+                ) + "Do not repeat update_shot. Inspect source/reference evidence and SAM overlays before rendering.",
+            }, []
         if tool == "split_shot":
             _, _, segs, i, seg = self.shot(s, args)
             f = args.get("frame")

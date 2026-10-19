@@ -105,6 +105,23 @@ def prepare_context(s, system, tools, image_count):
     # Keep the latest user instruction intact; older corrections stay in the digest/source history.
     applied = [m for m in s.messages if m.get("status") == "applied"]
     latest = applied[-1:] or s.feedback[-1:]
+    # Keep current facts ahead of potentially truncated history/plan sections.
+    # Assistant action summaries are intent, never evidence that a tool succeeded.
+    last_outcome = next(
+        (e for e in reversed(s.events) if e.get("kind") in ("observation", "error")),
+        {},
+    )
+    live = {
+        "video": s.plan.get("video"),
+        "fps": s.plan.get("fps"),
+        "global_refs": s.plan.get("global_refs", []),
+        "latest_tool": last_outcome.get("tool"),
+        "latest_tool_failed": last_outcome.get("kind") == "error",
+        "confirmed_changes": (last_outcome.get("result") or {}).get("changed"),
+        "already_applied": (last_outcome.get("result") or {}).get("already_applied"),
+        "next_step": (last_outcome.get("result") or {}).get("next_step"),
+        "instruction": "Use actual reference filenames from the current plan/inspect_source, never filenames from old assistant claims. Successful changes are already saved; do not repeat them. After a tool error change the request according to the error. Segmentation overlays are visual evidence; inspect them instead of repeating unchanged segment. temporal_expand is mask dilation, not proof that tracking is correct across the video.",
+    }
     base = (
         system
         + "\nTOOLS:\n"
@@ -131,6 +148,8 @@ def prepare_context(s, system, tools, image_count):
         + json.dumps(text_context(latest), ensure_ascii=False)
         + "\nGENERATION STATE:\n"
         + json.dumps(state, ensure_ascii=False)
+        + "\nAUTHORITATIVE LIVE FACTS AND LAST TOOL OUTCOME:\n"
+        + json.dumps(text_context(live), ensure_ascii=False)
     )
     if text_room <= tokens(base):
         s.context_usage = {
