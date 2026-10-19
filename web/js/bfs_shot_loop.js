@@ -1014,7 +1014,7 @@ app.registerExtension({
     const handle = {};
     createApp({
       setup: () => Panel({
-        nodeId: node.id,
+        get nodeId() { return node.id; },
         getPlan: () => planWidget?.value ?? "{}",
         setPlan: v => { if (planWidget) planWidget.value = v; node.graph?.setDirtyCanvas(true); },
         expose: o => Object.assign(handle, o),

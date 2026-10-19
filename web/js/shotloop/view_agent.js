@@ -36,7 +36,11 @@ export function createAgent(c, io, app) {
     try {
       if(['running','waiting_render'].includes(a.status))throw new Error('Pause or stop the current session first');
       c.save();const graph=await app.graphToPrompt();
-      apply(await post('/start',{task:a.task,plan:JSON.parse(JSON.stringify(c.plan)),settings:{...a.settings},workflow:graph.output,planner_id:String(io.nodeId),client_id:c.api.clientId}));
+      const plannerId=String(io.nodeId);
+      if(graph.output?.[plannerId]?.class_type!=='BFSShotPlanner') {
+        throw new Error('The current Planner is missing from the executable workflow. Enable this Planner and connect it to the generation/output chain, then try again.');
+      }
+      apply(await post('/start',{task:a.task,plan:JSON.parse(JSON.stringify(c.plan)),settings:{...a.settings},workflow:graph.output,planner_id:plannerId,client_id:c.api.clientId}));
     } catch(e){a.error=String(e.message||e);}finally{a.working=false;}
   }
   async function control(action) {
