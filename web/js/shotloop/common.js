@@ -360,7 +360,21 @@ function localizeChildren(value) {
 export function h(type, props, children) {
   const hasChildrenArg = arguments.length >= 3;
   if (!hasChildrenArg && props?.__v_isVNode) return vueH(type, null, props);
-  const p = localizeProps(props);
+  let p = localizeProps(props);
+  // Many controls commit on change (blur). Agent polling and progress events
+  // must not replace their unsaved DOM draft while the user is still typing.
+  if (p && typeof p === "object" && !Array.isArray(p) && Object.hasOwn(p, "value") &&
+      (type === "textarea" || (type === "input" && [undefined, "text", "number", "search", "url", "email", "password"].includes(p.type)))) {
+    const beforeUpdate = p.onVnodeBeforeUpdate;
+    p = { ...p, onVnodeBeforeUpdate(vnode, previous) {
+      if (Array.isArray(beforeUpdate)) beforeUpdate.forEach(fn => fn(vnode, previous));
+      else beforeUpdate?.(vnode, previous);
+      const el = previous.el;
+      if (el && typeof document !== "undefined" && document.activeElement === el) {
+        vnode.props.value = el.value;
+      }
+    } };
+  }
   if (hasChildrenArg) return vueH(type, p, localizeChildren(children));
   if (typeof props === "string" || Array.isArray(props)) return vueH(type, localizeChildren(props));
   return vueH(type, p);
