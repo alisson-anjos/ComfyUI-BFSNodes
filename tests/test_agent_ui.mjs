@@ -25,6 +25,58 @@ function context() {
   c.agent.a.view='settings';
   return c;
 }
+test('polling preserves manual video, references and prompts while accepting unrelated agent edits', async () => {
+  const c=context();
+  let plan={video:'old.mp4',global_refs:['old.png'],global_prompt:'old prompt',segs:[{prompt:'old shot'}],vlm_cfg:{temperature:0.5,max_tokens:512},fps:16};
+  c.plan=structuredClone(plan);
+  c.api.fetchApi=async()=>({ok:true,json:async()=>({id:'test',status:'running',plan:structuredClone(plan)})});
+  await c.agent.poll();
+  Object.assign(c.plan,{video:'new.mp4',global_refs:['new.png'],global_prompt:'my prompt',segs:[{prompt:'my shot'}]});
+  c.plan.vlm_cfg.temperature=0.9;
+  await c.agent.poll();
+  plan={...plan,global_prompt:'agent prompt',fps:24,vlm_cfg:{temperature:0.7,max_tokens:1024}};
+  await c.agent.poll();
+  assert.equal(c.plan.video,'new.mp4');
+  assert.deepEqual(c.plan.global_refs,['new.png']);
+  assert.equal(c.plan.global_prompt,'my prompt');
+  assert.equal(c.plan.segs[0].prompt,'my shot');
+  assert.deepEqual(c.plan.vlm_cfg,{temperature:0.9,max_tokens:1024});
+  assert.equal(c.plan.fps,24);
+  // Completed sessions used to restore the old plan on every poll too.
+  c.api.fetchApi=async()=>({ok:true,json:async()=>({id:'test',status:'complete',plan})});
+  await c.agent.poll();
+  assert.equal(c.plan.video,'new.mp4');
+});
+test('reconnecting to an old session keeps the saved workflow plan', async () => {
+  const c=context();
+  c.plan={video:'new.mp4',global_refs:['new.png'],global_prompt:'new prompt'};
+  c.api.fetchApi=async()=>({ok:true,json:async()=>({id:'test',status:'complete',plan:{video:'old.mp4',global_refs:[],global_prompt:'old'}})});
+  await c.agent.poll();await c.agent.poll();
+  assert.deepEqual({...c.plan,agent_session_id:undefined},{video:'new.mp4',global_refs:['new.png'],global_prompt:'new prompt',agent_session_id:undefined});
+});
+test('agent changes still reach untouched fields and removed fields while paused drafts survive Resume', async () => {
+  const c=context();
+  let status='running', plan={video:'clip.mp4',global_prompt:'old',global_refs:['ref.png'],obsolete:true};
+  c.plan=structuredClone(plan);
+  c.api.fetchApi=async(url,options)=>{
+    if(options){plan=JSON.parse(options.body).plan;status='running';}
+    return {ok:true,json:async()=>({id:'test',status,plan:structuredClone(plan)})};
+  };
+  await c.agent.poll();
+  plan={video:'clip.mp4',global_prompt:'agent edit',global_refs:['ref2.png']};
+  await c.agent.poll();
+  assert.equal(c.plan.global_prompt,'agent edit');
+  assert.deepEqual(c.plan.global_refs,['ref2.png']);
+  assert.equal('obsolete' in c.plan,false);
+  status='paused';await c.agent.poll();
+  c.plan.global_prompt='manual paused edit';c.plan.global_refs=[];
+  await c.agent.poll();await c.agent.control('resume');await c.agent.poll();
+  assert.equal(plan.global_prompt,'manual paused edit');
+  assert.equal(c.plan.global_prompt,'manual paused edit');
+  assert.deepEqual(c.plan.global_refs,[]);
+  plan.global_prompt='agent after resume';await c.agent.poll();
+  assert.equal(c.plan.global_prompt,'agent after resume');
+});
 test('token edits survive a poll before blur, including an empty draft', async () => {
   const c = context();
   const label = find(agentTab(c), n => n.tag === 'label' && n.children[0] === 'Decision token budget');

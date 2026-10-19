@@ -6,6 +6,22 @@ export function createAgent(c, io, app) {
   const a = reactive({ task:'', feedback:'', feedbackHistory:[], reviewCoverage:{}, messages:[], attachments:[], pendingMessages:[], contextUsage:null, contextSummary:null, tokenUsage:null, resources:null, resourceError:'', view:'chat', logFilter:'all', inputKind:'feedback', lightbox:null, followChat:true, actions:0, renders:0, created:0, copying:false, copyNotice:'', historyEvents:[], historyBefore:0, eventCount:0, pendingRender:null, id:'', status:'idle', checklist:[], events:[], observation:{}, preview:null, previewHistory:[], vlmInfo:null, requiresNewTask:false, settings:{thinking:true,web:true,max_actions:40,max_renders:4,max_tokens:4096,review_fps:2,context_window:32768,project_root:''}, follow:false, error:'', working:false, combined:null });
   let timer = null, dead = false, polling = false, resourcesAt = 0, resourcePolling = false;
   let fileInput = null;
+  let remotePlan = null, remoteSession = null;
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  // Apply server changes only where the user has not edited the last server value.
+  // Arrays are atomic: shot indices and reference order can change together.
+  function mergePlan(local, previous, incoming) {
+    for (const key of new Set([...Object.keys(previous), ...Object.keys(incoming)])) {
+      if (same(previous[key], incoming[key])) continue;
+      if (same(local[key], previous[key])) {
+        if (Object.hasOwn(incoming, key)) local[key] = clone(incoming[key]);
+        else delete local[key];
+      } else if ([local[key], previous[key], incoming[key]].every(value => value && typeof value === 'object' && !Array.isArray(value))) {
+        mergePlan(local[key], previous[key], incoming[key]);
+      }
+    }
+  }
   const endpoint = '/bfs/shotloop/agent';
   async function post(path, data) {
     const r=await c.api.fetchApi(endpoint+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
@@ -32,10 +48,17 @@ export function createAgent(c, io, app) {
     a.requiresNewTask=!!j.requires_new_task||String(j.observation?.error||'').includes('Workflow VAE loader rejected');
     a.checklist=j.checklist||[];a.id=j.id;a.status=j.status;a.events=j.events||[];a.observation=j.observation||{};a.preview=j.preview;a.combined=j.combined;
     // Paused manual edits are sent back to the server on Resume.
-    if (j.plan && ['running','waiting_render','complete','budget_exhausted','error'].includes(j.status)) {
-      const sourceChanged=j.plan.video!==c.plan.video;
-      const refsChanged=JSON.stringify(j.plan.global_refs)!==JSON.stringify(c.plan.global_refs);
-      Object.assign(c.plan,j.plan);c.save();
+    if (j.plan) {
+      const video=c.plan.video, refs=JSON.stringify(c.plan.global_refs);
+      if (remotePlan && remoteSession === j.id && ['running','waiting_render','complete','budget_exhausted','error'].includes(j.status)) {
+        mergePlan(c.plan,remotePlan,j.plan);
+      }
+      // On reconnect, the saved workflow is the user's current plan. An old
+      // session snapshot establishes the baseline without replacing that plan.
+      remotePlan=clone(j.plan);remoteSession=j.id;
+      const sourceChanged=video!==c.plan.video;
+      const refsChanged=refs!==JSON.stringify(c.plan.global_refs);
+      c.save();
       if(sourceChanged||refsChanged)c.refreshFiles?.();
       if(sourceChanged)c.analyze?.();
     }
@@ -63,7 +86,9 @@ export function createAgent(c, io, app) {
       if(graph.output?.[plannerId]?.class_type!=='BFSShotPlanner') {
         throw new Error('The current Planner is missing from the executable workflow. Enable this Planner and connect it to the generation/output chain, then try again.');
       }
-      apply(await post('/start',{task:a.task,plan:JSON.parse(JSON.stringify(c.plan)),attachments:a.attachments.map(({src,name})=>({src,name})),settings:{...a.settings},workflow:graph.output,planner_id:plannerId,client_id:c.api.clientId}));
+      const plan=clone(c.plan);
+      const result=await post('/start',{task:a.task,plan,attachments:a.attachments.map(({src,name})=>({src,name})),settings:{...a.settings},workflow:graph.output,planner_id:plannerId,client_id:c.api.clientId});
+      remotePlan=plan;remoteSession=result.id;apply(result);
       a.attachments=[];a.followChat=true;
     } catch(e){a.error=String(e.message||e);}finally{a.working=false;}
   }
