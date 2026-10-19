@@ -1066,6 +1066,26 @@ class TinyPreviewLoaderTests(unittest.TestCase):
         )
 
 
+class SourceReviewTests(unittest.TestCase):
+    def test_adjacent_scene_and_continuity_head_are_excluded(self):
+        # Before: [previous scene]*5 + [this shot]*10 + [next scene]*7.
+        frames = torch.tensor([1] * 5 + [2] * 10 + [3] * 7)
+        shot = {"frames": frames, "head": 5, "length": 10, "start": 100, "end": 110}
+        indices = preview.source_review_indices(shot)
+        self.assertEqual(indices, [5, 9, 14])
+        self.assertEqual(frames[indices].tolist(), [2, 2, 2])
+
+    def test_short_cut_shot_never_reviews_following_scene_padding(self):
+        shot = {
+            "frames": torch.tensor([2] * 3 + [3] * 19),
+            "head": 0,
+            "start": 200,
+            "end": 203,
+        }
+        self.assertEqual(preview.source_review_indices(shot), [0, 1, 2])
+        self.assertEqual(preview.source_review_indices({"frames": torch.empty(0)}), [])
+
+
 class PreviewHistoryTests(unittest.TestCase):
     def test_capture_survives_restore_and_failure_keeps_review(self):
         with tempfile.TemporaryDirectory() as folder:

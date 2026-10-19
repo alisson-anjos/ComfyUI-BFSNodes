@@ -39,6 +39,25 @@ def video_latent(x0, latent_shapes=None):
     return x0
 
 
+def source_review_indices(shot):
+    """Exclude continuity head and generation padding belonging to adjacent shots."""
+    frames = shot.get("frames")
+    if frames is None or not len(frames):
+        return []
+    start = max(0, int(shot.get("head") or 0))
+    length = shot.get("length")
+    if length is None and shot.get("end") is not None and shot.get("start") is not None:
+        length = int(shot["end"]) - int(shot["start"])
+    end = (
+        min(len(frames), start + max(0, int(length)))
+        if length is not None
+        else len(frames)
+    )
+    if start >= end:
+        return []
+    return sorted(set((start, start + (end - start - 1) // 2, end - 1)))
+
+
 class PreviewSampler:
     def __init__(
         self,
@@ -214,14 +233,14 @@ class PreviewSampler:
                         if self.shot is not None:
                             f = self.shot.get("frames")
                             if f is not None and len(f):
-                                for j in (0, len(f) // 2, len(f) - 1):
+                                for j in source_review_indices(self.shot):
                                     comparison.append(image_tensor(f[j]))
                             comparison.extend(self.shot.get("refs") or [])
                         prompt = (
                             "Evaluate this APPROXIMATE intermediate video preview against the task: "
                             + s.task
                             + f"\nProgress {(step + 1) / total:.0%}. Early previews cannot establish fine identity. "
-                            'Images: intermediate generated previews first, then source frames and references when connected. Return JSON only: {"decision":"continue" or "retry", "reason":"brief observed evidence"}. '
+                            'Images: intermediate generated previews first (may include continuity head and end padding), then source frames strictly inside the current shot, then references when connected. Do not treat head/padding outside the shot as a failure. Return JSON only: {"decision":"continue" or "retry", "reason":"brief observed evidence"}. '
                             "Choose retry only for an unmistakable major composition failure after 65% progress. "
                             "Do not request tools or change the task."
                         )
