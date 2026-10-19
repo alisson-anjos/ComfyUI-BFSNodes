@@ -125,6 +125,7 @@ function buildPlayer(host) {
     const r = strip.getBoundingClientRect(), n = st.data?.frames || 0;
     if (n) seek(Math.min(n - 1, Math.max(0, Math.floor((e.clientX - r.left) / r.width * n))));
   });
+  const notes = el("div", {style:"white-space:pre-wrap;font-size:12px;padding:6px;color:#e6b566"});
   host.append(el("div", { class: "bfsvc" }, [
     el("div", { class: "row" }, [el("span", {}, "top"), selTop, btnSwap, el("span", {}, "bottom"), selBot, selMode, btnFull]),
     stage,
@@ -132,6 +133,7 @@ function buildPlayer(host) {
     el("div", { class: "row" }, [btnPrev, btnPlay, btnNext, scrub, btnMute, info]),
     el("div", { class: "row" }, [btnSave, btnRec, selFormat, el("label", { title: "Draw the names on the saved / recorded video" }, [chkLabels, "labels"]), lblRefs]),
     strip,
+    notes,
   ]));
 
   const fps = () => st.data?.fps || 24;
@@ -456,6 +458,7 @@ function buildPlayer(host) {
       lblRefs.style.display = d.refs?.length ? "flex" : "none";
       showRefs();
       st.data = d;
+      notes.textContent = (d.notes || []).join("\n");
       empty.style.display = "none";
       scrub.max = String(Math.max(0, d.frames - 1));
       refreshSelects();

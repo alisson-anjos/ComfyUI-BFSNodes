@@ -80,6 +80,28 @@ def save_refs(reference, out_dir: str, height: int) -> list:
     return names
 
 
+def video_batches(value, name):
+    parts = value if isinstance(value, list) else [value]
+    if not parts or any(not isinstance(x, torch.Tensor) or x.ndim != 4 or
+                        x.shape[0] < 1 or x.shape[-1] < 3 or min(x.shape[1:3]) < 1 for x in parts):
+        raise ValueError(f"{name} must contain nonempty IMAGE batches")
+    return parts
+
+
+def video_chunk(parts, start, end, h, w):
+    """Read a bounded frame interval across shot batches without concatenating full videos."""
+    result, pos = [], 0
+    for part in parts:
+        count = int(part.shape[0])
+        a, b = max(0, start - pos), min(count, end - pos)
+        if a < b:
+            result.append(_scale(part[a:b, ..., :3].float(), h, w))
+        pos += count
+        if pos >= end:
+            break
+    return result[0] if len(result) == 1 else torch.cat(result, 0)
+
+
 class BFSVideoCompare:
     @classmethod
     def INPUT_TYPES(cls):
@@ -110,8 +132,7 @@ class BFSVideoCompare:
             },
         }
 
-    # lists in: the reference can be the refs list of the planner / Unpack (pictures of different sizes); the other
-    # inputs take their first item
+    # IMAGE lists contain every shot, in order. Only scalar settings take their first item.
     INPUT_IS_LIST = True
     RETURN_TYPES = ("IMAGE", "STRING", "FLOAT")
     RETURN_NAMES = ("difference", "report", "mean_difference")
@@ -127,18 +148,28 @@ class BFSVideoCompare:
     def compare(self, guide, target, fps=24.0, audio=None, gain=2.0, size="guide", preview_height=720,
                 label_guide="guide", label_target="target", reference=None):
         one = lambda v: v[0] if isinstance(v, list) and v else v
-        guide, target, fps, audio, gain, size, preview_height, label_guide, label_target = map(
-            one, (guide, target, fps, audio, gain, size, preview_height, label_guide, label_target))
+        fps, audio, gain, size, preview_height, label_guide, label_target = map(
+            one, (fps, audio, gain, size, preview_height, label_guide, label_target))
+        guide, target = video_batches(guide, "guide"), video_batches(target, "target")
+        ng, nt = sum(x.shape[0] for x in guide), sum(x.shape[0] for x in target)
+        if len(guide) > 1 or len(target) > 1:
+            if ng != nt or (len(guide) == len(target) and any(g.shape[0] != t.shape[0] for g, t in zip(guide, target))):
+                raise ValueError("Guide/target shot lists have different timing. Connect BFS Shot Join's guide and images outputs from the SAME Join; Unpack guide frames can include continuity heads and generation padding.")
         notes = []
-        n = min(guide.shape[0], target.shape[0])
-        if guide.shape[0] != target.shape[0]:
-            notes.append(f"lengths differ (guide {guide.shape[0]}, target {target.shape[0]} frames): "
+        n = min(ng, nt)
+        if ng != nt:
+            notes.append(f"lengths differ (guide {ng}, target {nt} frames): "
                          f"compared the first {n}")
         ref = guide if size == "guide" else target
-        H, W = int(ref.shape[1]), int(ref.shape[2])
-        for name, v in (("guide", guide), ("target", target)):
-            if tuple(v.shape[1:3]) != (H, W):
-                notes.append(f"{name} scaled from {v.shape[2]}x{v.shape[1]} to {W}x{H}")
+        H, W = int(ref[0].shape[1]), int(ref[0].shape[2])
+        for name, parts in (("guide", guide), ("target", target)):
+            if len(parts) > 1:
+                notes.append(f"{name}: compared all {len(parts)} shot batches in input order")
+            for dims in sorted(set(tuple(v.shape[1:3]) for v in parts)):
+                if dims != (H, W):
+                    notes.append(f"{name} scaled from {dims[1]}x{dims[0]} to {W}x{H}")
+        if ng != nt:
+            notes.append("Timing may be misaligned. For Planner results, connect guide and images from the SAME BFS Shot Join.")
         ph = min(H, int(preview_height)) if preview_height and preview_height > 0 else H
         PH, PW = max(16, ph // 2 * 2), max(16, int(round(W * ph / H)) // 2 * 2)
 
@@ -151,8 +182,8 @@ class BFSVideoCompare:
         try:
             for a in range(0, n, CHUNK):
                 e = min(a + CHUNK, n)   # the longer video stops where the shorter one ends
-                g = _scale(guide[a:e, ..., :3].float(), H, W)
-                t = _scale(target[a:e, ..., :3].float(), H, W)
+                g = video_chunk(guide, a, e, H, W)
+                t = video_chunk(target, a, e, H, W)
                 m, e, s = difference(g, t, gain)
                 maps.append(m)
                 mae.append(e)
@@ -179,7 +210,7 @@ class BFSVideoCompare:
         ui = {"bfs_compare": [{**files, "fps": float(fps), "frames": n, "width": PW, "height": PH,
                                "labels": [label_guide, label_target], "mae": [round(float(x), 2) for x in mae],
                                "refs": refs,
-                               "report": report}]}
+                               "report": report, "notes": notes}]}
         return {"ui": ui, "result": (diff_map, report, mean)}
 
 

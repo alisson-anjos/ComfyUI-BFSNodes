@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import torch
@@ -64,6 +65,47 @@ class CompareNodeTest(unittest.TestCase):
             while cap.read()[0]:
                 n += 1
             self.assertEqual(n, 18, k)
+
+    def test_all_shots_keep_guide_and_target_order_across_chunk_boundaries(self):
+        class Writer:
+            videos = {}
+            def __init__(self, path, *args, **kwargs):
+                self.frames = self.videos.setdefault(Path(path).name, [])
+            def write(self, frames):
+                self.frames.append(frames.clone())
+            def close(self):
+                pass
+        # Scene 1 red, scene 2 green: 22 frames span the 16-frame encoder chunk.
+        guide = [torch.zeros(10, 32, 48, 3), torch.zeros(12, 32, 48, 3)]
+        guide[0][..., 0] = 1
+        guide[1][..., 1] = 1
+        target = [x.clone() for x in guide]
+        with patch.object(VC.VIO, "Mp4Writer", Writer):
+            out = VC.BFSVideoCompare().compare(guide, target, preview_height=32)
+        self.assertEqual(out["ui"]["bfs_compare"][0]["frames"], 22)
+        self.assertEqual(out["result"][2], 0)
+        for name in ("guide.mp4", "target.mp4"):
+            frames = torch.cat(Writer.videos[name])
+            self.assertEqual(frames.shape[0], 22)
+            self.assertEqual(frames[:10, 0, 0].tolist(), [[1., 0., 0.]] * 10)
+            self.assertEqual(frames[10:, 0, 0].tolist(), [[0., 1., 0.]] * 12)
+
+    def test_joined_video_can_match_multiple_equal_timing_shots(self):
+        g = [torch.zeros(3, 32, 48, 3), torch.ones(4, 32, 48, 3)]
+        self.assertEqual(VC.video_chunk(g, 2, 6, 32, 48)[:, 0, 0, 0].tolist(), [0., 1., 1., 1.])
+        out = VC.BFSVideoCompare().compare(g, torch.cat(g), preview_height=32)
+        self.assertEqual(out["ui"]["bfs_compare"][0]["frames"], 7)
+        self.assertEqual(out["result"][2], 0)
+
+    def test_misaligned_shot_lists_require_join_timing_instead_of_silent_truncation(self):
+        g = [torch.zeros(5, 32, 48, 3), torch.zeros(7, 32, 48, 3)]
+        t = [torch.zeros(6, 32, 48, 3), torch.zeros(6, 32, 48, 3)]
+        with self.assertRaisesRegex(ValueError, "SAME Join"):
+            VC.BFSVideoCompare().compare(g, t)
+        with self.assertRaisesRegex(ValueError, "SAME Join"):
+            VC.BFSVideoCompare().compare(g, torch.zeros(8, 32, 48, 3))
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            VC.BFSVideoCompare().compare([], t)
 
     def test_reference_pictures_go_to_the_player_no_taller_than_it(self):
         from PIL import Image
