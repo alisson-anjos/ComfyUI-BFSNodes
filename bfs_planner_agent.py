@@ -132,6 +132,7 @@ TABS = {
 SYSTEM = """You operate the BFS Shot Planner using tools, not prose promises. Fulfil the user's video task.
 Return exactly one JSON object: {"tool":"tool_name","arguments":{},"summary":"short user-facing action explanation"}.
 Choose one action per turn. Inspect the plan, publish a step-by-step checklist and keep it updated. Observe source and references before editing. Inspect SAM overlays before rendering.
+Loading VLM context is not a video render. When current_plan_rendered is false, call render before inspect_result or combine.
 Inspect results for identity, motion, background preservation, mask edges, temporal continuity and requested changes.
 Use all relevant reference pictures. Reference pictures define identity; source video defines movement unless asked otherwise.
 Intermediate previews are approximate: early steps support composition checks, not reliable fine identity judgement.
@@ -149,7 +150,18 @@ def parse_action(text):
         text = text.split("</think>", 1)[1].strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    action = json.loads(text)
+    if not text:
+        raise ValueError(
+            "VLM returned an empty final action. Increase Max tokens or disable Thinking, then Resume."
+        )
+    try:
+        action = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "VLM final answer is not a valid tool action JSON. Return only "
+            '{"tool":"inspect_plan","arguments":{},"summary":"Inspect current plan"} '
+            "or another registered action; no prose. If truncated, increase Max tokens."
+        ) from exc
     if not isinstance(action, dict) or action.get("tool") not in TOOLS:
         raise ValueError("Expected an action with a registered tool")
     if not isinstance(action.get("arguments", {}), dict):

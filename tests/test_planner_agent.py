@@ -55,6 +55,30 @@ class SessionTests(unittest.TestCase):
             with self.assertRaises((ValueError, json.JSONDecodeError)):
                 core.parse_action(invalid)
 
+    def test_invalid_final_action_has_actionable_error(self):
+        for text, message in (
+            ("", "empty final action"),
+            ("I will inspect the video", "valid tool action JSON"),
+            ('{"tool":', "valid tool action JSON"),
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, message):
+                core.parse_action(text)
+
+    def test_empty_thinking_output_has_actionable_error(self):
+        fake = types.ModuleType("comfy_extras.nodes_textgen")
+        fake.TextGenerate = object()
+        planner = types.SimpleNamespace(
+            _VLM={"clip": object()},
+            _textgenerate_execute=lambda *a, **kw: types.SimpleNamespace(
+                args=("", "private reasoning")
+            ),
+        )
+        session = self.session()
+        with patch.dict(sys.modules, {"comfy_extras.nodes_textgen": fake}):
+            with self.assertRaisesRegex(ValueError, "thinking output only") as error:
+                runtime.Runtime(planner).decide(session)
+        self.assertNotIn("private reasoning", str(error.exception))
+
     def test_plan_is_isolated(self):
         p = {"segs": [{"prompt": "old"}]}
         s = core.Session("task", p)
@@ -429,6 +453,14 @@ class ServerLoopTests(unittest.IsolatedAsyncioTestCase):
                         break
                     await asyncio.sleep(0.01)
                 self.assertEqual(s.status, "complete", s.observation)
+                context = next(
+                    e["result"]
+                    for e in s.events
+                    if e["kind"] == "observation"
+                    and e.get("result", {}).get("kind") == "context"
+                )
+                self.assertFalse(context["current_plan_rendered"])
+                self.assertIn("No video was generated", context["message"])
                 self.assertEqual(len(queue.graphs), 2)
                 self.assertEqual(s.renders, 1)
                 self.assertTrue(
