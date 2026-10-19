@@ -496,7 +496,10 @@ class Runtime:
         path, a, segs = self.context(s)
         i = args.get("shot")
         if isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(segs):
-            raise ValueError(f"shot must be an integer from 0 to {len(segs) - 1}")
+            raise ValueError(
+                f'shot is REQUIRED: submit arguments {{"shot":0}} (integer from 0 to {len(segs) - 1}). '
+                "An empty arguments object is invalid. Keep the successful render; do not render again to fix missing arguments."
+            )
         return path, a, segs, i, segs[i]
 
     def invalidate(self, s):
@@ -582,6 +585,11 @@ class Runtime:
         # Reasoning is handled internally by TextGenerate. Only final structured actions are persisted.
         from comfy_extras.nodes_textgen import TextGenerate
 
+        if all(
+            hasattr(p, name) for name in ("analyze", "resolve_plan", "apply_filters")
+        ):
+            _, _, segments = self.context(s)
+            s.active_shots = [i for i, seg in enumerate(segments) if seg.get("run")]
         prompt = prepare_context(s, SYSTEM, TOOLS, len(s.images))
         if callable(
             getattr(getattr(p, "folder_paths", None), "get_output_directory", None)
@@ -1082,6 +1090,29 @@ class Runtime:
             seen = set(s.review_coverage.get(str(i), {}).get("seen", []))
             picks = select_frames(length, required, seen, args)
             region = review_region(args.get("region"))
+            review_events = []
+            for event in reversed(s.events):
+                if event.get("kind") == "feedback" or (
+                    event.get("kind") == "action" and event.get("tool") == "render"
+                ):
+                    break
+                review_events.append(event)
+            same_pages = [
+                e
+                for e in review_events
+                if e.get("kind") == "observation"
+                and e.get("tool") == "inspect_result"
+                and e.get("result", {}).get("shot") == i
+                and e.get("result", {}).get("frame_indices") == picks
+                and e.get("result", {}).get("region") == region
+            ]
+            if len(same_pages) >= 2:
+                raise ValueError(
+                    f"These frames for shot {i} were already presented twice. "
+                    f"Remaining required frames: {[j for j in required if j not in seen][:6]}. "
+                    'Use inspect_result with {"shot":<index>} to advance automatically, '
+                    "inspect a different region if uncertain, or review the next active shot. Do not repeat this page."
+                )
             cached_video = Path(status["folder"]) / f"shot_{ri:04d}.mkv"
             if cached_video.exists():
                 probe = p._probe(str(cached_video))
@@ -1288,7 +1319,11 @@ class Runtime:
             status = p.cache_status(s.plan)
             active = {i for i, x in enumerate(segs) if x.get("run")}
             if not active or not active <= s.reviewed:
-                raise ValueError("Inspect every active rendered shot before combining")
+                raise ValueError(
+                    f"Inspect every active rendered shot before combining. Active shots: {sorted(active)}; missing review: {sorted(active - s.reviewed)}. "
+                    'Next call inspect_result with {"shot":<missing shot index>}. '
+                    "User feedback withdraws prior reviews. Coverage only records presented frames, not approval of their quality."
+                )
             if (
                 s.rendered_revision != s.revision
                 or any(not x for x in status["ok"])

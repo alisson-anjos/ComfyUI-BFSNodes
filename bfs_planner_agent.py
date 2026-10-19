@@ -572,6 +572,11 @@ class Session:
                             "Do not repeat the same call. Inspect another shot or proceed to render only when the mask is verified."
                         )
                 if action["tool"] == "render":
+                    if self.rendered_revision == self.revision:
+                        raise ValueError(
+                            'This plan is already rendered. Use inspect_result with {"shot":0}, then review every other active shot. '
+                            "To regenerate a rejected take, correct the plan or use retry_shot first. No render was queued."
+                        )
                     if self.renders >= self.settings["max_renders"]:
                         raise ValueError("Render budget exhausted")
                     self.renders += 1
@@ -587,7 +592,9 @@ class Session:
                 elif action["tool"] == "finish":
                     if not self.combined or self.rendered_revision != self.revision:
                         raise ValueError(
-                            "Combine a fully reviewed video before finishing"
+                            "Combine is required before finish, after reviewing EVERY active shot. "
+                            "Inspect missing shots with explicit shot indices, correct any user-reported defects, "
+                            "then call combine before finish. Previous assistant claims are not proof of success."
                         )
                     self.status = "complete"
                     self.observation = {

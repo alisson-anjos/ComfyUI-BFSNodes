@@ -65,6 +65,15 @@ class SessionTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 3)
 
+    def test_already_rendered_plan_cannot_waste_another_render(self):
+        session = self.session()
+        session.status = "running"
+        session.rendered_revision = session.revision
+        session.tick(lambda s: action("render"), lambda *args: ({}, []))
+        self.assertEqual(session.renders, 0)
+        self.assertIsNone(session.pending_render)
+        self.assertIn("already rendered", session.observation["error"])
+
     def test_reasoning_and_strict_action(self):
         self.assertEqual(
             core.parse_action(
@@ -1373,6 +1382,22 @@ class DenseReviewTests(unittest.TestCase):
             {"review_fps": 0},
         )
         self.s.rendered_revision = self.s.revision
+
+    def test_duplicate_review_page_blocked_and_feedback_allows_reinspection(self):
+        args = {"shot": 0, "frame_indices": [0, 1, 2]}
+        for _ in range(2):
+            out, _ = self.rt.execute(self.s, "inspect_result", args)
+            self.s.event(
+                "observation",
+                tool="inspect_result",
+                result={k: v for k, v in out.items() if k != "frames"},
+            )
+        with self.assertRaisesRegex(ValueError, "already presented twice"):
+            self.rt.execute(self.s, "inspect_result", args)
+        self.s.add_feedback("The protected person is also changing")
+        self.assertFalse(self.s.reviewed)
+        out, _ = self.rt.execute(self.s, "inspect_result", args)
+        self.assertEqual(out["frame_indices"], [0, 1, 2])
 
     def test_full_review_is_paged_and_uses_matching_source_times(self):
         for page in range(4):

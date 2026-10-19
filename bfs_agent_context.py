@@ -27,7 +27,7 @@ def compact(s, through):
                     "type": "requested_tool",
                     "tool": event.get("tool"),
                     "arguments": text_context(event.get("arguments", {})),
-                    "note": event.get("summary", "")[:300],
+                    "unverified_assistant_claim": event.get("summary", "")[:300],
                 }
             )
         elif kind == "error":
@@ -88,6 +88,10 @@ def prepare_context(s, system, tools, image_count):
         "revision": s.revision,
         "rendered_revision": s.rendered_revision,
         "current_plan_rendered": s.revision == s.rendered_revision,
+        "reviewed_shots": sorted(s.reviewed),
+        "active_shots": getattr(s, "active_shots", None),
+        "combined": bool(s.combined),
+        "coverage_is_not_quality_approval": True,
         "renders": s.renders,
         "render_limit": s.settings["max_renders"],
         "actions": sum(e["kind"] == "action" for e in s.events),
@@ -105,6 +109,17 @@ def prepare_context(s, system, tools, image_count):
         system
         + "\nTOOLS:\n"
         + json.dumps(tools, ensure_ascii=False)
+        + "\nAUTHORITATIVE RECOVERY (follow before older history):\n"
+        + json.dumps(
+            text_context(
+                {
+                    "error": s.observation.get("error"),
+                    "recovery": s.observation.get("recovery"),
+                    "instruction": "Use explicit integer shot for inspect_result. Review ALL active shots. Presented frames are coverage, not proof of visual correctness. If current_plan_rendered=true inspect results rather than render again. Finish requires combine first. User corrections override prior assistant claims of success; analyze attached screenshots and locate the defects before combining.",
+                }
+            ),
+            ensure_ascii=False,
+        )
         + "\nCURRENT VISUAL INPUT (ordered, actual attached images):\n"
         + json.dumps(
             text_context(s.observation.get("image_order", [])), ensure_ascii=False
