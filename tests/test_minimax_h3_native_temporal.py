@@ -36,7 +36,24 @@ def test_wrong_video_index_and_temporal_mismatch_rejected():
  with pytest.raises(ValueError,match='Video 2'):node.temporal_layout(l,r,None,2)
  l,r=example(6)
  with pytest.raises(ValueError,match='identical temporal'):node.temporal_layout(l,r,None)
- with pytest.raises(ValueError,match='Add Guide'):node.temporal_layout(l,r,[{}])
+
+def test_add_guide_history_keyframes_keep_reference_alignment():
+ # The previous shot's last frames as an Add Guide history (cond rows after the text) must not shift the reference.
+ l,refs=example();plain,src0,tgt0=node.temporal_layout(l,refs,None)
+ kfs=[dict(resolved_frame_index=0,latent=torch.zeros(1,4,2,8,8))]
+ k=CORE.PackedLayout(3,7,8,8,2,keyframes=kfs,refs=refs)
+ aligned,src,tgt=node.temporal_layout(k,refs,kfs)
+ cond=[s for s in k.segments if s[2]=='cond'];assert cond
+ a,b,_=cond[0];n=b-a
+ assert src.sum()==src0.sum() and tgt.sum()==tgt0.sum()
+ assert not src[a:b].any() and not tgt[a:b].any()
+ # Same rows as without history, shifted by the cond rows; same aligned positions for the reference and the target.
+ assert torch.equal(src[b:],src0[a:]) and torch.equal(tgt[b:],tgt0[a:])
+ torch.testing.assert_close(aligned.position_ids[src],plain.position_ids[src0],rtol=0,atol=1e-12)
+ torch.testing.assert_close(aligned.position_ids[tgt],plain.position_ids[tgt0],rtol=0,atol=1e-12)
+ # History rows sit on the target's first frames and are left untouched.
+ torch.testing.assert_close(aligned.position_ids[a:b],k.position_ids[a:b],rtol=0,atol=0)
+ assert aligned.position_ids[a,0]==aligned.position_ids[tgt][0,0]
 
 def context():
  l,r=example();a,s,t=node.temporal_layout(l,r,None)

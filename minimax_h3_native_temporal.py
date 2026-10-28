@@ -48,8 +48,9 @@ def dense_backend_selection(override):
 
 
 def temporal_layout(native, refs, keyframes, video_index=1):
-    if keyframes:
-        raise ValueError('Native temporal mode cannot be combined with Add Guide, first-frame guides or history. Remove those guides.')
+    # Add Guide keyframes (e.g. the previous shot's last frames as history) pack as 'cond' rows right after the text,
+    # before the references, at the target's own timeline positions and never denoised. They stay as they are: no
+    # temporal bias touches them, and the reference rows are located after them.
     required = ('position_ids', 'segments', 'seq_len', 'signature')
     if any(not hasattr(native, x) for x in required):
         raise RuntimeError('Unsupported H3 PackedLayout API; update ComfyUI.')
@@ -59,8 +60,9 @@ def temporal_layout(native, refs, keyframes, video_index=1):
     target = torch.zeros_like(source)
     ta, tb, _ = next(s for s in native.segments if s[2] == 'video')
     target[ta:tb] = True
-    # Native packing is text, each reference's optional audio then video, targets.
+    # Native packing is text, keyframe cond rows, each reference's optional audio then video, targets.
     cursor = next(s[1] for s in native.segments if s[2] == 'text')
+    cursor = max([cursor] + [s[1] for s in native.segments if s[2] in ('cond', 'cond_audio')])
     videos = 0
     for ref in refs:
         kind = ref['kind']
