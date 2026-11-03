@@ -9,6 +9,8 @@
  * whatever you do in the player (dragging the divider, pausing, scrubbing) until ■ stop. Both draw the two videos into
  * a canvas and record it in the browser, in real time. The browser's file (WebM, or a fragmented MP4 many apps won't
  * play) is then converted by ComfyUI to the chosen format: MP4 (H.264), a small MP4 (under 10 MB) or a GIF.
+ * 🖼 PNG downloads the frame on screen as a picture, drawn the same way. With a single frame (two images) the node
+ * also sends lossless PNGs of guide / target / difference: ⬇ save PNG draws from those, at the compared size.
  */
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
@@ -109,6 +111,7 @@ function buildPlayer(host) {
   selFormat.title = "Format of what save / rec download. MP4: H.264 + AAC, plays and previews anywhere. MP4 small: "
     + "the same, sized to stay under 10 MB. GIF: no sound, under 10 MB. browser file: the recording as it is, no conversion.";
   const btnRec = el("button", { title: "Record what you do in the player until stop, then download it", onclick: () => (rec.mr ? stopRec() : startRec()) }, "● rec");
+  const btnShot = el("button", { title: "Download the frame on screen as a PNG, as shown (layout, divider, labels, refs)", onclick: () => snapshot() }, "🖼 PNG");
   const chkLabels = el("input", { type: "checkbox" });
   chkLabels.checked = true;
   chkLabels.addEventListener("change", () => { st.labels = chkLabels.checked; });
@@ -131,7 +134,7 @@ function buildPlayer(host) {
     stage,
     refBox,
     el("div", { class: "row" }, [btnPrev, btnPlay, btnNext, scrub, btnMute, info]),
-    el("div", { class: "row" }, [btnSave, btnRec, selFormat, el("label", { title: "Draw the names on the saved / recorded video" }, [chkLabels, "labels"]), lblRefs]),
+    el("div", { class: "row" }, [btnSave, btnShot, btnRec, selFormat, el("label", { title: "Draw the names on the saved / recorded video" }, [chkLabels, "labels"]), lblRefs]),
     strip,
     notes,
   ]));
@@ -267,6 +270,9 @@ function buildPlayer(host) {
   }
 
   const last = new Map();   // video -> its last whole frame, drawn while it seeks (a seeking video draws blank)
+  const stills = {};        // source -> loaded lossless PNG (single-frame comparisons only)
+  const single = () => st.data?.frames === 1;
+  const still = s => (stills[s]?.complete && stills[s].naturalWidth ? stills[s] : null);
   function pic(v) {
     if (v.readyState < 2 || v.seeking) return last.get(v) || v;
     let c = last.get(v);
@@ -306,8 +312,8 @@ function buildPlayer(host) {
 
   function drawVideos(ctx, area) {
     const cw = ctx.canvas.width, ch = area ?? ctx.canvas.height, m = st.mode, p = st.pos;
-    const B = pic(vBot), T = pic(vTop);
-    const aw = vBot.videoWidth || st.data.width, ah = vBot.videoHeight || st.data.height;
+    const B = still(st.bottom) || pic(vBot), T = still(st.top) || pic(vTop);
+    const aw = B.naturalWidth || vBot.videoWidth || st.data.width, ah = B.naturalHeight || vBot.videoHeight || st.data.height;
     const name = s => s === "guide" ? (st.data?.labels?.[0] || "guide") : s === "target" ? (st.data?.labels?.[1] || "target") : "difference";
     ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cw, ch);
     if (m === "side") {   // bottom left, top right, as on the stage
@@ -378,6 +384,29 @@ function buildPlayer(host) {
     }
   }
 
+  // the canvas for save / rec / PNG: the videos at their size (side by side twice as wide), the reference strip below
+  function sheet(aw, ah) {
+    const canvas = el("canvas");
+    canvas.width = (st.mode === "side" ? 2 * aw + Math.round(2 * aw * 0.004) : aw) & ~1;
+    canvas.videoHeight = ah & ~1;
+    canvas.height = canvas.videoHeight + stripHeight(canvas.videoHeight);
+    return canvas;
+  }
+
+  function snapshot() {   // the frame on screen -> PNG (a single frame draws from the lossless stills)
+    if (!st.data) return;
+    if (st.playing) toggle();
+    const s = still(st.bottom);
+    const canvas = sheet(s?.naturalWidth || vBot.videoWidth || st.data.width, s?.naturalHeight || vBot.videoHeight || st.data.height);
+    compose(canvas.getContext("2d"));
+    canvas.toBlob(blob => {
+      if (!blob) { alert("BFS Video Compare: could not make the PNG."); return; }
+      const href = URL.createObjectURL(blob);
+      download(href, `${stem()}${single() ? "" : `_f${st.frame}`}.png`);
+      setTimeout(() => URL.revokeObjectURL(href), 60000);
+    }, "image/png");
+  }
+
   function buttons() {
     if (rec.busy) {   // uploading / converting the finished recording
       btnRec.classList.remove("rec");
@@ -391,18 +420,17 @@ function buildPlayer(host) {
     btnRec.classList.toggle("rec", busy);
     btnRec.textContent = busy ? (rec.full ? "■ stop" : `■ stop ${((performance.now() - rec.t0) / 1000).toFixed(0)}s`) : "● rec";
     btnSave.disabled = busy;
-    btnSave.textContent = busy && rec.full ? `⬇ ${Math.round(100 * (vBot.currentTime / (vBot.duration || 1)))}%` : "⬇ save";
+    btnSave.textContent = busy && rec.full ? `⬇ ${Math.round(100 * (vBot.currentTime / (vBot.duration || 1)))}%` : single() ? "⬇ save PNG" : "⬇ save";
+    btnShot.disabled = busy;
+    // one frame is a picture: save downloads it as PNG, a video recording has nothing to show
+    for (const b of [btnRec, selFormat, btnShot]) b.style.display = single() ? "none" : "";
   }
 
   function startRec(full = false) {
     if (!st.data || rec.mr || rec.busy) return false;
     if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) { alert("This browser can't record a canvas (MediaRecorder)."); return false; }
-    const aw = vBot.videoWidth || st.data.width, ah = vBot.videoHeight || st.data.height;
-    const side = st.mode === "side", canvas = el("canvas");
     // the size of the layout it starts in (side by side is twice as wide); a later mode change is fitted into it
-    canvas.width = (side ? 2 * aw + Math.round(2 * aw * 0.004) : aw) & ~1;
-    canvas.videoHeight = ah & ~1;                       // the videos; the reference strip goes below them
-    canvas.height = canvas.videoHeight + stripHeight(canvas.videoHeight);
+    const canvas = sheet(vBot.videoWidth || st.data.width, vBot.videoHeight || st.data.height);
     const ctx = canvas.getContext("2d");
     compose(ctx);
     const stream = canvas.captureStream(Math.max(30, Math.round(fps())));
@@ -437,6 +465,7 @@ function buildPlayer(host) {
 
   async function saveFull() {   // once from the first frame to the last, then stop and download
     if (!st.data || rec.mr || rec.busy) return;
+    if (single()) { snapshot(); return; }
     if (st.playing) toggle();
     for (const v of videos()) v.loop = false;
     const seeked = v => new Promise(res => { const t = setTimeout(res, 2000); v.addEventListener("seeked", () => { clearTimeout(t); res(); }, { once: true }); });
@@ -458,6 +487,9 @@ function buildPlayer(host) {
       lblRefs.style.display = d.refs?.length ? "flex" : "none";
       showRefs();
       st.data = d;
+      for (const k of Object.keys(stills)) delete stills[k];
+      for (const [k, f] of Object.entries(d.stills || {})) { const im = new Image(); im.crossOrigin = "anonymous"; im.src = url(f); stills[k] = im; }
+      buttons();
       notes.textContent = (d.notes || []).join("\n");
       empty.style.display = "none";
       scrub.max = String(Math.max(0, d.frames - 1));

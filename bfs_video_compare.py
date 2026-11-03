@@ -67,6 +67,17 @@ def ref_pictures(reference) -> list:
     return out[:MAX_REFS]
 
 
+def save_stills(frames: dict, out_dir: str) -> dict:
+    """{source: [1, H, W, 3] in 0..1} as lossless PNGs -> {source: file name}."""
+    from PIL import Image
+    names = {}
+    for k, v in frames.items():
+        names[k] = f"{k}.png"
+        Image.fromarray((v[0, ..., :3].float().clamp(0, 1).cpu().numpy() * 255).round().astype(np.uint8)).save(
+            os.path.join(out_dir, names[k]))
+    return names
+
+
 def save_refs(reference, out_dir: str, height: int) -> list:
     """The reference pictures as PNGs no taller than the player (no upscale) -> file names."""
     from PIL import Image
@@ -195,6 +206,9 @@ class BFSVideoCompare:
                 w.close()
         diff_map = torch.cat(maps, 0)
         mae, mse = torch.cat(mae), torch.cat(mse)
+        # a single frame is a picture: lossless PNGs at the compared size, which the player's ⬇ save PNG downloads
+        stills = save_stills({"guide": video_chunk(guide, 0, 1, H, W), "target": video_chunk(target, 0, 1, H, W),
+                              "difference": diff_map[:1]}, out_dir) if n == 1 else {}
         mean = float(mae.mean())
         worst, best = int(mae.argmax()), int(mae.argmin())
         report = "\n".join([
@@ -210,6 +224,7 @@ class BFSVideoCompare:
         ui = {"bfs_compare": [{**files, "fps": float(fps), "frames": n, "width": PW, "height": PH,
                                "labels": [label_guide, label_target], "mae": [round(float(x), 2) for x in mae],
                                "refs": refs,
+                               "stills": {k: {"filename": f, "subfolder": sub, "type": "temp"} for k, f in stills.items()},
                                "report": report, "notes": notes}]}
         return {"ui": ui, "result": (diff_map, report, mean)}
 

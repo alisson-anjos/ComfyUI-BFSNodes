@@ -107,6 +107,19 @@ class CompareNodeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonempty"):
             VC.BFSVideoCompare().compare([], t)
 
+    def test_a_single_frame_also_sends_lossless_pngs_at_the_compared_size(self):
+        from PIL import Image
+        guide, target = torch.rand(1, 40, 60, 3), torch.rand(1, 20, 30, 3)
+        ui = VC.BFSVideoCompare().compare(guide, target, preview_height=16)["ui"]["bfs_compare"][0]
+        self.assertEqual(sorted(ui["stills"]), ["difference", "guide", "target"])
+        for k, f in ui["stills"].items():
+            im = Image.open(os.path.join(_TMP, f["subfolder"], f["filename"]))
+            self.assertEqual(im.size, (60, 40))                         # the guide's size, not the 16 px preview
+        g = Image.open(os.path.join(_TMP, ui["stills"]["guide"]["subfolder"], ui["stills"]["guide"]["filename"]))
+        self.assertEqual(g.getpixel((7, 5)), tuple(int(round(float(c) * 255)) for c in guide[0, 5, 7]))   # lossless
+        video = VC.BFSVideoCompare().compare(torch.rand(3, 8, 8, 3), torch.rand(3, 8, 8, 3), preview_height=8)
+        self.assertEqual(video["ui"]["bfs_compare"][0]["stills"], {})
+
     def test_reference_pictures_go_to_the_player_no_taller_than_it(self):
         from PIL import Image
         guide, target = torch.rand(4, 32, 48, 3), torch.rand(4, 32, 48, 3)

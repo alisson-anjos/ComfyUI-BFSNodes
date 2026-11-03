@@ -144,7 +144,7 @@ workflow once per shot, and join the results back with the original timing and s
   guide at 2 fps without native guide video-reference latents; use Add Guide separately for motion.
   See [H3 guide modes](MINIMAX_H3_GUIDES.md#video-context-in-clip-with-aligned-guide-latents).
 - **BFS Shot Join** — concatenates, trims to the true lengths, cross-fades soft joins, returns audio. With `comparison` on, its `guide` output is the original video frame for frame.
-- **BFS Video Compare** — one player for two videos (Join's `guide` and `images`): wipe ↔ / ↕, overlay or side by side, any of guide / target / difference on top, plus a per-pixel difference map and the difference per frame (click to jump).
+- **BFS Video Compare** — one player for two videos (Join's `guide` and `images`): wipe ↔ / ↕, overlay or side by side, any of guide / target / difference on top, plus a per-pixel difference map and the difference per frame (click to jump). 🖼 PNG downloads the frame on screen as shown; with two images (one frame) ⬇ save PNG downloads it from lossless PNGs at the compared size.
 
 **Cast (1.49.0)**: *Find people* tracks faces through the video (InsightFace) and groups them
 into people. Link each person to a reference and every shot uses the reference of the person
