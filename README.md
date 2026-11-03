@@ -252,3 +252,16 @@ The Token / Word Weight Editor accepts `(phrase:1.3)` directives in
 [One workflow](examples/h3_tara_optional_sam_loop.comfy.json) now has independent
 SAM 3.1 and shot-loop switches. Both default OFF. See
 [setup, disabled branches and status](H3_CAST_AND_TOKEN_CONTROLS.md#one-workflow-with-optional-sam-and-loop-111531).
+
+### BFS Segment Picker (1.116.0)
+
+Segment an image into objects with SAM 3.1 and pick them with the mouse. Connect a
+Load Checkpoint node with `sam3.1_multiplex_fp16.safetensors` (its MODEL and CLIP),
+press **▶ Segment** (runs only this node) and the objects appear on a canvas in the
+node: hover to see one, click to select it. The automatic pass looks for the
+`concepts` (default `person, animal`); add what it missed with **Find** (a SAM 3 text
+prompt) or with keep / exclude **points**. Outputs: the selection's mask, one mask per
+selected object, the image with the selection tinted (`mark_color` at `mark_opacity`,
+magenta at 0.3 by default, the Colored Mark convention), a numbered overlay and the
+objects as JSON. The selection and the added objects are saved with the workflow and
+segmented again on load.

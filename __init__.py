@@ -132,6 +132,12 @@ try:
 except Exception as _e:  # noqa
     print(f"[BFSNodes] Video Compare node not loaded: {_e!r}")
     VCMP_NODE_CLASS_MAPPINGS, VCMP_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
+try:
+    from .bfs_segment_picker import NODE_CLASS_MAPPINGS as SEGPICK_NODE_CLASS_MAPPINGS
+    from .bfs_segment_picker import NODE_DISPLAY_NAME_MAPPINGS as SEGPICK_NODE_DISPLAY_NAME_MAPPINGS
+except Exception as _e:  # noqa
+    print(f"[BFSNodes] Segment Picker node not loaded: {_e!r}")
+    SEGPICK_NODE_CLASS_MAPPINGS, SEGPICK_NODE_DISPLAY_NAME_MAPPINGS = {}, {}
 
 try:
     from .minimax_h3_clip_video import NODE_CLASS_MAPPINGS as H3CLIP_NODE_CLASS_MAPPINGS
@@ -181,6 +187,7 @@ NODE_CLASS_MAPPINGS = {
     **HSMS_NODE_CLASS_MAPPINGS,
     **LSURG_NODE_CLASS_MAPPINGS,
     **VCMP_NODE_CLASS_MAPPINGS,
+    **SEGPICK_NODE_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -217,6 +224,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **HSMS_NODE_DISPLAY_NAME_MAPPINGS,
     **LSURG_NODE_DISPLAY_NAME_MAPPINGS,
     **VCMP_NODE_DISPLAY_NAME_MAPPINGS,
+    **SEGPICK_NODE_DISPLAY_NAME_MAPPINGS,
 }
 
 WEB_DIRECTORY = "./web/js"

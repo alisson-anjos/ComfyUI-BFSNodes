@@ -1,0 +1,165 @@
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("bfs_segment_picker", ROOT / "bfs_segment_picker.py")
+SP = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(SP)
+
+
+def rect(h, w, x0, y0, x1, y1):
+    m = torch.zeros(h, w, dtype=torch.bool)
+    m[y0:y1, x0:x1] = True
+    return m
+
+
+class StateTest(unittest.TestCase):
+    def test_empty_and_broken_values(self):
+        for v in (None, "", "{}", "not json", "[1, 2]"):
+            self.assertEqual(SP.parse_state(v), {"selected": [], "added": [], "next": 1})
+
+    def test_keeps_valid_entries_only(self):
+        s = SP.parse_state(json.dumps({
+            "selected": ["a1", "a1", "t1.0", 3],
+            "added": [{"id": "t1", "text": " red car "}, {"id": "p2", "points": [{"x": .5, "y": .5, "label": 1}]},
+                      {"id": "p3", "points": [{"x": .1, "y": .1, "label": 0}]},   # only exclude points: nothing to keep
+                      {"text": "no id"}, {"id": "t4", "text": "  "}],
+            "next": 5}))
+        self.assertEqual(s["selected"], ["a1", "t1.0", "3"])
+        self.assertEqual(s["added"], [{"id": "t1", "text": "red car"}, {"id": "p2", "points": [{"x": .5, "y": .5, "label": 1}]}])
+        self.assertEqual(s["next"], 5)
+
+    def test_concepts(self):
+        self.assertEqual(SP.split_concepts("person, animal,\ncar, person ,,"), ["person", "animal", "car"])
+        self.assertEqual(SP.split_concepts(""), [])
+
+    def test_entry_key_changes_with_what_it_asks(self):
+        a = SP.entry_key({"id": "t1", "text": "car"})
+        self.assertEqual(a, SP.entry_key({"id": "t9", "text": "car"}))
+        self.assertNotEqual(a, SP.entry_key({"id": "t1", "text": "bus"}))
+
+
+class GeometryTest(unittest.TestCase):
+    def test_box(self):
+        self.assertEqual(SP.box_of(rect(10, 20, 3, 2, 8, 6)), [3, 2, 5, 4])
+        self.assertEqual(SP.box_of(torch.zeros(4, 4, dtype=torch.bool)), [0, 0, 0, 0])
+
+    def test_dedupe_drops_repeats_keeps_neighbours(self):
+        a = rect(20, 20, 0, 0, 10, 10)
+        repeat = rect(20, 20, 0, 0, 10, 9)           # 90 % inside a
+        other = rect(20, 20, 8, 8, 18, 18)           # touches a a little
+        kept = SP.dedupe([(a, {"n": 1}), (repeat, {"n": 2}), (other, {"n": 3})])
+        self.assertEqual([i["n"] for _, i in kept], [1, 3])
+
+    def test_compose(self):
+        u, each = SP.compose([], 4, 5)
+        self.assertEqual(tuple(u.shape), (1, 4, 5)); self.assertEqual(float(u.sum()), 0.)
+        a, b = rect(4, 5, 0, 0, 2, 2), rect(4, 5, 1, 1, 3, 3)
+        u, each = SP.compose([a, b], 4, 5)
+        self.assertEqual(tuple(each.shape), (2, 4, 5))
+        self.assertEqual(float(u.sum()), float((a | b).sum()))
+
+    def test_tint_only_inside(self):
+        img = torch.zeros(1, 4, 4, 3)
+        m = rect(4, 4, 0, 0, 2, 2).float()[None]
+        out = SP.tint(img, m, (255, 0, 255), .3)
+        self.assertAlmostEqual(float(out[0, 0, 0, 0]), .3, places=5)
+        self.assertAlmostEqual(float(out[0, 0, 0, 1]), 0., places=5)
+        self.assertEqual(float(out[0, 3, 3].sum()), 0.)
+
+    def test_color(self):
+        self.assertEqual(SP.parse_color("#FF00FF"), (255, 0, 255))
+        self.assertEqual(SP.parse_color("0f0"), (0, 255, 0))
+        self.assertEqual(SP.parse_color("nope"), (255, 0, 255))
+
+
+class SessionTest(unittest.TestCase):
+    """The node with SAM replaced: what is segmented once, what is segmented again, what the outputs hold."""
+
+    def setUp(self):
+        self.calls = []
+        h, w = 20, 40
+        people = [rect(h, w, 25, 2, 35, 18), rect(h, w, 2, 2, 12, 18)]
+
+        def detect_text(sam, frame, text, threshold, max_detections):
+            self.calls.append(("text", text))
+            if text == "person":
+                return [(m, {"score": .9}) for m in people]
+            if text == "dog":
+                return [(rect(h, w, 15, 10, 20, 15), {"score": .7})]
+            return []
+
+        def detect_points(sam, frame, points, threshold):
+            self.calls.append(("points", len(points)))
+            return rect(h, w, 14, 0, 19, 6)
+
+        SP.detect_text, SP.detect_points = detect_text, detect_points
+        SP._SESSIONS.clear()
+        self.frame = torch.rand(1, h, w, 3)
+        self.sam = (object(), object())
+        self.tmp = Path(__file__).resolve().parent / ".segpick_tmp"
+        SP._temp_dir = lambda: str(self.tmp.mkdir(exist_ok=True) or self.tmp)
+
+    def tearDown(self):
+        for f in self.tmp.glob("*.png"):
+            f.unlink()
+        if self.tmp.exists():
+            self.tmp.rmdir()
+
+    def run_node(self, selection, concepts="person"):
+        return SP.BFSSegmentPicker().pick(self.frame, self.sam[0], self.sam[1], concepts, .4, 8, 0., "#FF00FF", .3, json.dumps(selection))
+
+    def test_auto_ids_left_to_right_and_selection(self):
+        out = self.run_node({"selected": ["a2"]})
+        mask, masks, marked, overlay, info = out["result"]
+        info = json.loads(info)
+        self.assertEqual([o["id"] for o in info["objects"]], ["a1", "a2"])
+        self.assertLess(info["objects"][0]["box"][0], info["objects"][1]["box"][0])
+        self.assertEqual(info["selected"], ["a2"])
+        self.assertEqual(float(mask[0, 10, 30]), 1.)      # a2 is the person on the right
+        self.assertEqual(float(mask[0, 10, 5]), 0.)
+        self.assertEqual(tuple(masks.shape), (1, 20, 40))
+        self.assertGreater(float(marked[0, 10, 30, 0]), float(self.frame[0, 10, 30, 0]) * .7 - 1e-6)
+        panel = out["ui"]["bfs_segpick"][0]
+        self.assertEqual(len(panel["objects"]), 2)
+        self.assertTrue((self.tmp / panel["objects"][0]["mask"]["filename"]).exists())
+
+    def test_segments_once_then_only_new_entries(self):
+        self.run_node({"selected": ["a1"]})
+        self.run_node({"selected": ["a2"]})                # only the selection changed
+        self.assertEqual(self.calls, [("text", "person")])
+        sel = {"selected": ["t1.0", "p2"], "added": [{"id": "t1", "text": "dog"},
+                                                     {"id": "p2", "points": [{"x": .37, "y": .05, "label": 1}]}]}
+        _, masks, *_ , info = self.run_node(sel)["result"]
+        self.assertEqual(json.loads(info)["selected"], ["t1.0", "p2"])
+        self.assertEqual(tuple(masks.shape), (2, 20, 40))
+        self.run_node(sel)
+        self.assertEqual(self.calls, [("text", "person"), ("text", "dog"), ("points", 1)])
+        sel["added"][0]["text"] = "cat"                     # an edited entry is segmented again
+        _, _, _, _, info = self.run_node(sel)["result"]
+        self.assertEqual(self.calls[-1], ("text", "cat"))
+        self.assertEqual(json.loads(info)["selected"], ["p2"])   # "cat" found nothing, so t1.0 is gone
+
+    def test_unknown_ids_are_ignored(self):
+        mask, masks, *_ = self.run_node({"selected": ["a9", "t5.0"]})["result"]
+        self.assertEqual(float(mask.sum()), 0.)
+        self.assertEqual(tuple(masks.shape), (1, 20, 40))
+
+    def test_another_sam_is_another_session(self):
+        self.run_node({})
+        self.sam = (object(), object())
+        self.run_node({})
+        self.assertEqual(self.calls, [("text", "person"), ("text", "person")])
+
+    def test_other_concepts_are_another_session(self):
+        self.run_node({}, concepts="person")
+        self.run_node({}, concepts="person, dog")
+        self.assertEqual(self.calls, [("text", "person"), ("text", "person"), ("text", "dog")])
+
+
+if __name__ == "__main__":
+    unittest.main()
