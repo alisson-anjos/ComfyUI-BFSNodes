@@ -1,7 +1,8 @@
 /**
  * BFS Segment Picker: the canvas of the node. It shows the objects SAM 3 found in the image, colored; hover one to
- * see it, click to select it. Objects the automatic pass missed are added by text (a SAM 3 prompt) or by points
- * (keep / exclude), segmented at once by /bfs/segpick/add.
+ * see it, click to select it. Objects the automatic pass missed are added by text (a SAM 3 prompt), by points
+ * (keep / exclude), segmented at once by /bfs/segpick/add, or painted with the brush (to grow the mark by hand).
+ * ➖ Remove (points) and 🧽 Eraser (brush) make the same kinds of objects, cut out of the mark instead of added to it.
  *
  * All state lives in the hidden `selection` STRING widget (JSON: selected ids and the added entries), so a workflow
  * saves, reloads and shares the selection. The objects themselves come from the node's last run (onExecuted).
@@ -14,6 +15,7 @@ import { createApp, h, ref, reactive, computed, watch, nextTick, onMounted, onBe
 // same order as PALETTE in bfs_segment_picker.py, so the panel and the overlay output agree
 const PALETTE = [[230, 70, 60], [45, 125, 225], [50, 180, 90], [235, 205, 35], [205, 55, 180], [30, 200, 205],
   [240, 130, 35], [135, 75, 210], [120, 200, 60], [225, 95, 150], [80, 160, 230], [190, 150, 90]];
+const CUT = [25, 25, 25];        // remove / eraser objects: a dark hole, unlike any PALETTE color
 const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 const DEFAULT_W = 760, DEFAULT_H = 820;
 
@@ -44,7 +46,11 @@ function styles() {
 .bsp .frame{position:relative}
 .bsp .frame img,.bsp .frame canvas{position:absolute;inset:0;width:100%;height:100%;user-select:none}
 .bsp .frame canvas{cursor:pointer}
-.bsp .frame.points canvas{cursor:crosshair}
+.bsp .frame.points canvas,.bsp .frame.remove canvas{cursor:crosshair}
+.bsp .frame.brush canvas,.bsp .frame.eraser canvas{cursor:none}
+.bsp .chip.cut{border-style:dashed}
+.bsp .frame.remove .pt.pos{background:#e74c3c}.bsp .frame.remove .pt.neg{background:#2ecc71}
+.bsp input[type=range]{width:90px}
 .bsp .pt{position:absolute;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;border:2px solid #fff;pointer-events:auto;cursor:pointer;box-shadow:0 0 3px #000}
 .bsp .pt.pos{background:#2ecc71}.bsp .pt.neg{background:#e74c3c}
 .bsp .empty{color:#888;text-align:center;padding:20px;line-height:1.6}
@@ -101,8 +107,11 @@ function Panel(io) {
   const loaded = new Map();          // object id -> loadMask result (not reactive: canvases and big arrays)
   const ready = ref(0);              // bumps when masks finish loading, to redraw
   const hover = ref(null);
-  const mode = ref("select");        // "select" | "points"
+  const mode = ref("select");        // "select" | "points" | "brush" | "remove" (points) | "eraser" (brush)
   const points = ref([]);            // the point entry being built
+  const strokes = ref([]);           // the brush entry being built: [{r, pts: [[x, y], ...]}], relative to the image
+  const brush = ref(.02);            // brush radius, relative to the image width
+  let painting = false, cursor = null;
   const text = ref("");
   const busy = ref(""); const error = ref("");
   const stageEl = ref(null); const canvasEl = ref(null);
@@ -110,15 +119,25 @@ function Panel(io) {
 
   const save = () => io.set(JSON.stringify({ selected: state.selected, added: state.added, next: state.next }));
   const objects = computed(() => data.value?.objects || []);
-  const colorOf = id => PALETTE[Math.max(0, objects.value.findIndex(o => o.id === id)) % PALETTE.length];
+  const colorOf = id => {
+    const i = Math.max(0, objects.value.findIndex(o => o.id === id));
+    return objects.value[i]?.remove ? CUT : PALETTE[i % PALETTE.length];
+  };
   const isSel = id => state.selected.includes(id);
+  const pointing = () => mode.value === "points" || mode.value === "remove";
+  const brushing = () => mode.value === "brush" || mode.value === "eraser";
+  const cutting = () => mode.value === "remove" || mode.value === "eraser";
+  function setMode(m) {
+    if (m !== mode.value) { points.value = []; strokes.value = []; }   // unfinished points / strokes mean something else in another mode
+    mode.value = m; hover.value = null;
+  }
 
   async function loadAll() {
     const objs = objects.value;
     await Promise.all(objs.map(async (o, i) => {
       const key = `${o.id}|${o.mask.filename}`;
       if (loaded.get(o.id)?.key === key) return;
-      try { loaded.set(o.id, { key, ...(await loadMask(o, PALETTE[i % PALETTE.length])) }); } catch { /* shown as missing */ }
+      try { loaded.set(o.id, { key, ...(await loadMask(o, o.remove ? CUT : PALETTE[i % PALETTE.length])) }); } catch { /* shown as missing */ }
     }));
     ready.value++;
   }
@@ -146,13 +165,27 @@ function Panel(io) {
       if (!m) continue;
       const sel = isSel(o.id), hov = hover.value === o.id;
       if (sel || hov) { g.globalAlpha = sel ? (hov ? .6 : .45) : .3; g.drawImage(m.canvas, 0, 0, W, H); }
-      if (mode.value === "points" && !sel && !hov) continue;
+      if (mode.value !== "select" && !sel && !hov) continue;
       g.globalAlpha = sel || hov ? 1 : .7;
       g.drawImage(m.edge, 0, 0, W, H);
     }
     g.globalAlpha = 1;
+    if (!brushing()) return;
+    g.strokeStyle = g.fillStyle = cutting() ? "rgba(20,20,20,.6)" : "rgba(255,0,255,.55)"; g.lineCap = g.lineJoin = "round";
+    for (const st of strokes.value) {
+      const [x0, y0] = st.pts[0];
+      g.beginPath(); g.arc(x0 * W, y0 * H, st.r * W, 0, 2 * Math.PI); g.fill();
+      if (st.pts.length < 2) continue;
+      g.lineWidth = 2 * st.r * W; g.beginPath(); g.moveTo(x0 * W, y0 * H);
+      for (const [x, y] of st.pts.slice(1)) g.lineTo(x * W, y * H);
+      g.stroke();
+    }
+    if (cursor) {
+      g.lineWidth = Math.max(1, W / 500); g.strokeStyle = "#fff";
+      g.beginPath(); g.arc(cursor.x * W, cursor.y * H, brush.value * W, 0, 2 * Math.PI); g.stroke();
+    }
   }
-  watch([ready, hover, mode, () => [...state.selected], () => fit.w, () => fit.h], () => nextTick(draw));
+  watch([ready, hover, mode, brush, () => strokes.value.length, () => [...state.selected], () => fit.w, () => fit.h], () => nextTick(draw));
 
   function at(e) {
     const r = canvasEl.value.getBoundingClientRect();
@@ -177,21 +210,35 @@ function Panel(io) {
     if (!data.value) return;
     e.preventDefault(); e.stopPropagation();
     const p = at(e);
-    if (mode.value === "points") {
+    if (pointing()) {
       points.value = [...points.value, { x: +p.x.toFixed(4), y: +p.y.toFixed(4), label: (e.button === 2 || e.shiftKey) ? 0 : 1 }];
+      return;
+    }
+    if (brushing()) {
+      canvasEl.value.setPointerCapture(e.pointerId);
+      painting = true;
+      strokes.value = [...strokes.value, { r: +brush.value.toFixed(4), pts: [[+p.x.toFixed(4), +p.y.toFixed(4)]] }];
       return;
     }
     const o = objectAt(p);
     if (o) toggle(o.id);
   }
   function onMove(e) {
-    if (!data.value || mode.value === "points") { hover.value = null; return; }
+    if (data.value && brushing()) {
+      cursor = at(e);
+      const pts = strokes.value.at(-1)?.pts, last = pts?.at(-1);
+      // a point every ~quarter radius keeps the stroke smooth without bloating the saved JSON
+      if (painting && Math.hypot(cursor.x - last[0], cursor.y - last[1]) > brush.value / 4) pts.push([+cursor.x.toFixed(4), +cursor.y.toFixed(4)]);
+      draw();
+      return;
+    }
+    if (!data.value || pointing()) { hover.value = null; return; }
     hover.value = objectAt(at(e))?.id ?? null;
   }
 
   async function add(entry) {
     if (!data.value) { error.value = "Run the node first (▶ Segment)."; return; }
-    busy.value = entry.text ? `Finding “${entry.text}”…` : "Segmenting the points…"; error.value = "";
+    busy.value = entry.text ? `Finding “${entry.text}”…` : entry.strokes ? "Adding the painted area…" : "Segmenting the points…"; error.value = "";
     try {
       const r = await api.fetchApi("/bfs/segpick/add", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session: data.value.session, entry }) });
@@ -211,8 +258,14 @@ function Panel(io) {
   const addText = () => { const t = text.value.trim(); if (t) { add({ id: `t${state.next}`, text: t }); text.value = ""; } };
   const addPoints = async () => {
     if (!points.value.some(p => p.label)) return;
-    await add({ id: `p${state.next}`, points: points.value });
-    if (!error.value) { points.value = []; mode.value = "select"; }
+    await add(cutting() ? { id: `r${state.next}`, remove: true, points: points.value } : { id: `p${state.next}`, points: points.value });
+    if (!error.value) setMode("select");
+  };
+  const addBrush = async () => {
+    if (!strokes.value.length) return;
+    const stroke = { image: data.value.image_key, strokes: strokes.value };
+    await add(cutting() ? { id: `e${state.next}`, remove: true, ...stroke } : { id: `b${state.next}`, ...stroke });
+    if (!error.value) setMode("select");
   };
   function removeEntry(entryId) {
     state.added = state.added.filter(a => a.id !== entryId);
@@ -237,6 +290,10 @@ function Panel(io) {
       busy.value = "";
       if (!d) return;
       if (data.value?.session !== d.session) loaded.clear();
+      if (data.value && data.value.image_key !== d.image_key) strokes.value = [];
+      // brush entries belong to the image they were painted on: another image drops them (text and points segment again)
+      const stale = state.added.filter(a => a.strokes && a.image && a.image !== d.image_key).map(a => a.id);
+      if (stale.length) { state.added = state.added.filter(a => !stale.includes(a.id)); save(); }
       data.value = d;
       // ids of objects that no longer exist (another image, other concepts) leave the selection
       const ids = new Set(d.objects.map(o => o.id));
@@ -265,9 +322,15 @@ function Panel(io) {
     return h("div", { class: "bsp", onKeydown: e => e.stopPropagation() }, [
       h("div", { class: "bar" }, [
         h("button", { class: "pri", onClick: runNode, title: "Run this node only (and what feeds it) to segment the image" }, d ? "↻ Segment again" : "▶ Segment"),
-        h("button", { class: mode.value === "select" ? "on" : "", onClick: () => { mode.value = "select"; } }, "👆 Select"),
-        h("button", { class: mode.value === "points" ? "on" : "", disabled: !d, onClick: () => { mode.value = "points"; hover.value = null; },
+        h("button", { class: mode.value === "select" ? "on" : "", onClick: () => setMode("select") }, "👆 Select"),
+        h("button", { class: mode.value === "points" ? "on" : "", disabled: !d, onClick: () => setMode("points"),
           title: "Place points on something the automatic pass missed" }, "📍 Points"),
+        h("button", { class: mode.value === "brush" ? "on" : "", disabled: !d, onClick: () => setMode("brush"),
+          title: "Paint extra area into the mark by hand (e.g. hair SAM left out)" }, "🖌 Brush"),
+        h("button", { class: mode.value === "remove" ? "on" : "", disabled: !d, onClick: () => setMode("remove"),
+          title: "Place points on something to cut out of the mark (SAM segments it)" }, "➖ Remove"),
+        h("button", { class: mode.value === "eraser" ? "on" : "", disabled: !d, onClick: () => setMode("eraser"),
+          title: "Paint what to cut out of the mark by hand" }, "🧽 Eraser"),
         h("span", { class: "hint" }, d ? `${objs.length} objects · ${state.selected.length} selected` : ""),
         h("span", { style: "flex:1" }),
         h("button", { disabled: !objs.length, onClick: () => { state.selected = objs.map(o => o.id); save(); } }, "All"),
@@ -277,30 +340,43 @@ function Panel(io) {
         h("input", { type: "text", value: text.value, placeholder: "Find by text (SAM 3 prompt), e.g. red umbrella, the man on the left",
           disabled: !d, onInput: e => { text.value = e.target.value; }, onKeydown: e => { e.stopPropagation(); if (e.key === "Enter") addText(); } }),
         h("button", { disabled: !d || !text.value.trim() || !!busy.value, onClick: addText }, "🔎 Find"),
-        mode.value === "points" ? [
-          h("button", { class: "pri", disabled: !points.value.some(p => p.label) || !!busy.value, onClick: addPoints }, `✓ Create object (${points.value.length})`),
+        pointing() ? [
+          h("button", { class: "pri", disabled: !points.value.some(p => p.label) || !!busy.value, onClick: addPoints },
+            `${cutting() ? "✓ Remove this" : "✓ Create object"} (${points.value.length})`),
           h("button", { disabled: !points.value.length, onClick: () => { points.value = []; } }, "Clear points"),
+        ] : null,
+        brushing() ? [
+          h("input", { type: "range", min: .003, max: .1, step: .001, value: brush.value, title: "Brush size",
+            onInput: e => { brush.value = +e.target.value; } }),
+          h("button", { class: "pri", disabled: !strokes.value.length || !!busy.value, onClick: addBrush },
+            `${cutting() ? "✓ Erase painted area" : "✓ Add painted area"} (${strokes.value.length})`),
+          h("button", { disabled: !strokes.value.length, onClick: () => { strokes.value = strokes.value.slice(0, -1); } }, "Undo"),
+          h("button", { disabled: !strokes.value.length, onClick: () => { strokes.value = []; } }, "Clear"),
         ] : null,
       ]),
       h("div", { class: "stage", ref: stageEl, onContextmenu: e => e.preventDefault() }, d ? [
-        h("div", { class: ["frame", mode.value === "points" && "points"], style: `width:${fit.w}px;height:${fit.h}px` }, [
+        h("div", { class: ["frame", mode.value !== "select" && mode.value], style: `width:${fit.w}px;height:${fit.h}px` }, [
           h("img", { src: fileUrl(d.image), draggable: false }),
-          h("canvas", { ref: canvasEl, onPointerdown: onPointer, onPointermove: onMove, onPointerleave: () => { hover.value = null; } }),
+          h("canvas", { ref: canvasEl, onPointerdown: onPointer, onPointermove: onMove, onPointerup: () => { painting = false; },
+            onPointerleave: () => { hover.value = null; cursor = null; if (!painting) draw(); } }),
           ...points.value.map((p, k) => h("div", { class: ["pt", p.label ? "pos" : "neg"], style: `left:${p.x * 100}%;top:${p.y * 100}%`,
             title: "click to remove", onPointerdown: e => { e.stopPropagation(); points.value = points.value.filter((_, j) => j !== k); } })),
         ]),
         hovered ? h("div", { class: "tip" }, `${hovered.id} · ${hovered.label}${hovered.score != null ? ` · ${hovered.score}` : ""}`) : null,
         mode.value === "points" ? h("div", { class: "tip" }, "click = keep · right-click or shift+click = exclude · click a point to remove it") : null,
+        mode.value === "remove" ? h("div", { class: "tip" }, "click on what to cut out of the mark · right-click or shift+click = keep it in · then ✓ Remove this") : null,
+        mode.value === "brush" ? h("div", { class: "tip" }, "paint what the mark should also cover · then ✓ Add painted area") : null,
+        mode.value === "eraser" ? h("div", { class: "tip" }, "paint what to cut out of the mark · then ✓ Erase painted area") : null,
       ] : h("div", { class: "empty" }, ["Connect an image and press ▶ Segment (or run the workflow).", h("br"),
         "Then click objects to select them; add what was missed by text or 📍 points."])),
       busy.value ? h("div", { class: "hint" }, busy.value) : null,
       error.value ? h("div", { class: "err" }, error.value) : null,
       objs.length ? h("div", { class: "list" }, objs.map(o => h("div", {
-        class: ["chip", isSel(o.id) && "sel"], title: `${o.label}${o.score != null ? ` · score ${o.score}` : ""} · ${(o.area * 100).toFixed(1)}% of the image`,
+        class: ["chip", isSel(o.id) && "sel", o.remove && "cut"], title: `${o.label}${o.score != null ? ` · score ${o.score}` : ""} · ${(o.area * 100).toFixed(1)}% of the image`,
         onClick: () => toggle(o.id), onPointerenter: () => { hover.value = o.id; }, onPointerleave: () => { hover.value = null; },
       }, [
         h("span", { class: "sw", style: `background:${rgb(colorOf(o.id))}` }),
-        `${o.id} ${o.label}`,
+        `${o.remove ? "➖ " : ""}${o.id} ${o.label}`,
         o.entry ? h("span", { class: "x", title: "remove this added object", onClick: e => { e.stopPropagation(); removeEntry(o.entry); } }, "×") : null,
       ]))) : null,
       d ? h("div", { class: "hint" }, "The outputs follow the selection on the next run.") : null,
@@ -321,7 +397,8 @@ app.registerExtension({
     }
     const host = document.createElement("div");
     host.style.cssText = "position:relative;width:100%;height:100%;min-width:420px;min-height:460px";
-    node.addDOMWidget("bfs_segment_picker", "div", host, { serialize: false, hideOnZoom: false });
+    // hideInPanel: the side panel's legacy renderer writes its own width into the widget, shrinking the canvas in the node
+    node.addDOMWidget("bfs_segment_picker", "div", host, { serialize: false, hideOnZoom: false, hideInPanel: true });
     wheelToCanvas(host);
     const handle = {};
     createApp({

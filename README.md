@@ -265,3 +265,10 @@ selected object, the image with the selection tinted (`mark_color` at `mark_opac
 magenta at 0.3 by default, the Colored Mark convention), a numbered overlay and the
 objects as JSON. The selection and the added objects are saved with the workflow and
 segmented again on load.
+
+Hand edits (1.118.0): **🖌 Brush** paints extra area into the mark (e.g. hair SAM left
+out), **➖ Remove** cuts out what SAM segments at the points you place, and **🧽 Eraser**
+paints what to cut out. Each becomes a chip; unselect it to switch it off. Brush and
+eraser strokes belong to the image they were painted on and are dropped when the image
+changes. Fixed: clicking inside the node no longer shrinks its canvas while the side
+panel is open.

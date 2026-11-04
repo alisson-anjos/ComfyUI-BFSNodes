@@ -7,14 +7,18 @@ selection, one mask per selected object, the image with the selection tinted (th
 30 % marks the subject a body swap replaces) and a numbered overlay of everything found.
 
 When the automatic pass misses something, add it in the panel: type what to find (a SAM 3 text prompt, e.g. "red
-umbrella"), or place keep / exclude points on it. Added objects appear at once (the panel asks the server through
+umbrella"), place keep / exclude points on it, or paint it with the brush (to grow the mark past what SAM found, e.g.
+over hair). Added objects appear at once (the panel asks the server through
 /bfs/segpick/*), and the workflow stores how each one was made, so a reload or another machine segments them again.
 
 All state lives in the hidden `selection` STRING widget (JSON):
     {"selected": ["a3", "t1.0"], "added": [{"id": "t1", "text": "red umbrella"},
-                                             {"id": "p2", "points": [{"x": .41, "y": .62, "label": 1}]}], "next": 3}
-Points are relative to the image (0..1). Ids: a<k> automatic objects (left to right), t<n>.<k> the k-th match of a text
-entry, p<n> a point entry.
+                                             {"id": "p2", "points": [{"x": .41, "y": .62, "label": 1}]},
+                                             {"id": "b3", "image": "9f2c...", "strokes": [{"r": .02, "pts": [[.4, .3], [.45, .32]]}]}], "next": 4}
+An entry with "remove": true (r<n> points, e<n> eraser strokes) is cut out of the selection instead of added to it.
+Points are relative to the image (0..1), a stroke radius to its width. A brush entry belongs to the image it was painted
+on (`image`, see image_key): on another image it is dropped, while text and point entries are segmented again. Ids: a<k> automatic objects (left to right),
+t<n>.<k> the k-th match of a text entry, p<n> a point entry, b<n> a brush entry.
 """
 from __future__ import annotations
 
@@ -55,6 +59,7 @@ def parse_state(text: str | None) -> dict:
     for e in s.get("added") or []:
         if not isinstance(e, dict) or not e.get("id"):
             continue
+        n = len(added)
         if str(e.get("text") or "").strip():
             added.append({"id": str(e["id"]), "text": str(e["text"]).strip()})
         elif e.get("points"):
@@ -62,6 +67,13 @@ def parse_state(text: str | None) -> dict:
                    for p in e["points"] if isinstance(p, dict) and "x" in p and "y" in p]
             if any(p["label"] for p in pts):
                 added.append({"id": str(e["id"]), "points": pts})
+        elif e.get("strokes"):
+            strokes = [{"r": float(st["r"]), "pts": [[float(x), float(y)] for x, y in st["pts"]]}
+                       for st in e["strokes"] if isinstance(st, dict) and st.get("pts")]
+            if strokes:
+                added.append({"id": str(e["id"]), "image": str(e.get("image") or ""), "strokes": strokes})
+        if e.get("remove") and len(added) > n:
+            added[-1]["remove"] = True
     selected = [str(i) for i in s.get("selected") or [] if isinstance(i, (str, int))]
     return {"selected": list(dict.fromkeys(selected)), "added": added, "next": int(s.get("next") or len(added) + 1)}
 
@@ -72,7 +84,7 @@ def split_concepts(text: str) -> list[str]:
 
 def entry_key(entry: dict) -> str:
     """What an added entry asks SAM for: an entry whose text or points change is segmented again."""
-    return json.dumps({k: entry[k] for k in ("text", "points") if k in entry}, sort_keys=True)
+    return json.dumps({k: entry[k] for k in ("text", "points", "strokes", "remove") if k in entry}, sort_keys=True)
 
 
 # ------------------------------------------------------------------------------------------------------------ geometry
@@ -103,6 +115,20 @@ def compose(masks: list[torch.Tensor], h: int, w: int) -> tuple[torch.Tensor, to
         return z, z.clone()
     stack = torch.stack([m.float() for m in masks])
     return (stack.amax(0, keepdim=True)), stack
+
+
+def paint(strokes: list[dict], h: int, w: int) -> torch.Tensor:
+    """Brush strokes (relative points, radius relative to the width) as a bool mask [h, w]."""
+    img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(img)
+    for st in strokes:
+        r = max(1., st["r"] * w)
+        pts = [(x * w, y * h) for x, y in st["pts"]]
+        if len(pts) > 1:
+            draw.line(pts, fill=255, width=round(2 * r), joint="curve")
+        for x, y in pts:
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=255)
+    return torch.from_numpy(np.array(img) > 127)
 
 
 def tint(image: torch.Tensor, mask: torch.Tensor, color: tuple[int, int, int], opacity: float) -> torch.Tensor:
@@ -157,11 +183,17 @@ def detect_points(sam: tuple, frame: torch.Tensor, points: list[dict], threshold
 
 # ------------------------------------------------------------------------------------------------------------- session
 
-def _session_key(frame: torch.Tensor, spec: dict, sam: tuple) -> str:
+def image_key(frame: torch.Tensor) -> str:
+    """Which image this is, from a 64x64 thumbnail and the size: what a brush entry is tied to."""
     small = torch.nn.functional.interpolate(frame[..., :3].movedim(-1, 1).float(), size=(64, 64), mode="area")
     digest = hashlib.sha1((small * 255).round().byte().numpy().tobytes())
-    digest.update(json.dumps(spec, sort_keys=True).encode())
     digest.update(str(tuple(frame.shape)).encode())
+    return digest.hexdigest()[:12]
+
+
+def _session_key(frame: torch.Tensor, spec: dict, sam: tuple) -> str:
+    digest = hashlib.sha1(image_key(frame).encode())
+    digest.update(json.dumps(spec, sort_keys=True).encode())
     digest.update(str(id(getattr(sam[0], "model", sam[0]))).encode())    # another SAM checkpoint segments again
     return digest.hexdigest()[:16]
 
@@ -188,11 +220,22 @@ def auto_objects(sam: tuple, frame: torch.Tensor, concepts: list[str], threshold
 
 
 def entry_objects(sam: tuple, frame: torch.Tensor, entry: dict, threshold: float, max_per_concept: int) -> list[dict]:
+    objs = _entry_objects(sam, frame, entry, threshold, max_per_concept)
+    if entry.get("remove"):
+        for o in objs:
+            o["remove"], o["label"] = True, "eraser" if entry.get("strokes") else "remove"
+    return objs
+
+
+def _entry_objects(sam: tuple, frame: torch.Tensor, entry: dict, threshold: float, max_per_concept: int) -> list[dict]:
     if entry.get("text"):
         hits = dedupe(detect_text(sam, frame, entry["text"], threshold, max_per_concept))
         hits.sort(key=lambda f: box_of(f[0])[0])
         return [{"id": f"{entry['id']}.{k}", "label": entry["text"], "source": "text", "entry": entry["id"],
                  "score": info["score"], "mask": m} for k, (m, info) in enumerate(hits)]
+    if entry.get("strokes"):
+        m = paint(entry["strokes"], *frame.shape[1:3])
+        return [{"id": entry["id"], "label": "brush", "source": "brush", "entry": entry["id"], "score": None, "mask": m}] if m.any() else []
     m = detect_points(sam, frame, entry["points"], threshold)
     if int(m.sum()) < 16:
         return []
@@ -207,7 +250,7 @@ def session_for(sam: tuple, frame: torch.Tensor, spec: dict) -> tuple[str, dict]
         return sid, _SESSIONS[sid]
     objs = auto_objects(sam, frame, split_concepts(spec["concepts"]), spec["threshold"], spec["max_per_concept"], spec["min_area"])
     # the panel's /bfs/segpick/add segments with the SAM the node last ran with
-    return sid, _remember(sid, {"frame": frame.cpu(), "spec": spec, "auto": objs, "entries": {}, "sam": sam})
+    return sid, _remember(sid, {"frame": frame.cpu(), "image_key": image_key(frame), "spec": spec, "auto": objs, "entries": {}, "sam": sam})
 
 
 def ensure_entry(sess: dict, entry: dict) -> list[dict]:
@@ -224,6 +267,8 @@ def ensure_entry(sess: dict, entry: dict) -> list[dict]:
 def all_objects(sess: dict, state: dict) -> list[dict]:
     objs = list(sess["auto"])
     for e in state["added"]:
+        if e.get("strokes") and e["image"] and e["image"] != sess["image_key"]:
+            continue                                   # painted on another image
         objs += ensure_entry(sess, e)
     return objs
 
@@ -257,7 +302,7 @@ def panel_object(o: dict, size: tuple[int, int], h: int, w: int) -> dict:
     if "_file" not in o:
         o["_file"] = _save(rgba, f"m_{o['id']}")
     return {"id": o["id"], "label": o["label"], "source": o["source"], "entry": o.get("entry"), "score": o["score"],
-            "area": round(float(o["mask"].float().mean()), 5), "box": [round(x / w, 4), round(y / h, 4), round(bw / w, 4), round(bh / h, 4)],
+            "remove": bool(o.get("remove")), "area": round(float(o["mask"].float().mean()), 5), "box": [round(x / w, 4), round(y / h, 4), round(bw / w, 4), round(bh / h, 4)],
             "mask": o["_file"]}
 
 
@@ -268,7 +313,7 @@ def panel_data(sid: str, sess: dict, objects: list[dict]) -> dict:
     if "_image" not in sess:
         rgb = (frame[0, ..., :3].clamp(0, 1) * 255).byte().numpy()
         sess["_image"] = _save(Image.fromarray(rgb).resize(size, Image.LANCZOS), "img")
-    return {"session": sid, "width": int(w), "height": int(h), "image": sess["_image"],
+    return {"session": sid, "image_key": sess["image_key"], "width": int(w), "height": int(h), "image": sess["_image"],
             "objects": [panel_object(o, size, h, w) for o in objects]}
 
 
@@ -298,7 +343,7 @@ def overlay(frame: torch.Tensor, objects: list[dict], selected: set[str]) -> tor
 # ---------------------------------------------------------------------------------------------------------------- node
 
 class BFSSegmentPicker:
-    DESCRIPTION = __doc__.split("\n\n")[0] + " Click objects on the canvas to select them; add missed ones by text or points."
+    DESCRIPTION = __doc__.split("\n\n")[0] + " Click objects on the canvas to select them; add missed ones by text, points or the brush."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -320,7 +365,7 @@ class BFSSegmentPicker:
 
     RETURN_TYPES = ("MASK", "MASK", "IMAGE", "IMAGE", "STRING")
     RETURN_NAMES = ("mask", "masks", "marked", "overlay", "objects")
-    OUTPUT_TOOLTIPS = ("Union of the selected objects (one mask).", "One mask per selected object, in selection order.",
+    OUTPUT_TOOLTIPS = ("Union of the selected objects, minus the selected remove / eraser ones (one mask).", "One mask per selected object (remove ones already cut out), in selection order.",
                        "The image with the selection tinted (mark_color, mark_opacity).", "Every object found, numbered; the selection stronger.",
                        "JSON: size, selected ids and every object's id, label, score, box (relative x, y, w, h) and area.")
     FUNCTION = "pick"
@@ -337,7 +382,9 @@ class BFSSegmentPicker:
         objects = all_objects(sess, state)
         by_id = {o["id"]: o for o in objects}
         chosen = [by_id[i] for i in state["selected"] if i in by_id]
-        mask, masks = compose([o["mask"] for o in chosen], h, w)
+        cut = [o["mask"] for o in chosen if o.get("remove")]
+        cut = torch.stack(cut).any(0) if cut else torch.zeros(h, w, dtype=torch.bool)
+        mask, masks = compose([o["mask"] & ~cut for o in chosen if not o.get("remove")], h, w)
         marked = tint(frame, mask, parse_color(mark_color), mark_opacity)
         info = {"width": int(w), "height": int(h), "selected": [o["id"] for o in chosen],
                 "objects": [{k: v for k, v in panel_object(o, _preview_size(h, w), h, w).items() if k != "mask"} for o in objects]}
@@ -363,7 +410,7 @@ def _routes():
             return web.json_response({"error": "This image is no longer in memory: run the node once, then add again."}, status=404)
         state = parse_state(json.dumps({"added": [body.get("entry") or {}]}))
         if not state["added"]:
-            return web.json_response({"error": "Give a text prompt or at least one keep point."}, status=400)
+            return web.json_response({"error": "Give a text prompt, at least one keep point or a brush stroke."}, status=400)
         try:
             objs = ensure_entry(sess, state["added"][0])
         except Exception as e:  # noqa: BLE001 - shown in the panel

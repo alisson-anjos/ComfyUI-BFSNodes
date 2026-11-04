@@ -144,6 +144,36 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(self.calls[-1], ("text", "cat"))
         self.assertEqual(json.loads(info)["selected"], ["p2"])   # "cat" found nothing, so t1.0 is gone
 
+    def test_brush_is_dropped_on_another_image(self):
+        key = SP.image_key(self.frame)
+        sel = {"selected": ["a1", "b1"], "added": [{"id": "b1", "image": key, "strokes": [{"r": .05, "pts": [[.5, .5]]}]}]}
+        out = self.run_node(sel)
+        self.assertEqual(out["ui"]["bfs_segpick"][0]["image_key"], key)
+        self.assertEqual(json.loads(out["result"][4])["selected"], ["a1", "b1"])
+        self.frame = torch.rand(1, 20, 40, 3)                  # another image: the strokes no longer apply
+        mask, _, _, _, info = self.run_node(sel)["result"]
+        self.assertEqual(json.loads(info)["selected"], ["a1"])
+        self.assertEqual(float(mask[0, 10, 20]), 0.)
+
+    def test_remove_entries_cut_the_selection(self):
+        key = SP.image_key(self.frame)
+        sel = {"selected": ["a1", "e1", "r2"], "added": [
+            {"id": "e1", "image": key, "remove": True, "strokes": [{"r": .05, "pts": [[.175, .5]]}]},
+            {"id": "r2", "remove": True, "points": [{"x": .4, "y": .1, "label": 1}]}]}
+        out = self.run_node(sel)
+        mask, masks, _, _, info = out["result"]
+        self.assertEqual(float(mask[0, 10, 7]), 0.)              # erased out of a1
+        self.assertEqual(float(mask[0, 10, 3]), 1.)              # the rest of a1 stays
+        self.assertEqual(tuple(masks.shape), (1, 20, 40))       # remove entries are not masks of their own
+        self.assertEqual(float(masks[0, 10, 7]), 0.)
+        self.assertEqual(json.loads(info)["selected"], ["a1", "e1", "r2"])
+        panel = {o["id"]: o for o in out["ui"]["bfs_segpick"][0]["objects"]}
+        self.assertEqual((panel["e1"]["label"], panel["e1"]["remove"]), ("eraser", True))
+        self.assertEqual((panel["r2"]["label"], panel["r2"]["remove"]), ("remove", True))
+        self.assertFalse(panel["a1"]["remove"])
+        sel["selected"] = ["a1", "r2"]                           # unselecting the eraser gives a1 back whole
+        self.assertEqual(float(self.run_node(sel)["result"][0][0, 10, 7]), 1.)
+
     def test_unknown_ids_are_ignored(self):
         mask, masks, *_ = self.run_node({"selected": ["a9", "t5.0"]})["result"]
         self.assertEqual(float(mask.sum()), 0.)
@@ -159,6 +189,28 @@ class SessionTest(unittest.TestCase):
         self.run_node({}, concepts="person")
         self.run_node({}, concepts="person, dog")
         self.assertEqual(self.calls, [("text", "person"), ("text", "person"), ("text", "dog")])
+
+
+class BrushTest(unittest.TestCase):
+    def test_state_keeps_strokes(self):
+        s = SP.parse_state(json.dumps({"added": [{"id": "b1", "strokes": [{"r": .1, "pts": [[.2, .5], [.8, .5]]}]},
+                                                 {"id": "b2", "strokes": [{"r": .1, "pts": []}]}]}))
+        self.assertEqual(s["added"], [{"id": "b1", "image": "", "strokes": [{"r": .1, "pts": [[.2, .5], [.8, .5]]}]}])
+        self.assertNotEqual(SP.entry_key(s["added"][0]), SP.entry_key({"id": "b1", "strokes": [{"r": .2, "pts": [[.2, .5]]}]}))
+        r = SP.parse_state(json.dumps({"added": [{"id": "r1", "remove": True, "points": [{"x": .5, "y": .5, "label": 1}]},
+                                                 {"id": "p2", "remove": False, "points": [{"x": .5, "y": .5, "label": 1}]}]}))
+        self.assertEqual([e.get("remove") for e in r["added"]], [True, None])
+
+    def test_paint_covers_the_stroke_only(self):
+        m = SP.paint([{"r": .1, "pts": [[.2, .5], [.8, .5]]}], 50, 100)
+        self.assertTrue(m[25, 20] and m[25, 50] and m[25, 80])
+        self.assertFalse(m[5, 50] or m[25, 5] or m[25, 95])
+
+    def test_brush_entry_needs_no_sam(self):
+        frame = torch.zeros(1, 50, 100, 3)
+        objs = SP.entry_objects(None, frame, {"id": "b3", "strokes": [{"r": .05, "pts": [[.5, .5]]}]}, .4, 8)
+        self.assertEqual([(o["id"], o["source"]) for o in objs], [("b3", "brush")])
+        self.assertTrue(objs[0]["mask"][25, 50])
 
 
 if __name__ == "__main__":
