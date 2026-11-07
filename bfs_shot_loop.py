@@ -1685,7 +1685,16 @@ async def _off_loop(fn):
     """Run slow work in a thread so the server keeps answering (and the panel gets progress events)."""
     import asyncio
     _outside_prompt()
-    return await asyncio.get_running_loop().run_in_executor(None, fn)
+    return await asyncio.get_running_loop().run_in_executor(None, lambda: _like_a_node(fn))
+
+
+def _like_a_node(fn):
+    """Run a panel button's model work under torch.inference_mode(), as ComfyUI runs every node (execution.py). After
+    the workflow ran once, the VLM and SAM keep tensors made in inference mode; using them outside it raises
+    "Inference tensors do not track version counter" (issue #14)."""
+    import torch
+    with torch.inference_mode():
+        return fn()
 
 
 def _outside_prompt() -> None:
@@ -5850,10 +5859,10 @@ try:
             preview_color = (mask_override or {}).get("preview_color") or (
                 seg.get("color_guide_color") if seg.get("color_guide") else "#ff283c")
             out = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
+                None, lambda: _like_a_node(lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
                                            int(body.get("count", 6)),
                                            preview_color,
-                                           seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55))
+                                           seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55)))
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         return web.json_response(out)
@@ -5878,8 +5887,8 @@ try:
             import asyncio
             _outside_prompt()
             out = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg), start=s["start"], end=s["end"])
-                               for s in pick])
+                None, lambda: _like_a_node(lambda: [dict(vlm_shot(clip, path, a, s["start"], s["end"], cfg),
+                                                         start=s["start"], end=s["end"]) for s in pick]))
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         return web.json_response({"segs": out})
