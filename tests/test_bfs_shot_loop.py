@@ -1759,3 +1759,19 @@ class PromptReferenceContractTest(unittest.TestCase):
                     ["fox wearing blue pants", "city street"], "Use Picture 2 for the setting", {},
                     style="captions", source_facts="A dancer is moving in a street.")
         self.assertEqual(generator.call_count, 2)
+
+
+class PanelInferenceModeTest(unittest.TestCase):
+    """Issue #14: panel buttons reuse models a workflow run left with inference tensors; they must run like a node."""
+
+    def test_panel_work_runs_in_inference_mode(self):
+        import asyncio
+        with torch.inference_mode():
+            cache = torch.zeros(3)   # e.g. a VLM buffer created while the workflow ran
+
+        def work():
+            self.assertTrue(torch.is_inference_mode_enabled())
+            cache.add_(1)
+            return cache.sum().item()
+
+        self.assertEqual(asyncio.run(SL._off_loop(work)), 3.0)
