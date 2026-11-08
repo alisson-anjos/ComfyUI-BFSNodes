@@ -2,6 +2,11 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.119.6] - 2026-11-09
+
+### Fixed
+- **BFS Shot H3 Conditioning (`BFSShotH3ConditioningSimple`)**: Reset newly added number and toggle widgets when loading workflows saved with the older `use_ref_2` layout, preventing shifted values such as `blur` from being parsed as `clip_video_fps`.
+
 ## [1.119.5] - 2026-11-09
 
 ### Changed

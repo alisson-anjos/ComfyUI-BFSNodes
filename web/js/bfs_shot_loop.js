@@ -955,12 +955,20 @@ function upgradeConditioningWidgets(node, info) {
   const names = Array.isArray(v) && oldWidgetNames(node.comfyClass, v);
   if (!names) return;
   names.forEach((name, k) => { const w = node.widgets?.find(x => x.name === name); if (w && k < v.length) w.value = v[k]; });
-  // widgets the saved workflow did not have got a shifted value: back to their default (a list's first choice)
+  // widgets the saved workflow did not have got a shifted value: back to their default (a list's first choice, or the
+  // number/toggle default). Numbers matter too: clip_video_fps (added later) got 'blur' and the run failed with
+  // "The value blur for BFS Shot H3 Conditioning's clip_video_fps couldn't be converted to FLOAT".
   node.widgets?.forEach(w => {
+    if (names.includes(w.name)) return;
     const choices = w.options?.values;
-    if (!names.includes(w.name) && Array.isArray(choices) && !choices.includes(w.value)) w.value = w.options.default ?? choices[0];
+    if (Array.isArray(choices)) { if (!choices.includes(w.value)) w.value = w.options.default ?? choices[0]; return; }
+    if (w.type === "number" && (typeof w.value !== "number" || !Number.isFinite(w.value)))
+      w.value = typeof w.options?.default === "number" ? w.options.default : NUMBER_DEFAULTS[w.name] ?? w.options?.min ?? 0;
+    else if (w.type === "toggle" && typeof w.value !== "boolean") w.value = !!w.options?.default;
   });
 }
+// Defaults of the number widgets added after the saved layouts above (the frontend does not always keep a default).
+const NUMBER_DEFAULTS = { clip_video_fps: 2.0, native_guide_scale: 1.0, source_blur_strength: 1.0 };
 
 function upgradeLegacySlots(node, info) {
   const cls = node.comfyClass;
