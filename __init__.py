@@ -227,6 +227,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **SEGPICK_NODE_DISPLAY_NAME_MAPPINGS,
 }
 
+# Character swap with marked guides (Video Segment Picker -> H3 Character Swap Conditioning), keyframe planning, and
+# the loop / sweep helpers. Each module loads on its own: a missing optional dependency only skips that module.
+for _mod in ("bfs_keyframe_marks", "bfs_video_segment_picker", "bfs_h3_swap_conditioning", "bfs_keyframe_planner",
+             "bfs_frame_loop", "bfs_xy_sweep", "bfs_workflow_loop"):
+    try:
+        import importlib as _il
+        _m = _il.import_module(f".{_mod}", __package__)
+        NODE_CLASS_MAPPINGS.update(_m.NODE_CLASS_MAPPINGS)
+        NODE_DISPLAY_NAME_MAPPINGS.update(_m.NODE_DISPLAY_NAME_MAPPINGS)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[BFSNodes] {_mod} not loaded: {_e!r}")
+
 WEB_DIRECTORY = "./web/js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
