@@ -329,7 +329,7 @@ def _limb_ok(a, b, cap):
     return a is not None and b is not None and ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 <= cap
 
 
-def pick_person(people, mask, W, H):
+def pick_person(people, mask, W, H, min_inside=0.5, min_diag=0.3, exclude=()):
     """The DWPose person of this subject: most of its body/face points inside the subject's OWN mask (not the grown gray
     region, which can swallow someone in the background) and a size that matches it. None when DWPose missed the subject
     in this frame (e.g. an upside-down dancer): then no skeleton is drawn rather than somebody else's."""
@@ -339,14 +339,17 @@ def pick_person(people, mask, W, H):
         return None
     mdiag = float(np.hypot(xs.max() - xs.min(), ys.max() - ys.min())) + 1
     best, score = None, 0.0
+    excl_ids = {id(p) for p in (exclude or ())}
     for p in people or []:
+        if id(p) in excl_ids:
+            continue
         pts = [q for q in _pts(p.get("pose_keypoints_2d"), W, H) + _pts(p.get("face_keypoints_2d"), W, H) if q]
         if len(pts) < 4:
             continue
         inside = sum(1 for x, y in pts if 0 <= int(y) < H and 0 <= int(x) < W and mask[int(y), int(x)]) / len(pts)
         px, py = [q[0] for q in pts], [q[1] for q in pts]
         pdiag = float(np.hypot(max(px) - min(px), max(py) - min(py)))
-        if inside < 0.5 or pdiag < 0.3 * mdiag:
+        if inside < min_inside or pdiag < min_diag * mdiag:
             continue
         sc = inside + min(pdiag / mdiag, 1.0)
         if sc > score: best, score = p, sc
@@ -880,9 +883,10 @@ class BFSVideoSegmentPicker:
             import numpy as np
             import cv2
             st("drawing the DWPose marks", 0.75)
+            ga = float(pose_gray_opacity)
+            subj_data = {}
+            # Pass 1: compute hulls and erase all subjects to neutral gray FIRST so no subject's gray region erases another subject's skeleton
             for sj, m in per_subject.items():
-                # the convex hull of the person, grown by a generous margin, so the gray region
-                # does not reveal the original silhouette (the new body shape stays free)
                 mk = (m > 0.5).numpy().astype(np.uint8)
                 area = float(mk.sum(axis=(1, 2)).mean()) + 1
                 hull = pose_region.startswith("convex")
@@ -894,17 +898,40 @@ class BFSVideoSegmentPicker:
                     cs, _ = cv2.findContours(mk[i], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if cs:
                         cv2.fillPoly(hm_i, [cv2.convexHull(np.concatenate(cs))] if hull else cs, 1)
-                    hulls.append(torch.from_numpy(cv2.dilate(hm_i, se) > 0))
+                    region = torch.from_numpy(cv2.dilate(hm_i, se) > 0)
+                    hulls.append(region)
+                    if bool(region.any()):
+                        base[i][region] = base[i][region] * (1 - ga) + 0.5 * ga
+                subj_data[sj] = (mk, hulls)
+
+            # Pass 2: match DWPose skeletons per frame (with relaxed fallback + neighbor frame fallback) and draw all skeletons on top
+            used_per_frame = {i: [] for i in range(n)}
+            for sj, (mk, hulls) in subj_data.items():
                 col = HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)]
+                matched = [None] * n
                 for i in range(n):
                     if not bool(hulls[i].any()):
                         continue
-                    region = hulls[i]
-                    ga = float(pose_gray_opacity)                          # the original person, erased to neutral gray
-                    base[i][region] = base[i][region] * (1 - ga) + 0.5 * ga
                     fk = frames_kp[i] or {}
+                    ppl = fk.get("people")
                     tight = cv2.dilate(mk[i], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
-                    person = pick_person(fk.get("people"), tight, w, h)
+                    person = pick_person(ppl, tight, w, h, exclude=used_per_frame[i])
+                    if person is None:
+                        grow_t = cv2.dilate(mk[i], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) > 0
+                        person = pick_person(ppl, grow_t, w, h, min_inside=0.25, min_diag=0.2, exclude=used_per_frame[i])
+                    if person is not None:
+                        matched[i] = person
+                        used_per_frame[i].append(person)
+                for i in range(n):
+                    if not bool(hulls[i].any()):
+                        continue
+                    person = matched[i]
+                    if person is None:
+                        for delta in (-1, 1, -2, 2):
+                            j = i + delta
+                            if 0 <= j < n and matched[j] is not None:
+                                person = matched[j]
+                                break
                     if person is None:
                         continue
                     cv = torch.from_numpy(draw_pose(person, col, w, h)).to(base.dtype) / 255.0

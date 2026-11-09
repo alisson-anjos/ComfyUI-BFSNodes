@@ -2,6 +2,18 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.119.2] - 2026-11-09
+
+### Fixed
+- **BFS H3 Character Swap Conditioning (`BFSH3KeyframeConditioning`)**:
+  - Added runtime VRAM estimation and peak activation patching (`_patch_vram_estimate`) onto the `MiniMaxH3` model instance so ComfyUI accounts for `minimax_keyframes` (`guide_video`), `minimax_refs` (`Picture 1`–`Picture 4`), and `cross_attn` tokens when computing `minimum_memory_required`, and releases intermediate `q, k, v` and `h` buffers early in `DiTBlock` / `Attention` without modifying ComfyUI core.
+  - Cleared cached DWPose detector/pose sessions (`global_cached_dwpose`) safely in `_free_gpu()` without triggering lazy-import errors on unrelated modules in `sys.modules`.
+- **BFS Video Segment Picker (`BFSVideoSegmentPicker`)**:
+  - Separated multi-subject DWPose guide rendering into two passes (erase all subject regions to neutral gray first, then draw all subject skeletons on top) so overlapping gray regions of adjacent/hugging subjects never erase each other's skeletons.
+  - Added per-frame DWPose matching exclusion (`exclude`), relaxed overlap fallback (`min_inside=0.25`), and neighbor-frame pose fallback (`±2` frames) so closely interacting subjects do not lose their skeleton on intermediate frames.
+
+---
+
 ## [1.119.1] - 2026-11-09
 
 ### Fixed
