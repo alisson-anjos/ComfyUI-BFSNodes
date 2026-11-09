@@ -101,7 +101,8 @@ function loadMask(o, color) {
   });
 }
 
-export function Panel(io) {   // exported: BFS Video Segment Picker shows one per frame
+export function Panel(io, options = {}) {   // exported: BFS Video Segment Picker shows one per frame
+  const showEraser = options.showEraser !== false;
   const state = reactive(parseState(io.get()));
   const data = ref(null);            // {session, width, height, image, objects} from the last run
   const loaded = new Map();          // object id -> loadMask result (not reactive: canvases and big arrays)
@@ -329,8 +330,8 @@ export function Panel(io) {   // exported: BFS Video Segment Picker shows one pe
           title: "Paint extra area into the mark by hand (e.g. hair SAM left out)" }, "🖌 Brush"),
         h("button", { class: mode.value === "remove" ? "on" : "", disabled: !d, onClick: () => setMode("remove"),
           title: "Place points on something to cut out of the mark (SAM segments it)" }, "➖ Remove"),
-        h("button", { class: mode.value === "eraser" ? "on" : "", disabled: !d, onClick: () => setMode("eraser"),
-          title: "Paint what to cut out of the mark by hand" }, "🧽 Eraser"),
+        showEraser ? h("button", { class: mode.value === "eraser" ? "on" : "", disabled: !d, onClick: () => setMode("eraser"),
+          title: "Paint an area to subtract manually from the selected mask" }, "🧽 Eraser") : null,
         h("span", { class: "hint" }, d ? `${objs.length} objects · ${state.selected.length} selected` : ""),
         h("span", { style: "flex:1" }),
         h("button", { disabled: !objs.length, onClick: () => { state.selected = objs.map(o => o.id); save(); } }, "All"),

@@ -305,6 +305,49 @@ def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, th
                    f"{len(found)} shots re-anchored"), pts
 
 
+def molmo_relocate_legacy(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, threshold, fps=24.0, memo=None, text_override=None):
+    """Classic BFS path: describe the selected mask, track that text through the full video, seed unanchored shots."""
+    import re
+    m = anchor_mask > 0.5
+    ys, xs = torch.nonzero(m, as_tuple=True)
+    if not len(ys):
+        return {}, "no anchor mask", []
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    crop = image[anchor, y0:y1, x0:x1, :3].clone()
+    crop[~m[y0:y1, x0:x1]] = 0.5
+    key = memo and (("legacy",) + tuple(memo) + (anchor, mask_key(anchor_mask), text_override or ""))
+    reused = key in _MOLMO_CACHE if key else False
+    if reused:
+        desc, pts = _MOLMO_CACHE[key]
+        _MOLMO_CACHE.move_to_end(key)
+    else:
+        if text_override:
+            desc = text_override.strip()
+        else:
+            text = molmo.runtime.generate(DESCRIBE_SOURCE, [{"type": "image", "data": crop[None]}], 96, molmo.phase_b_max_frames,
+                                          do_sample=False, repetition_penalty=1.0)["text"]
+            desc = re.sub(r"^(the|a|an)\s+", "", " ".join(str(text).strip().strip('"').split()).rstrip(". "), flags=re.I)
+        ans = molmo.runtime.track_subjects([f"Track the {desc}."], image[..., :3], fps, max_fps=4.0)[0]
+        pts = sorted(ans.get("points", []))
+        if key:
+            _remember(_MOLMO_CACHE, key, (desc, pts), 16)
+    found = {}
+    for si, (s0, s1) in enumerate(shots):
+        if has_anchor[si]:
+            continue
+        inside = [p for p in pts if s0 <= int(round(float(p[0]) * fps)) < s1]
+        if not inside:
+            continue
+        mid = (s0 + s1 - 1) / 2.0
+        t, _o, x, y = min(inside, key=lambda p: abs(float(p[0]) * fps - mid))
+        f = min(s1 - 1, max(s0, int(round(float(t) * fps))))
+        mk = person_at(sam, image[f:f + 1, ..., :3].float().cpu(), x, y, threshold)
+        if bool(mk.any()):
+            found[f] = mk.float()
+    return found, (f"Molmo2 legacy{' (reused)' if reused else ''}: '{desc}', {len(pts)} points, {len(shots)} shots, "
+                   f"{len(found)} shots re-anchored"), pts
+
+
 # OpenPose 18-point body (COCO order of controlnet_aux DWPose) and the 70-point face (68 + 2 pupils)
 BODY_LIMBS = [(1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10), (1, 11), (11, 12), (12, 13), (1, 0),
               (0, 14), (14, 16), (0, 15), (15, 17)]
@@ -457,6 +500,7 @@ def grow_masks(masks, rel):
 
 from collections import OrderedDict
 _TRACK_CACHE = OrderedDict()   # (video, subject, its picks, cuts, options) -> (masks, report), most recent last
+_LAST_TRACK_CACHE = OrderedDict()  # (video, subject) -> last completed propagated masks/report
 
 
 def video_key(image):
@@ -587,7 +631,7 @@ class BFSVideoSegmentPicker:
             "pose_keypoint": ("POSE_KEYPOINT", {"lazy": True, "tooltip": "Optional: DWPose Estimator keypoints of the same frames (body + hands + face), "
                                                            "for mark_style 'openpose + face'."}),
             "molmo_clip": ("CLIP", {"lazy": True, "tooltip": "Optional: Molmo2 as H3 encoder. It sees the whole video, finds the picked person again after "
-                                               "camera cuts (describe -> track) and SAM 3.1 segments them there from Molmo's point."}),
+                                               "camera cuts and helps recover missed masks. In the default Molmo2 (classic) mode it describes the selected person, tracks that description through the video, and uses its points to guide SAM 3.1."}),
             "mark_style": (MARK_STYLES, {"default": MARK_STYLES[0],
                            "tooltip": "How each subject is drawn in the hybrid output, always in its color: the normal map, the DWPose "
                                       "skeleton with the face, or texture-free alternatives that need no MoGe (flat, blur, pixelate, gray "
@@ -613,8 +657,12 @@ class BFSVideoSegmentPicker:
                                              "result may then copy."}),
             "max_subjects": (["auto", "1", "2", "3"], {"default": "auto",
                              "tooltip": "Limit active subjects: 'auto' automatically detects connected picture inputs in downstream H3 conditioning (ignoring extra subjects like green if only 2 pictures are connected), or force 1, 2, or 3."}),
-            "molmo_descriptions": ("STRING", {"multiline": True, "default": "",
-                                   "tooltip": "Optional explicit visual description per subject for Molmo2 tracking (line 1 = Subject 1, line 2 = Subject 2, line 3 = Subject 3). When provided, Molmo2 tracks using these exact text descriptions instead of guessing from crops, avoiding tracking errors."}),
+            "propagate_scope": (["all frames", "from first selected frame onward", "only this frame", "from active frame onward", "fill only empty masks"], {"default": "fill only empty masks",
+                             "tooltip": "Fill only empty masks keeps every existing non-empty frame unchanged and fills only frames whose mask is empty. Only this frame replaces one mask; from active frame onward recalculates from the open frame and preserves earlier results; all frames recomputes the clip."}),
+            "propagation_method": (["Molmo2 (classic)", "SAM 3 (current)"], {"default": "Molmo2 (classic)",
+                             "tooltip": "Classic uses Molmo2 to describe the selected person, track it through the full video, and re-anchor weak or lost masks. SAM 3 (current) uses mask tracking with Molmo2-assisted recovery."}),
+            "molmo_descriptions": ("STRING", {"multiline": False, "default": "",
+                                   "tooltip": "Optional tracking description for subject 1. Leave blank to let Molmo2 describe the person you selected automatically. This only overrides the text query; the selected mask remains the visual anchor."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
@@ -631,12 +679,13 @@ class BFSVideoSegmentPicker:
              selection, track=True, strip_frames=16, normals=None, normals_convention="normal_directx", hybrid_base=None, subject=None,
              mark_style=MARK_STYLES[0], molmo_clip=None, pose_keypoint=None,
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
-             pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", unique_id=None, prompt=None, **kw):
+             pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
+             propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
                               molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
-                              max_subjects, molmo_descriptions, prompt)
+                              max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt)
         finally:
             self._free(sam3_model, free_after)
 
@@ -681,7 +730,7 @@ class BFSVideoSegmentPicker:
             else:
                 mm.unload_model_and_clones(sam3_model)
             if "caches" in mode:
-                sp._SESSIONS.clear(); _TRACK_CACHE.clear(); _SHOT_CACHE.clear(); _MOLMO_CACHE.clear()
+                sp._SESSIONS.clear(); _TRACK_CACHE.clear(); _LAST_TRACK_CACHE.clear(); _SHOT_CACHE.clear(); _MOLMO_CACHE.clear()
             gc.collect()
             mm.soft_empty_cache(True)
             print(f"[BFS Video Segment Picker] memory freed ({mode})", flush=True)
@@ -691,7 +740,8 @@ class BFSVideoSegmentPicker:
     def _pick(self, image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style, molmo_clip,
               pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
-              max_subjects="auto", molmo_descriptions="", prompt=None):
+              max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
+              propagation_method="Molmo2 (classic)", prompt=None):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -705,9 +755,12 @@ class BFSVideoSegmentPicker:
                 "max_per_concept": int(max_per_concept), "min_area": round(float(min_area), 5)}
         states = parse_frames(selection)
         try:
-            segment_only = bool(json.loads(selection or "{}").get("segment_only"))
+            selection_meta = json.loads(selection or "{}")
+            segment_only = bool(selection_meta.get("segment_only"))
+            active_frame = int(selection_meta.get("active_frame", -1))
         except Exception:
             segment_only = False
+            active_frame = -1
         if segment_only:
             st("segment only (picking): no tracking, no Molmo2 - press Propagate to track", None, log=True)
         user_descs = [l.strip().strip('. ') for l in str(molmo_descriptions or '').splitlines()]
@@ -754,8 +807,13 @@ class BFSVideoSegmentPicker:
         vkey = video_key(image)
         for sj in subjects:
             mine = {k: v[str(sj)] for k, v in sorted(states.items()) if v.get(str(sj))}   # only this subject's picks
-            ckey = ("v2", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track), molmo_clip is not None, float(threshold))
-            hit = _TRACK_CACHE.get(ckey)
+            previous = _LAST_TRACK_CACHE.get((vkey, sj))
+            ckey = ("v4", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track), molmo_clip is not None, float(threshold), propagate_scope, propagation_method, active_frame)
+            if (not segment_only and propagate_scope not in ("all frames", "fill only empty masks") and previous is not None
+                    and len(previous) > 2 and previous[2] == mine):
+                per_subject[sj], report_s[sj] = previous[0].clone(), [dict(r) for r in previous[1]]
+                continue
+            hit = None if propagate_scope == "fill only empty masks" else _TRACK_CACHE.get(ckey)
             if hit is not None:   # same video, same picks for this subject: reuse its masks (style / margin changes are instant)
                 st(f"subject {sj}: masks reused from the last run (same video and picks)", 0.3 + 0.4 * subjects.index(sj) / len(subjects), log=True)
                 per_subject[sj], report_s[sj] = hit[0].clone(), [dict(r) for r in hit[1]]
@@ -763,19 +821,43 @@ class BFSVideoSegmentPicker:
                 continue
             anchors = [i for i in strip if bool(own[sj][i].any())]
             user_anchors = list(anchors)
-            first_pick = user_anchors[0] if user_anchors else 0
+            fix_frame = active_frame if 0 <= active_frame < n else (user_anchors[-1] if user_anchors else 0)
+            first_pick = (fix_frame if propagate_scope == "from active frame onward" else
+                          (user_anchors[0] if user_anchors else 0))
+            if propagate_scope == "from active frame onward":
+                anchors = [a for a in anchors if a >= fix_frame]
+                if not anchors and previous is not None:
+                    per_subject[sj], report_s[sj] = previous[0].clone(), [dict(r) for r in previous[1]]
+                    continue
             prev_strip = max([s for s in strip if s < first_pick], default=0)
-            min_valid_frame = 0 if first_pick == 0 else prev_strip
+            min_valid_frame = (first_pick if propagate_scope in ("from first selected frame onward", "from active frame onward")
+                               else (0 if first_pick == 0 else prev_strip))
             if segment_only:   # picking only: the picked frames' masks (the last propagated masks are kept by the cache)
-                m = torch.zeros(n, h, w)
-                for i in anchors: m[i] = own[sj][i]
+                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w)
+                rp_prev = [dict(r) for r in previous[1]] if previous is not None else [
+                    {"frame": i, "source": "empty"} for i in range(n)]
+                for i in user_anchors:
+                    m[i] = own[sj][i]
+                    rp_prev[i] = {"frame": i, "source": "picked (pending propagate)"}
                 per_subject[sj] = m
-                report_s[sj] = [{"frame": i, "source": "picked" if i in anchors else "not tracked yet (Propagate)"} for i in range(n)]
+                report_s[sj] = rp_prev
                 continue
             m = torch.zeros(n, h, w)
             for i in anchors:
                 m[i] = own[sj][i]
             rep = [{"frame": i, "source": "picked" if i in anchors else "empty"} for i in range(n)]
+            if propagate_scope == "only this frame":
+                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w)
+                rep = [dict(r) for r in previous[1]] if previous is not None else [
+                    {"frame": i, "source": "empty"} for i in range(n)]
+                if 0 <= fix_frame < n and bool(own[sj].get(fix_frame, torch.zeros(h, w)).any()):
+                    m[fix_frame] = own[sj][fix_frame]
+                    rep[fix_frame] = {"frame": fix_frame, "source": "picked (frame fix)"}
+                per_subject[sj] = m; report_s[sj] = rep
+                _TRACK_CACHE[ckey] = (m.clone(), [dict(r) for r in rep])
+                _LAST_TRACK_CACHE[(vkey, sj)] = (m.clone(), [dict(r) for r in rep], mine)
+                _LAST_TRACK_CACHE.move_to_end((vkey, sj))
+                continue
             if anchors and track and n > 1:
                 def claimed_at(f):
                     out_c = [per_subject[ok][f] for ok in per_subject if ok != sj and bool((per_subject[ok][f] > 0.5).any())]
@@ -796,11 +878,19 @@ class BFSVideoSegmentPicker:
                     desc_override = user_descs[sj - 1] if 0 <= sj - 1 < len(user_descs) and user_descs[sj - 1] else None
                     if desc_override:
                         st(f"Molmo2 subject {sj}: using explicit text description '{desc_override}'", None, log=True)
-                    extra, note, pts = molmo_relocate(
-                        molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
-                        shots, has, float(threshold), memo=(vkey, sj, float(threshold), desc_override or ""),
-                        claimed_by_frame=claimed_map, text_override=desc_override
-                    )
+                    relocate = molmo_relocate_legacy if propagation_method == "Molmo2 (classic)" else molmo_relocate
+                    if propagation_method == "Molmo2 (classic)":
+                        extra, note, pts = relocate(
+                            molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
+                            shots, has, float(threshold), memo=(vkey, sj, float(threshold), desc_override or ""),
+                            text_override=desc_override
+                        )
+                    else:
+                        extra, note, pts = relocate(
+                            molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
+                            shots, has, float(threshold), memo=(vkey, sj, float(threshold), desc_override or ""),
+                            claimed_by_frame=claimed_map, text_override=desc_override
+                        )
                     note += f" ({time.time() - t0:.0f}s)"
                     st(f"subject {sj}: {note}", None, log=True)
                     for f, mk in extra.items():
@@ -816,7 +906,7 @@ class BFSVideoSegmentPicker:
                             continue
                         sa = [a for a in anchors if s0 <= a < s1]
                         skey = ("v2", vkey, sj, s0, s1, min_valid_frame, tuple((a, mask_key(own[sj][a])) for a in sa), float(threshold))
-                        if skey in _SHOT_CACHE:   # same anchors in this shot as a previous run: its tracking is the same
+                        if skey in _SHOT_CACHE and propagate_scope != "fill only empty masks":   # fill mode retries shots with empty masks instead of reusing a failed track
                             cm, cr = _SHOT_CACHE[skey]
                             _SHOT_CACHE.move_to_end(skey)
                             for i in range(s0, s1):
@@ -871,7 +961,40 @@ class BFSVideoSegmentPicker:
                     return out, rp
 
                 out, rp = track_shots(anchors)
-                if pts:   # second pass: stretches after first_pick where the SAM mask is missing OR misses Molmo's point
+                if pts and propagation_method == "Molmo2 (classic)":
+                    # Classic behavior: Molmo points audit the full SAM track; two nearby misses indicate a lost stretch.
+                    off = set()
+                    for t_, _o, x_, y_ in pts:
+                        f_ = min(n - 1, max(0, int(round(float(t_) * 24))))
+                        if f_ < min_valid_frame:
+                            continue
+                        px_, py_ = min(w - 1, int(x_ * w)), min(h - 1, int(y_ * h))
+                        mk_ = out[f_] > 0.5
+                        if bool(mk_.any()) and not bool(mk_[max(0, py_ - 6):py_ + 7, max(0, px_ - 6):px_ + 7].any()):
+                            off.add(f_)
+                    offs = sorted(off); wrong = set()
+                    for a_, b_ in zip(offs, offs[1:]):
+                        if b_ - a_ <= 8: wrong.update(range(a_, b_ + 1))
+                    lost = sorted({i for i in range(min_valid_frame, n) if not bool(out[i].any())} | wrong)
+                    runs, cur = [], []
+                    for i in lost:
+                        if cur and i != cur[-1] + 1: runs.append(cur); cur = []
+                        cur.append(i)
+                    if cur: runs.append(cur)
+                    added = 0
+                    for run in [r for r in runs if len(r) >= 6]:
+                        inside = [q for q in pts if run[0] <= int(round(float(q[0]) * 24)) <= run[-1]]
+                        if not inside: continue
+                        mid = (run[0] + run[-1]) / 2.0
+                        t, _o, x, y = min(inside, key=lambda q: abs(float(q[0]) * 24 - mid))
+                        f = min(run[-1], max(run[0], int(round(float(t) * 24))))
+                        mk = person_at((sam3_model, sam3_clip), image[f:f + 1, ..., :3].float().cpu(), x, y, float(threshold))
+                        if bool(mk.any()):
+                            own[sj][f] = mk.float(); anchors = sorted(set(anchors) | {f}); added += 1
+                    if added:
+                        st(f"subject {sj}: {added} lost stretches re-anchored by Molmo2 (classic mode), tracking again", None, log=True)
+                        out, rp = track_shots(anchors)
+                if pts and propagation_method != "Molmo2 (classic)":   # current mode recovery: verify Molmo points against the selected person's appearance
                     ref_crop = person_crop(image[first_pick, ..., :3], own[sj][first_pick])
                     off = set()
                     for t_, _o, x_, y_ in pts:
@@ -922,8 +1045,22 @@ class BFSVideoSegmentPicker:
                                 out[i], rp[i] = prev_out[i], prev_rp[i]
                 for i in range(n):
                     m[i] = out[i]; rep[i] = {"frame": i, "source": rp[i]}
+            if propagate_scope == "from active frame onward" and previous is not None:
+                m[:fix_frame] = previous[0][:fix_frame]
+                rep[:fix_frame] = [dict(r) for r in previous[1][:fix_frame]]
+            if propagate_scope == "fill only empty masks" and previous is not None:
+                keep = previous[0] > 0.5
+                m[keep] = previous[0][keep]
+                for i in range(n):
+                    if bool(keep[i].any()):
+                        rep[i] = dict(previous[1][i])
             per_subject[sj] = m; report_s[sj] = rep
             _TRACK_CACHE[ckey] = (m.clone(), [dict(r) for r in rep])
+            if not segment_only:
+                _LAST_TRACK_CACHE[(vkey, sj)] = (m.clone(), [dict(r) for r in rep], mine)
+                _LAST_TRACK_CACHE.move_to_end((vkey, sj))
+                while len(_LAST_TRACK_CACHE) > 24:
+                    _LAST_TRACK_CACHE.popitem(last=False)
             while len(_TRACK_CACHE) > 24:
                 _TRACK_CACHE.popitem(last=False)
         masks = torch.stack(list(per_subject.values())).amax(0)

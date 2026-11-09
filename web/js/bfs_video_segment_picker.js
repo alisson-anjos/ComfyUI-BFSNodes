@@ -122,7 +122,12 @@ app.registerExtension({
       widget.serializeValue = () => widget.value;
     }
     const frames = reactive({ v: parse(widget?.value) });
-    const save = () => { if (widget) widget.value = JSON.stringify({ frames: frames.v }); node.graph?.setDirtyCanvas(true); };
+    let focusFrame = 0;
+    const scopeWidget = node.widgets?.find(w => w.name === "propagate_scope");
+    const validScopes = ["all frames", "only this frame", "from active frame onward", "from first selected frame onward", "fill only empty masks"];
+    const scope = ref(validScopes.includes(scopeWidget?.value) ? scopeWidget.value : "fill only empty masks");
+    if (scopeWidget) scopeWidget.value = scope.value;
+    const save = () => { if (widget) widget.value = JSON.stringify({ frames: frames.v, active_frame: focusFrame }); node.graph?.setDirtyCanvas(true); };
     const hasPicks = k => Object.values(frames.v).some(f => f?.[k]?.selected?.length);
     const clearSubject = k => {
       let changed = false;
@@ -133,9 +138,11 @@ app.registerExtension({
         }
       }
       if (changed) {
+        scope.value = "all frames";
+        if (scopeWidget) scopeWidget.value = "all frames";
         save();
         mountPanel();
-        autoPropagate();
+        if (propagatedOnce()) propagate();
       }
     };
     const run = reactive({ data: null });          // {frames: [panel data per frame], report: [...]}
@@ -154,19 +161,21 @@ app.registerExtension({
     const mountPanel = () => {
       panelApp?.unmount(); panelHost.innerHTML = ""; handle = {};
       const i = run.data?.indices?.[active.value] ?? active.value;   // the real frame index of the strip entry
+      focusFrame = i;
       const sj = subject.value;
       const el = document.createElement("div"); el.style.cssText = "position:absolute;inset:0"; panelHost.appendChild(el);
       panelApp = createApp({ setup: () => Panel({
         node,
         get: () => JSON.stringify(frames.v[String(i)]?.[sj] || {}),
         set: v => {
+          focusFrame = i;
           const before = JSON.stringify(frames.v[String(i)]?.[sj]?.selected || []);
           try { frames.v[String(i)] = { ...(frames.v[String(i)] || {}), [sj]: JSON.parse(v) }; } catch { /* keep */ }
           save();
           if (JSON.stringify(frames.v[String(i)]?.[sj]?.selected || []) !== before) autoPropagate();
         },
         expose: o => Object.assign(handle, o),
-      }) });
+      }, { showEraser: false }) });
       panelApp.mount(el);
       const d = run.data?.frames?.[active.value];
       if (d) setTimeout(() => handle.executed?.(d), 0);
@@ -206,7 +215,7 @@ app.registerExtension({
     };
     // after the first Propagate, a pick that changes a frame's selection propagates by itself (1.5 s after the last
     // click): only the shots whose picks changed are tracked again, the rest comes from the cache
-    const auto = ref(localStorage.getItem("bfs_vsegpick_auto") !== "0");
+    const auto = ref(localStorage.getItem("bfs_vsegpick_auto") === "1");
     let autoTimer = null;
     const propagatedOnce = () => (run.data?.report || []).some(r => /tracked|lost|Molmo/.test(JSON.stringify(r)));
     const autoPropagate = () => {
@@ -219,7 +228,9 @@ app.registerExtension({
       const n = run.data?.count || 0;
       f = Math.max(0, Math.min(n - 1, Math.round(+f)));
       if (!Number.isFinite(f)) return;
+      focusFrame = f;
       if (!frames.v[String(f)]) { frames.v[String(f)] = {}; save(); }
+      else save();
       segmentOnly();
     };
     const SUBJ = { "1": "red", "2": "blue", "3": "green" };
@@ -260,10 +271,16 @@ app.registerExtension({
                 }, "✕") : null,
               ]))),
             h("span", { class: "sp" }),
-            h("label", { class: "chk", title: "After the first Propagate: picking a person on a frame propagates by itself (1.5 s after the last click)" }, [
+            h("select", { value: scope.value, title: "Choose how a new frame selection changes the propagated masks",
+              style: "max-width:190px;background:#23262c;color:#e3e6eb;border:1px solid #3a3e47;border-radius:6px;padding:4px;font:inherit",
+              onChange: e => { scope.value = e.target.value; if (scopeWidget) scopeWidget.value = e.target.value; node.graph?.setDirtyCanvas(true); } },
+              ["from active frame onward", "only this frame", "fill only empty masks", "all frames", "from first selected frame onward"].map(v => h("option", { value: v },
+                v === "from active frame onward" ? "From this frame onward" : v === "only this frame" ? "Only this frame"
+                  : v === "fill only empty masks" ? "Fill only empty masks" : v === "all frames" ? "Recompute all frames" : "From earliest selected frame"))),
+            h("label", { class: "chk", title: "After a selection changes, apply the selected fix mode automatically after 1.5 seconds" }, [
               h("input", { type: "checkbox", checked: auto.value, onChange: e => { auto.value = e.target.checked;
                 try { localStorage.setItem("bfs_vsegpick_auto", e.target.checked ? "1" : "0"); } catch { /* ignore */ } } }), "auto"]),
-            h("button", { class: "btn pri", onClick: propagate, title: "Track the picks to every frame (Molmo2 finds the person after camera cuts)" }, "↔ Propagate"),
+            h("button", { class: "btn pri", onClick: propagate, title: "Apply the selected fix mode to the current selection" }, "↔ Apply fix"),
           ]),
           live.text || busy.value ? h("div", { class: "stat" }, [
             h("span", { class: "pb" }, [h("i", { style: { width: `${Math.round(100 * (live.progress ?? 0))}%`,
@@ -287,7 +304,7 @@ app.registerExtension({
                 const [cls, mark] = status(i);
                 return h("div", { class: ["fr", i === active.value ? "on" : ""], key: i, title: run.data.report?.[i]?.source || "",
                   style: { backgroundImage: `url("${fileUrl(d.image)}")` },
-                  onClick: () => { if (active.value !== i) { active.value = i; mountPanel(); } } },
+                  onClick: () => { if (active.value !== i) { active.value = i; focusFrame = run.data.indices?.[i] ?? i; save(); mountPanel(); } } },
                   [h("span", { class: "b" }, `f${run.data.indices?.[i] ?? i}`), mark ? h("span", { class: ["s", cls] }, mark) : null,
                    h("span", { class: "dots" }, pickedSubjects(i).map(k => h("i", { style: { background: SUBJECTS[(+k - 1) % SUBJECTS.length][1] } })))]);
               }))
@@ -328,13 +345,21 @@ app.registerExtension({
       const d = output?.bfs_vsegpick?.[0];
       if (!d) return;
       run.data = d; busy.value = "";
+      const focusIndex = d.indices?.indexOf?.(focusFrame) ?? -1;
+      if (focusIndex >= 0) active.value = focusIndex;
       if (active.value >= d.frames.length) active.value = 0;
       mountPanel();
     };
     const onConfigure = node.onConfigure;
     node.onConfigure = function () {
       const r = onConfigure?.apply(this, arguments);
-      setTimeout(() => { frames.v = parse(widget?.value); mountPanel(); }, 0);
+      setTimeout(() => {
+        let saved = {};
+        try { saved = JSON.parse(widget?.value || "{}"); } catch { /* ignore */ }
+        frames.v = parse(widget?.value); focusFrame = Number.isInteger(+saved.active_frame) ? +saved.active_frame : 0;
+        if (scopeWidget?.value) scope.value = scopeWidget.value;
+        mountPanel();
+      }, 0);
       return r;
     };
     node.size = [Math.max(node.size[0], 780), Math.max(node.size[1], 1180)];
