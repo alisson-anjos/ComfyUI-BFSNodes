@@ -11,13 +11,18 @@ import { createApp, h, ref, reactive } from "./vendor/vue.esm-browser.prod.mjs";
 
 const fileUrl = f => api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}`);
 
-const SUBJECTS = [["1", "#eb2828", "red"], ["2", "#236eeb", "blue"], ["3", "#3ccd3c", "green"], ["4", "#f0d723", "yellow"]];
+const SUBJECTS = [["1", "#eb2828", "red"], ["2", "#236eeb", "blue"], ["3", "#3ccd3c", "green"]];
 function parse(text) {   // {frame: {subject: selection}}; a bare selection (older state) is subject 1
   let s = {};
   try { s = JSON.parse(text || "{}") || {}; } catch { s = {}; }
   const f = (s.frames && typeof s.frames === "object") ? s.frames : {};
   const out = {};
-  for (const [k, v] of Object.entries(f)) out[k] = (v && (v.selected || v.added)) ? { "1": v } : (v || {});
+  for (const [k, v] of Object.entries(f)) {
+    if (v && (v.selected || v.added)) out[k] = { "1": v };
+    else if (v && typeof v === "object") {
+      out[k] = Object.fromEntries(Object.entries(v).filter(([sk]) => +sk >= 1 && +sk <= SUBJECTS.length));
+    } else out[k] = {};
+  }
   return out;
 }
 
@@ -200,7 +205,7 @@ app.registerExtension({
       if (!frames.v[String(f)]) { frames.v[String(f)] = {}; save(); }
       segmentOnly();
     };
-    const SUBJ = { "1": "red", "2": "blue", "3": "green", "4": "yellow" };
+    const SUBJ = { "1": "red", "2": "blue", "3": "green" };
     const tlPos = ref(0);             // index into run.data.timeline (whole-video scrubber)
     const counts = () => {
       const r = run.data?.report || []; const n = run.data?.frames?.length || 0;
@@ -259,7 +264,7 @@ app.registerExtension({
                   style: { backgroundImage: `url("${fileUrl(d.image)}")` },
                   onClick: () => { if (active.value !== i) { active.value = i; mountPanel(); } } },
                   [h("span", { class: "b" }, `f${run.data.indices?.[i] ?? i}`), mark ? h("span", { class: ["s", cls] }, mark) : null,
-                   h("span", { class: "dots" }, pickedSubjects(i).map(k => h("i", { style: { background: SUBJECTS[(+k - 1) % 4][1] } })))]);
+                   h("span", { class: "dots" }, pickedSubjects(i).map(k => h("i", { style: { background: SUBJECTS[(+k - 1) % SUBJECTS.length][1] } })))]);
               }))
             : h("div", { class: "empty" }, "Run the node once: the frames appear here. Click a frame, then the person."),
         ]),
@@ -283,7 +288,7 @@ app.registerExtension({
               h("div", { class: "chips" }, (run.data.lost || []).length
                 ? (run.data.lost || []).slice(0, 12).map(r => h("span", { class: "c", title: "add the middle frame of this stretch to the strip",
                     onClick: () => addFrame((r.start + r.end) / 2) },
-                    [h("i", { style: { background: SUBJECTS[(+r.subject - 1) % 4]?.[1] || "#999" } }), `f${r.start}–${r.end}`]))
+                    [h("i", { style: { background: SUBJECTS[(+r.subject - 1) % SUBJECTS.length]?.[1] || "#999" } }), `f${r.start}–${r.end}`]))
                 : [h("span", { class: "okk" }, "✓ no lost stretches")]),
             ]),
           ]),

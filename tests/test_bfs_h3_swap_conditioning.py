@@ -16,7 +16,7 @@ class InputsTest(unittest.TestCase):
     def test_pictures_grouped_first(self):
         t = NODE.INPUT_TYPES()
         self.assertEqual(list(t["required"])[:7], ["clip", "vae", "guide_video", "width", "height", "length", "picture_1"])
-        self.assertEqual(list(t["optional"])[:6], ["picture_2", "picture_3", "picture_4", "model", "keyframes", "keyframe_spec"])
+        self.assertEqual(list(t["optional"])[:5], ["picture_2", "picture_3", "model", "keyframes", "keyframe_spec"])
 
     def test_outputs(self):
         self.assertEqual(len(NODE.RETURN_TYPES), len(NODE.RETURN_NAMES))
@@ -33,7 +33,7 @@ class InputsTest(unittest.TestCase):
 class PromptTest(unittest.TestCase):
     def test_guide_prompts_name_each_subject_once(self):
         for fn, word in ((SC.normals_caption, "normal map"), (SC.pose_caption, "pose skeleton")):
-            for k in range(1, 5):
+            for k in range(1, SC.MAX_PICTURES + 1):
                 p = fn(k)
                 self.assertTrue(p.startswith("character_swap:\nsubject_definitions:\n"))
                 for j in range(1, k + 1):

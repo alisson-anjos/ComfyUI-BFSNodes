@@ -4,7 +4,7 @@ Three ways to mark the subjects (`mode`):
   - "keyframe pins": the source video as an aligned guide (Add Guide at frame 0) plus one Add Guide per edited keyframe
     at its own frame index (frames of the result with the new people in place, e.g. from BFS Keyframe Planner).
   - "normal map guide": the guide video with each subject to replace drawn as its normal map in gray detail, tinted with
-    the subject's color (1 red, 2 blue, 3 green, 4 yellow = Picture 1..4).
+    the subject's color (1 red, 2 blue, 3 green = Picture 1..3).
   - "DWPose guide": the guide video with each subject erased to gray and drawn as its DWPose skeleton (body, hands and
     face, with the eyes and the mouth opening) in the subject's color.
 The marked guides come from BFS Video Segment Picker (`hybrid` output). The Pictures are native references and the
@@ -16,10 +16,10 @@ import torch
 
 GRAY = 128.0 / 255.0     # background of the keyframe_video preview
 MAX_KEYFRAMES = 8
-MAX_PICTURES = 4
+MAX_PICTURES = 3
 PINS, NORMALS, POSE = "keyframe pins", "normal map guide", "DWPose guide"
 MODES = [PINS, NORMALS, POSE]
-SUBJECT_COLORS = ["red", "blue", "green", "yellow"]
+SUBJECT_COLORS = ["red", "blue", "green"]
 
 
 def pose_caption(k):
@@ -146,6 +146,142 @@ class BFSH3KeyframeConditioning:
                 out.append((round(float(kw.get(f"time_{i}", 0.0)) * fps), kw[f"keyframe_{i}"]))
         return sorted(out, key=lambda x: x[0])
 
+    @staticmethod
+    def _free_gpu():
+        """Unload TE, VAE, and cached preprocessor models (e.g. DWPose) from GPU so MiniMaxH3 has full VRAM."""
+        try:
+            import gc
+            import sys
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            for k, mod in list(sys.modules.items()):
+                if "dwpose" not in k or mod is None:
+                    continue
+                try:
+                    dw = getattr(mod, "global_cached_dwpose", None)
+                    if dw is not None:
+                        dw.det = None
+                        dw.pose = None
+                        dw.det_filename = None
+                        dw.pose_filename = None
+                except Exception:  # noqa: BLE001
+                    pass
+            gc.collect()
+            mm.soft_empty_cache(True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[BFS H3 keyframe] could not free GPU models: {e!r}", flush=True)
+
+    @staticmethod
+    def _patch_vram_estimate(model):
+        """Ensure MiniMaxH3 accounts for guide_video/keyframes/refs in ComfyUI's VRAM estimate so it doesn't OOM."""
+        if model is None:
+            return None
+        inner = getattr(model, "model", None)
+        if inner is None:
+            return model
+        import math
+        import types
+
+        def _extra_conds_shapes(_self, **kwargs):
+            extra = 0
+            payload = kwargs.get("minimax_payload", None)
+            if hasattr(payload, "cond") and isinstance(payload.cond, dict):
+                payload = payload.cond
+            keyframes = kwargs.get("minimax_keyframes", None)
+            if keyframes is None and isinstance(payload, dict):
+                keyframes = payload.get("keyframes", None)
+            refs = kwargs.get("minimax_refs", None)
+            if refs is None and isinstance(payload, dict):
+                refs = payload.get("refs", None)
+            for item in (keyframes or []) + (refs or []):
+                if not isinstance(item, dict):
+                    continue
+                lat = item.get("latent", None)
+                if lat is not None and hasattr(lat, "shape"):
+                    extra += math.prod(lat.shape[1:])
+                aud = item.get("audio_latent", None)
+                if aud is not None and hasattr(aud, "shape"):
+                    extra += math.prod(aud.shape[1:])
+            cross_attn = kwargs.get("cross_attn", kwargs.get("c_crossattn", None))
+            if hasattr(cross_attn, "cond"):
+                cross_attn = cross_attn.cond
+            if cross_attn is not None and hasattr(cross_attn, "shape") and len(cross_attn.shape) >= 2:
+                extra += int(cross_attn.shape[1]) * 96
+            return {"minimax_cond": [1, 1, extra]} if extra > 0 else {}
+
+        cond_keys = tuple(getattr(inner, "memory_usage_factor_conds", ()) or ())
+        if "minimax_cond" not in cond_keys:
+            inner.memory_usage_factor_conds = cond_keys + ("minimax_cond",)
+            inner.extra_conds_shapes = types.MethodType(_extra_conds_shapes, inner)
+        if getattr(inner, "memory_usage_factor", 0.0) < 0.135:
+            inner.memory_usage_factor = 0.135
+
+        dm = getattr(inner, "diffusion_model", None)
+        if dm is not None and not getattr(dm, "_bfs_low_peak_patched", False):
+            try:
+                import comfy.ldm.minimax.model as mm_mod
+                import comfy.model_management as cmm
+                import comfy.quant_ops
+                from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+
+                def _attn_forward(self, x, rope_freqs=None, transformer_options={}):
+                    s = x.shape[0]
+                    dev = x.device
+                    q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
+                    del x
+                    v = v.view(s, self.heads, self.head_dim)
+                    if rope_freqs is not None:
+                        q = q.view(1, s, self.heads, self.head_dim)
+                        k = k.view(1, s, self.heads, self.head_dim)
+                        qw = cmm.cast_to(self.q_norm.weight, device=dev)
+                        kw = cmm.cast_to(self.k_norm.weight, device=dev)
+                        rot = rope_freqs.shape[-3] * 2
+                        if cmm.in_training:
+                            q, k = comfy.quant_ops.ck.rms_rope_split_half(
+                                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+                        else:
+                            comfy.quant_ops.ck.rms_rope_split_half_(
+                                q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
+                        del qw, kw
+                        q, k = q[0], k[0]
+                    else:
+                        q = self.q_norm(q.view(s, self.heads, self.head_dim))
+                        k = self.k_norm(k.view(s, self.heads, self.head_dim))
+                    q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+                    k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+                    v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+                    out = optimized_attention(
+                        q, k, v, self.heads, preferred_attention=self.comfy_attention,
+                        mask=None, skip_reshape=True, skip_output_reshape=True,
+                        transformer_options=transformer_options,
+                    )
+                    del q, k, v
+                    out = out.transpose(1, 2).reshape(s, self.heads * self.head_dim)
+                    return self.out_proj(out)
+
+                def _block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
+                    attention = self.attn if attention is None else attention
+                    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+                    attn_out = attention(
+                        mm_mod._mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments),
+                        rope_freqs=rope_freqs, transformer_options=transformer_options,
+                    )
+                    del shift_msa, scale_msa
+                    x = mm_mod._mod_gate(x, gate_msa, attn_out, mod_segments)
+                    del gate_msa, attn_out
+                    mlp_out = self.mlp(mm_mod._mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments))
+                    del shift_mlp, scale_mlp
+                    return mm_mod._mod_gate(x, gate_mlp, mlp_out, mod_segments)
+
+                for blk in getattr(dm, "blocks", ()):
+                    blk.forward = types.MethodType(_block_forward, blk)
+                    if hasattr(blk, "attn"):
+                        blk.attn.forward = types.MethodType(_attn_forward, blk.attn)
+                dm._bfs_low_peak_patched = True
+            except Exception as e:  # noqa: BLE001
+                print(f"[BFS H3 keyframe] could not patch block peak VRAM: {e!r}", flush=True)
+        return model
+
     def encode(self, clip, vae, guide_video, width, height, length, picture_1, mode=PINS, keyframe_until=0.7,
                keyframe_until_drops="keyframes only", prompt_override="", model=None, **kw):
         if mode not in MODES:
@@ -172,12 +308,16 @@ class BFSH3KeyframeConditioning:
         times = [f / 24.0 for f in placed]
         prompt = prompt_override.strip() or pins_caption(len(pictures), times)
         print("[BFS H3 keyframe] prompt:\n" + prompt, flush=True)
-        positive, latent = MiniMaxH3ReferenceToVideo.execute(
-            clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
-            ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
-        positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
-        for f, frame in zip(placed, frames):
-            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae, image=frame[None]).args[0]
+        try:
+            positive, latent = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
+                ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
+            self._free_gpu()
+            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+            for f, frame in zip(placed, frames):
+                positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae, image=frame[None]).args[0]
+        finally:
+            self._free_gpu()
         print(f"[BFS H3 keyframe] {mode}: {len(placed)} keyframes at frames {placed}; {len(pictures)} Pictures", flush=True)
         return (self._until(model, keyframe_until, keyframe_until_drops.startswith("keyframes")), positive, latent, prompt, video,
                 pictures)
@@ -190,12 +330,16 @@ class BFSH3KeyframeConditioning:
             raise ValueError(f"guide has {len(guide_video)} frames, length is {length}: connect Prepare's length.")
         prompt = prompt_override.strip() or (pose_caption if pose else normals_caption)(len(pictures))
         print("[BFS H3 keyframe] guide prompt:\n" + prompt, flush=True)
-        positive, latent = MiniMaxH3ReferenceToVideo.execute(
-            clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
-            ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
-        positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+        try:
+            positive, latent = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
+                ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
+            self._free_gpu()
+            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+        finally:
+            self._free_gpu()
         # the guide carries the background: it stays in every step (keyframe_until does not apply)
-        return model, positive, latent, prompt, guide_video, pictures
+        return self._patch_vram_estimate(model), positive, latent, prompt, guide_video, pictures
 
     @staticmethod
     def _until(model, keyframe_until, keep_source=False):
@@ -203,6 +347,7 @@ class BFSH3KeyframeConditioning:
         keep_source: drop only the keyframes; the source video (the first Add Guide, see encode) stays."""
         if model is None:
             return None
+        BFSH3KeyframeConditioning._patch_vram_estimate(model)
         import comfy.patcher_extension
         until = float(keyframe_until)
 

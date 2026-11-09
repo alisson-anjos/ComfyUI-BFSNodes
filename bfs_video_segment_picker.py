@@ -21,7 +21,7 @@ from .bfs_keyframe_marks import BFSTrackFromFrame
 
 MAX_FRAMES = 32           # frames segmented for the panel; a longer video shows an evenly spread strip
 # the hybrid guide: subject k drawn without its texture (e.g. its normal map in gray detail), tinted with its color
-HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60), (240, 215, 35)]   # RGB: red, blue, green, yellow
+HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60)]   # RGB: red, blue, green
 HYBRID_TINT = 0.75
 
 
@@ -82,9 +82,14 @@ def mark_fill(style, frame, normal_rgb, mask, color, alpha=HYBRID_TINT):
     return (detail * c * alpha + detail * (1 - alpha)).clamp(0, 1)
 
 
-DESCRIBE_SOURCE = ('Describe the person in this image as ONE short English noun phrase of 6 to 16 words that would '
-                   'identify them in a video: apparent gender and age, hair, and the colors and types of their clothes. '
+DESCRIBE_SOURCE = ('Describe the foreground person or costumed character in this image as ONE short English noun '
+                   'phrase of 6 to 18 words that uniquely identifies their visual appearance in a video: outfit or '
+                   'costume colors and pieces, mask/helmet/glasses if any, hair, and build. '
                    'No leading article, no background, no pose, no full sentence.')
+VERIFY_SAME_PERSON = ('Picture 1 shows the reference person selected by the user. '
+                      'Picture 2 shows a candidate person from another frame of the video. '
+                      'Do Picture 1 and Picture 2 show the exact same individual wearing the exact same outfit or '
+                      'costume? Answer with a single word: yes or no.')
 
 
 def detect_cuts(image, thresh=0.22):
@@ -143,45 +148,157 @@ def _remember(cache, key, value, cap):
         cache.popitem(last=False)
 
 
-def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, threshold, fps=24.0, memo=None):
-    """Find the subject in the shots that have no anchor yet: Molmo2 describes the picked person (masked crop), tracks the
-    description through the whole video (every shot, ~4 points/s), and in each shot without an anchor the whole person
-    under Molmo's point (SAM 3 'person' instance) becomes that shot's anchor. Returns {frame: mask}, report."""
+def person_crop(frame, mask):
+    """Crop [H,W,3] around mask > 0.5 with a small context margin and non-mask pixels dimmed toward neutral gray."""
+    m = mask > 0.5
+    ys, xs = torch.nonzero(m, as_tuple=True)
+    if not len(ys):
+        return None
+    h, w = frame.shape[:2]
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    py = max(4, int((y1 - y0) * 0.08)); px = max(4, int((x1 - x0) * 0.08))
+    y0, y1 = max(0, y0 - py), min(h, y1 + py)
+    x0, x1 = max(0, x0 - px), min(w, x1 + px)
+    crop = frame[y0:y1, x0:x1, :3].float().clone()
+    cm = m[y0:y1, x0:x1]
+    crop[~cm] = crop[~cm] * 0.25 + 0.375
+    return crop
+
+
+def highlight_person_frame(frame, mask):
+    """Full [H,W,3] frame with the picked person in full color and everything else dimmed toward neutral gray."""
+    m = mask > 0.5
+    out = frame[..., :3].float() * 0.20 + 0.40
+    out[m] = frame[..., :3].float()[m]
+    return out
+
+
+def person_color_sim(frame_a, mask_a, frame_b, mask_b):
+    """Histogram intersection similarity (0..1) of RGB + chroma inside two person masks."""
+    ma, mb = mask_a > 0.5, mask_b > 0.5
+    if int(ma.sum()) < 16 or int(mb.sum()) < 16:
+        return 0.0
+    pa = frame_a[..., :3].float()[ma].clamp(0, 1)
+    pb = frame_b[..., :3].float()[mb].clamp(0, 1)
+    sims = []
+    for c in range(3):
+        ha = torch.histc(pa[:, c], 16, 0.0, 1.0); hb = torch.histc(pb[:, c], 16, 0.0, 1.0)
+        sims.append(float(torch.minimum(ha / (ha.sum() + 1e-6), hb / (hb.sum() + 1e-6)).sum()))
+    ca = pa.max(-1).values - pa.min(-1).values
+    cb = pb.max(-1).values - pb.min(-1).values
+    ha = torch.histc(ca, 12, 0.0, 1.0); hb = torch.histc(cb, 12, 0.0, 1.0)
+    sims.append(float(torch.minimum(ha / (ha.sum() + 1e-6), hb / (hb.sum() + 1e-6)).sum()))
+    return sum(sims) / len(sims)
+
+
+def mask_overlap(mask_a, mask_b):
+    """(IoU, containment_in_smaller) between two 2D masks."""
+    a, b = mask_a > 0.5, mask_b > 0.5
+    inter = float((a & b).sum())
+    if inter <= 0:
+        return 0.0, 0.0
+    union = float((a | b).sum())
+    small = float(min(a.sum(), b.sum()))
+    return inter / max(1.0, union), inter / max(1.0, small)
+
+
+def molmo_verify_candidate(molmo, ref_crop, ref_frame, ref_mask, cand_frame, cand_mask, claimed_masks=None, memo=None):
+    """Verify a candidate re-anchor mask against the user's clicked reference person using:
+    1) non-overlap with masks already claimed by other subjects on that frame,
+    2) RGB + chroma appearance similarity, and
+    3) Molmo2 visual comparison of [Picture 1: clicked person crop, Picture 2: candidate person crop]."""
+    if not bool((cand_mask > 0.5).any()):
+        return False
+    for cm in (claimed_masks or []):
+        iou, contain = mask_overlap(cand_mask, cm)
+        if iou > 0.40 or contain > 0.55:
+            return False
+    sim = person_color_sim(ref_frame, ref_mask, cand_frame, cand_mask)
+    if sim < 0.38:
+        return False
+    if molmo is None or not hasattr(molmo, "runtime") or ref_crop is None:
+        return sim >= 0.55
+    cand_crop = person_crop(cand_frame, cand_mask)
+    if cand_crop is None:
+        return False
+    vkey = memo and ("verify_v2",) + tuple(memo) + (mask_key(ref_mask), mask_key(cand_mask))
+    if vkey and vkey in _MOLMO_CACHE:
+        ok = _MOLMO_CACHE[vkey]
+        _MOLMO_CACHE.move_to_end(vkey)
+        return bool(ok)
+    text = molmo.runtime.generate(
+        VERIFY_SAME_PERSON,
+        [{"type": "image", "data": ref_crop[None]}, {"type": "image", "data": cand_crop[None]}],
+        16, molmo.phase_b_max_frames, do_sample=False, repetition_penalty=1.0
+    )["text"]
+    ans = str(text or "").strip().lower()
+    ok = ans.startswith("yes") or ("yes" in ans.split()[:2] and "no" not in ans.split()[:2])
+    if vkey:
+        _remember(_MOLMO_CACHE, vkey, bool(ok), 64)
+    return bool(ok)
+
+
+def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, threshold, fps=24.0, memo=None, claimed_by_frame=None):
+    """Find the subject in later shots that have no anchor yet: Molmo2 describes the picked person (masked crop), tracks
+    forward from the picked frame (with the picked person visually highlighted in the first frame of the clip), and in
+    each later shot without an anchor verifies the candidate person crop against the clicked reference crop with Molmo2.
+    Returns {frame: mask}, report, pts."""
     import re
     m = anchor_mask > 0.5
     ys, xs = torch.nonzero(m, as_tuple=True)
     if not len(ys):
         return {}, "no anchor mask", []
-    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-    crop = image[anchor, y0:y1, x0:x1, :3].clone()
-    crop[~m[y0:y1, x0:x1]] = 0.5
-    key = memo and (memo + (anchor, mask_key(anchor_mask)))
+    n, h, w = image.shape[:3]
+    crop = person_crop(image[anchor, ..., :3], m)
+    cx = float(xs.float().mean()) / max(1, w) * 100.0
+    cy = float(ys.float().mean()) / max(1, h) * 100.0
+    key = memo and (("relocate_v2",) + tuple(memo) + (anchor, mask_key(anchor_mask)))
     reused = key in _MOLMO_CACHE if key else False
-    if reused:   # same first pick of this subject: the description and Molmo2's track are the same
+    if reused:   # same first pick of this subject: the description and Molmo2's forward track are the same
         desc, pts = _MOLMO_CACHE[key]
         _MOLMO_CACHE.move_to_end(key)
     else:
         text = molmo.runtime.generate(DESCRIBE_SOURCE, [{"type": "image", "data": crop[None]}], 96, molmo.phase_b_max_frames,
                                       do_sample=False, repetition_penalty=1.0)["text"]
         desc = re.sub(r"^(the|a|an)\s+", "", " ".join(str(text).strip().strip('"').split()).rstrip(". "), flags=re.I)
-        ans = molmo.runtime.track_subjects([f"Track the {desc}."], image[..., :3], fps, max_fps=4.0)[0]
-        pts = sorted(ans.get("points", []))
+        if anchor < n - 1:
+            sub = image[anchor:, ..., :3].clone()
+            sub[0] = highlight_person_frame(image[anchor, ..., :3], m).to(sub.dtype)
+            query = f"Track the {desc} (the person highlighted in color at ({cx:.0f}%, {cy:.0f}%) in the first frame)."
+            ans = molmo.runtime.track_subjects([query], sub, fps, max_fps=4.0)[0]
+            t_off = float(anchor) / float(fps)
+            pts = sorted((float(t) + t_off, int(o), float(x), float(y))
+                         for t, o, x, y in ans.get("points", [])
+                         if int(round((float(t) + t_off) * fps)) > anchor)
+        else:
+            pts = []
         if key:
             _remember(_MOLMO_CACHE, key, (desc, pts), 16)
     found = {}
     for si, (s0, s1) in enumerate(shots):
-        if has_anchor[si]:
+        if has_anchor[si] or s1 <= anchor:
             continue
-        inside = [p for p in pts if s0 <= int(round(float(p[0]) * fps)) < s1]
+        lo = max(s0, anchor + 1)
+        inside = [p for p in pts if lo <= int(round(float(p[0]) * fps)) < s1]
         if not inside:
             continue
-        mid = (s0 + s1 - 1) / 2.0                       # the point nearest the shot's middle: steadiest framing
-        t, _o, x, y = min(inside, key=lambda p: abs(float(p[0]) * fps - mid))
-        f = min(s1 - 1, max(s0, int(round(float(t) * fps))))
-        mk = person_at(sam, image[f:f + 1, ..., :3].float().cpu(), x, y, threshold)
-        if bool(mk.any()):
-            found[f] = mk.float()
-    return found, (f"Molmo2{' (reused)' if reused else ''}: '{desc}', {len(pts)} points, {len(shots)} shots, "
+        mid = (lo + s1 - 1) / 2.0                       # try points nearest the shot's middle first: steadiest framing
+        seen_f = set()
+        for t, _o, x, y in sorted(inside, key=lambda p: abs(float(p[0]) * fps - mid)):
+            f = min(s1 - 1, max(lo, int(round(float(t) * fps))))
+            if f in seen_f:
+                continue
+            seen_f.add(f)
+            mk = person_at(sam, image[f:f + 1, ..., :3].float().cpu(), x, y, threshold)
+            if bool(mk.any()) and molmo_verify_candidate(
+                molmo, crop, image[anchor, ..., :3], m, image[f, ..., :3], mk,
+                claimed_masks=(claimed_by_frame or {}).get(f), memo=(memo or ()) + (anchor, f)
+            ):
+                found[f] = mk.float()
+                break
+            if len(seen_f) >= 3:
+                break
+    return found, (f"Molmo2{' (reused)' if reused else ''}: '{desc}', {len(pts)} points from f{anchor}, {len(shots)} shots, "
                    f"{len(found)} shots re-anchored"), pts
 
 
@@ -212,7 +329,7 @@ def _limb_ok(a, b, cap):
     return a is not None and b is not None and ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5 <= cap
 
 
-def pick_person(people, mask, W, H):
+def pick_person(people, mask, W, H, min_inside=0.5, min_diag=0.3, exclude=()):
     """The DWPose person of this subject: most of its body/face points inside the subject's OWN mask (not the grown gray
     region, which can swallow someone in the background) and a size that matches it. None when DWPose missed the subject
     in this frame (e.g. an upside-down dancer): then no skeleton is drawn rather than somebody else's."""
@@ -222,14 +339,17 @@ def pick_person(people, mask, W, H):
         return None
     mdiag = float(np.hypot(xs.max() - xs.min(), ys.max() - ys.min())) + 1
     best, score = None, 0.0
+    excl_ids = {id(p) for p in (exclude or ())}
     for p in people or []:
+        if id(p) in excl_ids:
+            continue
         pts = [q for q in _pts(p.get("pose_keypoints_2d"), W, H) + _pts(p.get("face_keypoints_2d"), W, H) if q]
         if len(pts) < 4:
             continue
         inside = sum(1 for x, y in pts if 0 <= int(y) < H and 0 <= int(x) < W and mask[int(y), int(x)]) / len(pts)
         px, py = [q[0] for q in pts], [q[1] for q in pts]
         pdiag = float(np.hypot(max(px) - min(px), max(py) - min(py)))
-        if inside < 0.5 or pdiag < 0.3 * mdiag:
+        if inside < min_inside or pdiag < min_diag * mdiag:
             continue
         sc = inside + min(pdiag / mdiag, 1.0)
         if sc > score: best, score = p, sc
@@ -407,7 +527,10 @@ def parse_frames(text):
     for k, v in frames.items():
         if not isinstance(v, dict):
             continue
-        out[str(k)] = {"1": v} if ("selected" in v or "added" in v) else {str(sk): sv for sk, sv in v.items() if isinstance(sv, dict)}
+        out[str(k)] = {"1": v} if ("selected" in v or "added" in v) else {
+            str(sk): sv for sk, sv in v.items()
+            if isinstance(sv, dict) and str(sk).isdigit() and 1 <= int(sk) <= len(HYBRID_COLORS)
+        }
     return out
 
 
@@ -445,8 +568,9 @@ class BFSVideoSegmentPicker:
                                       "encoder left from the last generation (they load again when needed). Clearing the caches also "
                                       "frees RAM, but the next run segments and tracks again. Before MoGe / DWPose / Molmo2 run "
                                       "(only on Propagate) every model is unloaded anyway, so a second run does not run out of memory."}),
-            "pose_region": (["convex hull", "person outline"], {"default": "convex hull",
-                            "tooltip": "openpose mark: the gray region around each subject. The convex hull (with hybrid_grow margin) "
+            "pose_region": (["person outline", "convex hull"], {"default": "person outline",
+                            "tooltip": "openpose mark: the gray region around each subject. The outline (hybrid_grow ~0.02-0.05) hides "
+                                       "the least background and usually looks best; the convex hull (with hybrid_grow margin) "
                                        "hides the original body shape (the new one stays free); the outline follows the person "
                                        "(less background hidden, but the original silhouette shows)."}),
             "pose_gray_opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
@@ -468,7 +592,7 @@ class BFSVideoSegmentPicker:
     def pick(self, image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
              selection, track=True, strip_frames=16, normals=None, normals_convention="normal_directx", hybrid_base=None, subject=None,
              mark_style=MARK_STYLES[0], molmo_clip=None, pose_keypoint=None,
-             hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="convex hull",
+             hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
              pose_gray_opacity=1.0, unique_id=None, prompt=None):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
@@ -511,6 +635,7 @@ class BFSVideoSegmentPicker:
         if mode.startswith("keep"):
             return
         try:
+            import gc
             import comfy.model_management as mm
             if mode.startswith("unload all"):
                 mm.unload_all_models()
@@ -518,15 +643,15 @@ class BFSVideoSegmentPicker:
                 mm.unload_model_and_clones(sam3_model)
             if "caches" in mode:
                 sp._SESSIONS.clear(); _TRACK_CACHE.clear(); _SHOT_CACHE.clear(); _MOLMO_CACHE.clear()
-                import gc; gc.collect()
-            mm.soft_empty_cache()
+            gc.collect()
+            mm.soft_empty_cache(True)
             print(f"[BFS Video Segment Picker] memory freed ({mode})", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[BFS Video Segment Picker] could not free memory: {e!r}", flush=True)
 
     def _pick(self, image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style, molmo_clip,
-              pose_keypoint, hybrid_grow, unique_id, pose_region="convex hull", pose_gray_opacity=1.0):
+              pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -573,7 +698,7 @@ class BFSVideoSegmentPicker:
         vkey = video_key(image)
         for sj in subjects:
             mine = {k: v[str(sj)] for k, v in sorted(states.items()) if v.get(str(sj))}   # only this subject's picks
-            ckey = (vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track), molmo_clip is not None, float(threshold))
+            ckey = ("v2", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track), molmo_clip is not None, float(threshold))
             hit = _TRACK_CACHE.get(ckey)
             if hit is not None:   # same video, same picks for this subject: reuse its masks (style / margin changes are instant)
                 st(f"subject {sj}: masks reused from the last run (same video and picks)", 0.3 + 0.4 * subjects.index(sj) / len(subjects), log=True)
@@ -581,6 +706,10 @@ class BFSVideoSegmentPicker:
                 _TRACK_CACHE.move_to_end(ckey)
                 continue
             anchors = [i for i in strip if bool(own[sj][i].any())]
+            user_anchors = list(anchors)
+            first_pick = user_anchors[0] if user_anchors else 0
+            prev_strip = max([s for s in strip if s < first_pick], default=0)
+            min_valid_frame = 0 if first_pick == 0 else prev_strip
             if segment_only:   # picking only: the picked frames' masks (the last propagated masks are kept by the cache)
                 m = torch.zeros(n, h, w)
                 for i in anchors: m[i] = own[sj][i]
@@ -592,16 +721,26 @@ class BFSVideoSegmentPicker:
                 m[i] = own[sj][i]
             rep = [{"frame": i, "source": "picked" if i in anchors else "empty"} for i in range(n)]
             if anchors and track and n > 1:
+                def claimed_at(f):
+                    out_c = [per_subject[ok][f] for ok in per_subject if ok != sj and bool((per_subject[ok][f] > 0.5).any())]
+                    for ok in subjects:
+                        if ok != sj and f in own.get(ok, {}) and bool((own[ok][f] > 0.5).any()):
+                            out_c.append(own[ok][f])
+                    return out_c
+
                 shots = shots_of(n, cuts)
                 shot_of = lambda f: next(k for k, (s0, s1) in enumerate(shots) if s0 <= f < s1)
                 has = [any(s0 <= a < s1 for a in anchors) for s0, s1 in shots]
                 use_molmo = molmo_clip is not None and hasattr(molmo_clip, "runtime")
                 pts = []
                 if use_molmo:
-                    st(f"Molmo2: describing and tracking subject {sj} through the video", 0.3 + 0.4 * subjects.index(sj) / len(subjects))
+                    st(f"Molmo2: describing and tracking subject {sj} from frame {first_pick} forward", 0.3 + 0.4 * subjects.index(sj) / len(subjects))
                     t0 = time.time()
-                    extra, note, pts = molmo_relocate(molmo_clip, (sam3_model, sam3_clip), image, own[sj][anchors[0]], anchors[0],
-                                                      shots, has, float(threshold), memo=(vkey, sj, float(threshold)))
+                    claimed_map = {f: claimed_at(f) for f in range(first_pick + 1, n)}
+                    extra, note, pts = molmo_relocate(
+                        molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
+                        shots, has, float(threshold), memo=(vkey, sj, float(threshold)), claimed_by_frame=claimed_map
+                    )
                     note += f" ({time.time() - t0:.0f}s)"
                     st(f"subject {sj}: {note}", None, log=True)
                     for f, mk in extra.items():
@@ -611,8 +750,12 @@ class BFSVideoSegmentPicker:
                     out, rp = {}, {}
                     kept = 0
                     for si_, (s0, s1) in enumerate(shots):   # each shot is tracked only from anchors inside it: never across a cut
+                        if s1 <= min_valid_frame:
+                            for i in range(s0, s1):
+                                out[i] = torch.zeros(h, w); rp[i] = "before first pick"
+                            continue
                         sa = [a for a in anchors if s0 <= a < s1]
-                        skey = (vkey, sj, s0, s1, tuple((a, mask_key(own[sj][a])) for a in sa), float(threshold))
+                        skey = ("v2", vkey, sj, s0, s1, min_valid_frame, tuple((a, mask_key(own[sj][a])) for a in sa), float(threshold))
                         if skey in _SHOT_CACHE:   # same anchors in this shot as a previous run: its tracking is the same
                             cm, cr = _SHOT_CACHE[skey]
                             _SHOT_CACHE.move_to_end(skey)
@@ -624,17 +767,42 @@ class BFSVideoSegmentPicker:
                            0.3 + 0.4 * (subjects.index(sj) + si_ / max(1, len(shots))) / len(subjects))
                         if not sa:
                             for i in range(s0, s1):
-                                out[i] = torch.zeros(h, w); rp[i] = "lost (no anchor in this shot)"
+                                out[i] = torch.zeros(h, w)
+                                rp[i] = "before first pick" if i < first_pick else "lost (no anchor in this shot)"
                             continue
-                        seg = image[s0:s1, ..., :3]
-                        tr = {a: (BFSTrackFromFrame().track(seg, sam3_model, own[sj][a][None], a - s0)[0] if s1 - s0 > 1
-                                  else own[sj][a][None]) for a in sa}
-                        for i in range(s0, s1):
+                        seg_s0 = max(s0, min_valid_frame)
+                        seg = image[seg_s0:s1, ..., :3]
+                        tr = {a: (BFSTrackFromFrame().track(seg, sam3_model, own[sj][a][None], a - seg_s0)[0] if s1 - seg_s0 > 1
+                                  else own[sj][a][None]) for a in sa if a >= seg_s0}
+                        for i in range(s0, seg_s0):
+                            out[i] = torch.zeros(h, w); rp[i] = "before first pick"
+                        for i in range(seg_s0, s1):
                             if i in sa:
-                                out[i] = own[sj][i]; rp[i] = "picked" if i in strip else "Molmo2 + SAM"; continue
-                            a = min(sa, key=lambda k: (abs(k - i), k))
-                            out[i] = (tr[a][i - s0] > 0.5).float()
-                            rp[i] = f"tracked from {a}" if bool(out[i].any()) else f"lost (tracked from {a})"
+                                out[i] = own[sj][i]; rp[i] = "picked" if i in user_anchors else "Molmo2 + SAM"; continue
+                            a = min(tr, key=lambda k: (abs(k - i), k))
+                            out[i] = (tr[a][i - seg_s0] > 0.5).float()
+                            rp[i] = f"tracked from {a}" if bool(out[i].any()) else (
+                                "before first pick" if i < first_pick else f"lost (tracked from {a})")
+                        if first_pick > seg_s0 and seg_s0 <= first_pick < s1:
+                            for i in range(first_pick - 1, seg_s0 - 1, -1):
+                                ok_bwd = (
+                                    bool(out[i].any())
+                                    and mask_overlap(out[i], out[i + 1])[0] >= 0.15
+                                    and not any(mask_overlap(out[i], cm)[1] > 0.55 for cm in claimed_at(i))
+                                    and person_color_sim(image[first_pick, ..., :3], own[sj][first_pick], image[i, ..., :3], out[i]) >= 0.48
+                                )
+                                if not ok_bwd:
+                                    for j in range(seg_s0, i + 1):
+                                        out[j] = torch.zeros(h, w); rp[j] = "before first pick"
+                                    break
+                        for i in range(seg_s0, s1):
+                            if bool(out[i].any()) and i not in user_anchors:
+                                cl = claimed_at(i)
+                                if cl:
+                                    cu = torch.stack([cm > 0.5 for cm in cl]).any(0)
+                                    out[i] = out[i] * (~cu).float()
+                                    if not bool(out[i].any()):
+                                        rp[i] = "before first pick" if i < first_pick else rp[i].replace("tracked from", "lost (tracked from") + (")" if not rp[i].endswith(")") else "")
                         if sa:
                             _remember(_SHOT_CACHE, skey, (torch.stack([out[i] > 0.5 for i in range(s0, s1)]),
                                                           [rp[i] for i in range(s0, s1)]), 64)
@@ -643,19 +811,23 @@ class BFSVideoSegmentPicker:
                     return out, rp
 
                 out, rp = track_shots(anchors)
-                if pts:   # second pass: stretches where the SAM mask is missing OR misses Molmo's point (wrong person / a part)
+                if pts:   # second pass: stretches after first_pick where the SAM mask is missing OR misses Molmo's point
+                    ref_crop = person_crop(image[first_pick, ..., :3], own[sj][first_pick])
                     off = set()
                     for t_, _o, x_, y_ in pts:
                         f_ = min(n - 1, max(0, int(round(float(t_) * 24))))
+                        if f_ <= first_pick:
+                            continue
                         px_, py_ = min(w - 1, int(x_ * w)), min(h - 1, int(y_ * h))
                         mk_ = out[f_] > 0.5
                         if bool(mk_.any()) and not bool(mk_[max(0, py_ - 6):py_ + 7, max(0, px_ - 6):px_ + 7].any()):
-                            off.add(f_)
+                            if person_color_sim(image[first_pick, ..., :3], own[sj][first_pick], image[f_, ..., :3], mk_) < 0.42:
+                                off.add(f_)
                     # Molmo points about every 6 frames: two in a row off the mask -> the frames between them count as lost
                     offs = sorted(off); wrong = set()
                     for a_, b_ in zip(offs, offs[1:]):
                         if b_ - a_ <= 8: wrong.update(range(a_, b_ + 1))
-                    lost = sorted({i for i in range(n) if not bool(out[i].any())} | wrong)
+                    lost = sorted({i for i in range(first_pick + 1, n) if not bool(out[i].any())} | wrong)
                     runs, cur = [], []
                     for i in lost:
                         if cur and i != cur[-1] + 1: runs.append(cur); cur = []
@@ -666,14 +838,28 @@ class BFSVideoSegmentPicker:
                         inside = [q for q in pts if run[0] <= int(round(float(q[0]) * 24)) <= run[-1]]
                         if not inside: continue
                         mid = (run[0] + run[-1]) / 2.0
-                        t, _o, x, y = min(inside, key=lambda q: abs(float(q[0]) * 24 - mid))
-                        f = min(run[-1], max(run[0], int(round(float(t) * 24))))
-                        mk = person_at((sam3_model, sam3_clip), image[f:f + 1, ..., :3].float().cpu(), x, y, float(threshold))
-                        if bool(mk.any()):
-                            own[sj][f] = mk.float(); anchors = sorted(set(anchors) | {f}); added += 1
+                        seen_f = set()
+                        for t, _o, x, y in sorted(inside, key=lambda q: abs(float(q[0]) * 24 - mid)):
+                            f = min(run[-1], max(run[0], int(round(float(t) * 24))))
+                            if f in seen_f:
+                                continue
+                            seen_f.add(f)
+                            mk = person_at((sam3_model, sam3_clip), image[f:f + 1, ..., :3].float().cpu(), x, y, float(threshold))
+                            if bool(mk.any()) and molmo_verify_candidate(
+                                molmo_clip, ref_crop, image[first_pick, ..., :3], own[sj][first_pick],
+                                image[f, ..., :3], mk, claimed_masks=claimed_at(f), memo=(vkey, sj, float(threshold), first_pick, f)
+                            ):
+                                own[sj][f] = mk.float(); anchors = sorted(set(anchors) | {f}); added += 1
+                                break
+                            if len(seen_f) >= 3:
+                                break
                     if added:
-                        st(f"subject {sj}: {added} lost stretches re-anchored by Molmo2, tracking again", None, log=True)
+                        st(f"subject {sj}: {added} lost stretches re-anchored by Molmo2 (visually verified), tracking again", None, log=True)
+                        prev_out, prev_rp = dict(out), dict(rp)
                         out, rp = track_shots(anchors)
+                        for i in range(n):
+                            if bool(prev_out[i].any()) and i not in wrong:
+                                out[i], rp[i] = prev_out[i], prev_rp[i]
                 for i in range(n):
                     m[i] = out[i]; rep[i] = {"frame": i, "source": rp[i]}
             per_subject[sj] = m; report_s[sj] = rep
@@ -700,9 +886,10 @@ class BFSVideoSegmentPicker:
             import numpy as np
             import cv2
             st("drawing the DWPose marks", 0.75)
+            ga = float(pose_gray_opacity)
+            subj_data = {}
+            # Pass 1: compute hulls and erase all subjects to neutral gray FIRST so no subject's gray region erases another subject's skeleton
             for sj, m in per_subject.items():
-                # the convex hull of the person, grown by a generous margin, so the gray region
-                # does not reveal the original silhouette (the new body shape stays free)
                 mk = (m > 0.5).numpy().astype(np.uint8)
                 area = float(mk.sum(axis=(1, 2)).mean()) + 1
                 hull = pose_region.startswith("convex")
@@ -714,17 +901,40 @@ class BFSVideoSegmentPicker:
                     cs, _ = cv2.findContours(mk[i], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if cs:
                         cv2.fillPoly(hm_i, [cv2.convexHull(np.concatenate(cs))] if hull else cs, 1)
-                    hulls.append(torch.from_numpy(cv2.dilate(hm_i, se) > 0))
+                    region = torch.from_numpy(cv2.dilate(hm_i, se) > 0)
+                    hulls.append(region)
+                    if bool(region.any()):
+                        base[i][region] = base[i][region] * (1 - ga) + 0.5 * ga
+                subj_data[sj] = (mk, hulls)
+
+            # Pass 2: match DWPose skeletons per frame (with relaxed fallback + neighbor frame fallback) and draw all skeletons on top
+            used_per_frame = {i: [] for i in range(n)}
+            for sj, (mk, hulls) in subj_data.items():
                 col = HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)]
+                matched = [None] * n
                 for i in range(n):
                     if not bool(hulls[i].any()):
                         continue
-                    region = hulls[i]
-                    ga = float(pose_gray_opacity)                          # the original person, erased to neutral gray
-                    base[i][region] = base[i][region] * (1 - ga) + 0.5 * ga
                     fk = frames_kp[i] or {}
+                    ppl = fk.get("people")
                     tight = cv2.dilate(mk[i], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
-                    person = pick_person(fk.get("people"), tight, w, h)
+                    person = pick_person(ppl, tight, w, h, exclude=used_per_frame[i])
+                    if person is None:
+                        grow_t = cv2.dilate(mk[i], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) > 0
+                        person = pick_person(ppl, grow_t, w, h, min_inside=0.25, min_diag=0.2, exclude=used_per_frame[i])
+                    if person is not None:
+                        matched[i] = person
+                        used_per_frame[i].append(person)
+                for i in range(n):
+                    if not bool(hulls[i].any()):
+                        continue
+                    person = matched[i]
+                    if person is None:
+                        for delta in (-1, 1, -2, 2):
+                            j = i + delta
+                            if 0 <= j < n and matched[j] is not None:
+                                person = matched[j]
+                                break
                     if person is None:
                         continue
                     cv = torch.from_numpy(draw_pose(person, col, w, h)).to(base.dtype) / 255.0
@@ -751,12 +961,13 @@ class BFSVideoSegmentPicker:
                     if bool(hm[i].any()):
                         fill = mark_fill(mark_style, image[i, ..., :3].float(), nm[i], hm[i], col)
                         base[i][hm[i]] = fill.to(base.dtype)[hm[i]]
-        lost_runs = []   # stretches where a picked subject has no mask: the panel offers them to add to the strip
+        lost_runs = []   # stretches where a picked subject has no mask after its first appearance: the panel offers them to add to the strip
         for sj in subjects:
             if not any(r["source"] == "picked" for r in report_s[sj]):
                 continue
+            first_active = min([i for i in range(n) if bool(per_subject[sj][i].any())] or [0])
             run = None
-            for i in range(n):
+            for i in range(first_active, n):
                 bad = not bool(per_subject[sj][i].any())
                 if bad and run is None: run = [i, i]
                 elif bad: run[1] = i
