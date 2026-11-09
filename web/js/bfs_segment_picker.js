@@ -29,7 +29,7 @@ function parseState(text) {
 }
 
 const STYLE_ID = "bfs-segpick-style";
-function styles() {
+export function styles() {
   if (document.getElementById(STYLE_ID)) return;
   const css = document.createElement("style");
   css.id = STYLE_ID;
@@ -101,7 +101,7 @@ function loadMask(o, color) {
   });
 }
 
-function Panel(io) {
+export function Panel(io) {   // exported: BFS Video Segment Picker shows one per frame
   const state = reactive(parseState(io.get()));
   const data = ref(null);            // {session, width, height, image, objects} from the last run
   const loaded = new Map();          // object id -> loadMask result (not reactive: canvases and big arrays)

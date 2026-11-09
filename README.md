@@ -272,3 +272,50 @@ paints what to cut out. Each becomes a chip; unselect it to switch it off. Brush
 eraser strokes belong to the image they were painted on and are dropped when the image
 changes. Fixed: clicking inside the node no longer shrinks its canvas while the side
 panel is open.
+
+### Character swap with marked guides (1.119.0)
+
+Mark who is replaced in the guide video, then condition MiniMax H3 Character Swap on it.
+
+**BFS Video Segment Picker (SAM 3)** — the Segment Picker for a video. A strip shows
+frames of the batch; click a frame, pick the subject tab (1 red, 2 blue, 3 green,
+4 yellow = Picture 1–4) and click the person. **↔ Propagate** tracks every subject from
+its picked frames to the whole video with SAM 3, shot by shot (camera cuts are detected
+and never tracked across). Optional `molmo_clip` (Molmo2 H3 encoder): Molmo2 describes
+the picked person, follows them through the video and re-anchors shots that have no
+pick, so a person is found again after a cut. Picking runs only segment the strip;
+tracking, Molmo2, MoGe and DWPose run on Propagate. Repeated runs reuse what did not
+change (per subject and per shot). After the first Propagate, picking on a frame
+propagates by itself (**auto**). The **Whole video** scrubber shows every frame with
+its masks, the lost stretches in red; **＋ add this frame** puts any frame in the strip
+to fix it. A status line with a progress bar and a log shows what runs.
+
+Outputs: `masks`, `marked` (tinted), `overlay`, `report`, and `hybrid`: the guide
+with each subject drawn in its color, by `mark_style`:
+- `normal map` — its MoGe normal map in gray detail, tinted (connect `normals`:
+  Run MoGe Inference → Render MoGe Geometry, a normal mode);
+- `openpose + face` — erased to gray (`pose_region`: convex hull or person outline,
+  `pose_gray_opacity`) and drawn as its DWPose skeleton with the eyes and the mouth
+  opening (connect `pose_keypoint`: DWPose Estimator with body, hands and face);
+- texture-free alternatives: flat color, shading, blur, pixelate, gray detail, edges.
+
+`hybrid_grow` sets the margin around each subject; `hybrid_base` stacks pickers.
+`free_after` unloads the models from the GPU when the node is done (default: all).
+
+**BFS H3 Character Swap Conditioning** — `mode`:
+- `keyframe pins`: the source video plus one Add Guide per edited keyframe at its own
+  frame (`keyframes` + `keyframe_spec` from BFS Keyframe Planner, or `keyframe_N` /
+  `time_N`). `keyframe_until` drops the keyframes (or every guide) below that sigma on
+  the returned `model`.
+- `normal map guide` / `DWPose guide`: the Video Segment Picker's `hybrid` as the guide.
+
+Pictures 1–4 are the references in color order; the prompt is written from the mode
+and the number of Pictures (or `prompt_override`). Outputs: model, positive, latent,
+prompt, keyframe_video and `pictures` (the Pictures as a list, e.g. for BFS Video
+Compare's `reference`).
+
+Also: **BFS Keyframe Planner** (choose the keyframe frames on the video and export
+them with their spec), **BFS Keyframe Marks** / **BFS Track From Frame (SAM 3)** (a
+tracked person's mask at each keyframe), **BFS Workflow Loop** (run a part of the
+graph once per item, injecting the item and changing widgets per iteration),
+**BFS XY Sweep** (a grid of any two widgets' values) and **BFS Frame Loop Start/End**.
