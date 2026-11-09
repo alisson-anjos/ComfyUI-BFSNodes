@@ -4,7 +4,7 @@ Three ways to mark the subjects (`mode`):
   - "keyframe pins": the source video as an aligned guide (Add Guide at frame 0) plus one Add Guide per edited keyframe
     at its own frame index (frames of the result with the new people in place, e.g. from BFS Keyframe Planner).
   - "normal map guide": the guide video with each subject to replace drawn as its normal map in gray detail, tinted with
-    the subject's color (1 red, 2 blue, 3 green, 4 yellow = Picture 1..4).
+    the subject's color (1 red, 2 blue, 3 green = Picture 1..3).
   - "DWPose guide": the guide video with each subject erased to gray and drawn as its DWPose skeleton (body, hands and
     face, with the eyes and the mouth opening) in the subject's color.
 The marked guides come from BFS Video Segment Picker (`hybrid` output). The Pictures are native references and the
@@ -16,10 +16,10 @@ import torch
 
 GRAY = 128.0 / 255.0     # background of the keyframe_video preview
 MAX_KEYFRAMES = 8
-MAX_PICTURES = 4
+MAX_PICTURES = 3
 PINS, NORMALS, POSE = "keyframe pins", "normal map guide", "DWPose guide"
 MODES = [PINS, NORMALS, POSE]
-SUBJECT_COLORS = ["red", "blue", "green", "yellow"]
+SUBJECT_COLORS = ["red", "blue", "green"]
 
 
 def pose_caption(k):

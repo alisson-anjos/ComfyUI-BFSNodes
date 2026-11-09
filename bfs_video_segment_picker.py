@@ -21,7 +21,7 @@ from .bfs_keyframe_marks import BFSTrackFromFrame
 
 MAX_FRAMES = 32           # frames segmented for the panel; a longer video shows an evenly spread strip
 # the hybrid guide: subject k drawn without its texture (e.g. its normal map in gray detail), tinted with its color
-HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60), (240, 215, 35)]   # RGB: red, blue, green, yellow
+HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60)]   # RGB: red, blue, green
 HYBRID_TINT = 0.75
 
 
@@ -527,7 +527,10 @@ def parse_frames(text):
     for k, v in frames.items():
         if not isinstance(v, dict):
             continue
-        out[str(k)] = {"1": v} if ("selected" in v or "added" in v) else {str(sk): sv for sk, sv in v.items() if isinstance(sv, dict)}
+        out[str(k)] = {"1": v} if ("selected" in v or "added" in v) else {
+            str(sk): sv for sk, sv in v.items()
+            if isinstance(sv, dict) and str(sk).isdigit() and 1 <= int(sk) <= len(HYBRID_COLORS)
+        }
     return out
 
 

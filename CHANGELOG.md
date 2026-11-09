@@ -2,6 +2,14 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.119.3] - 2026-11-09
+
+### Changed
+- **BFS Video Segment Picker (`BFSVideoSegmentPicker`) & BFS H3 Character Swap Conditioning (`BFSH3KeyframeConditioning`)**:
+  - Limited selectable subjects and reference pictures to 3 (`1 · red`, `2 · blue`, `3 · green` / `picture_1`..`picture_3`) to match the 3-subject training distribution of the Normal Map and DWPose Character Swap LoRAs.
+
+---
+
 ## [1.119.2] - 2026-11-09
 
 ### Fixed
