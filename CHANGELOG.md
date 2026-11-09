@@ -2,6 +2,14 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.119.5] - 2026-11-09
+
+### Changed
+- **BFS Video Segment Picker (`BFSVideoSegmentPicker`)**: Restored the classic Molmo2 full-video text tracking as the default, with the current SAM 3 tracking available in a dropdown.
+- Added repair scopes for one frame, the active frame onward, recomputing all frames, and filling only empty masks. Filling empty masks is the default and preserves existing non-empty results.
+- Preserve the last propagated preview while adding selections, disable auto-propagation by default, and hide the manual eraser in the video picker while retaining SAM-guided remove points.
+- Shortened the package description to fit Comfy Registry metadata validation.
+
 ## [1.119.4] - 2026-11-09
 
 ### Added
