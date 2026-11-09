@@ -238,9 +238,9 @@ def molmo_verify_candidate(molmo, ref_crop, ref_frame, ref_mask, cand_frame, can
     return bool(ok)
 
 
-def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, threshold, fps=24.0, memo=None, claimed_by_frame=None):
-    """Find the subject in later shots that have no anchor yet: Molmo2 describes the picked person (masked crop), tracks
-    forward from the picked frame (with the picked person visually highlighted in the first frame of the clip), and in
+def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, threshold, fps=24.0, memo=None, claimed_by_frame=None, text_override=None):
+    """Find the subject in later shots that have no anchor yet: Molmo2 describes the picked person (masked crop) or uses text_override,
+    tracks forward from the picked frame (with the picked person visually highlighted in the first frame of the clip), and in
     each later shot without an anchor verifies the candidate person crop against the clicked reference crop with Molmo2.
     Returns {frame: mask}, report, pts."""
     import re
@@ -252,15 +252,18 @@ def molmo_relocate(molmo, sam, image, anchor_mask, anchor, shots, has_anchor, th
     crop = person_crop(image[anchor, ..., :3], m)
     cx = float(xs.float().mean()) / max(1, w) * 100.0
     cy = float(ys.float().mean()) / max(1, h) * 100.0
-    key = memo and (("relocate_v2",) + tuple(memo) + (anchor, mask_key(anchor_mask)))
+    key = memo and (("relocate_v2",) + tuple(memo) + (anchor, mask_key(anchor_mask), text_override or ""))
     reused = key in _MOLMO_CACHE if key else False
     if reused:   # same first pick of this subject: the description and Molmo2's forward track are the same
         desc, pts = _MOLMO_CACHE[key]
         _MOLMO_CACHE.move_to_end(key)
     else:
-        text = molmo.runtime.generate(DESCRIBE_SOURCE, [{"type": "image", "data": crop[None]}], 96, molmo.phase_b_max_frames,
-                                      do_sample=False, repetition_penalty=1.0)["text"]
-        desc = re.sub(r"^(the|a|an)\s+", "", " ".join(str(text).strip().strip('"').split()).rstrip(". "), flags=re.I)
+        if text_override:
+            desc = text_override.strip()
+        else:
+            text = molmo.runtime.generate(DESCRIBE_SOURCE, [{"type": "image", "data": crop[None]}], 96, molmo.phase_b_max_frames,
+                                          do_sample=False, repetition_penalty=1.0)["text"]
+            desc = re.sub(r"^(the|a|an)\s+", "", " ".join(str(text).strip().strip('"').split()).rstrip(". "), flags=re.I)
         if anchor < n - 1:
             sub = image[anchor:, ..., :3].clone()
             sub[0] = highlight_person_frame(image[anchor, ..., :3], m).to(sub.dtype)
@@ -534,6 +537,37 @@ def parse_frames(text):
     return out
 
 
+def find_connected_picture_count(prompt, unique_id):
+    """Inspects the prompt workflow graph to find downstream nodes consuming this node's output,
+    and returns the maximum index of connected picture inputs (e.g. 2 if only picture_1 and picture_2 are linked)."""
+    if not prompt or not unique_id:
+        return None
+    uid = str(unique_id)
+    direct_consumers = []
+    for nid, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for in_k, in_v in inputs.items():
+            if isinstance(in_v, list) and len(in_v) >= 1 and str(in_v[0]) == uid:
+                direct_consumers.append((nid, node))
+                break
+    max_pics = None
+    for nid, node in direct_consumers:
+        inputs = node.get("inputs", {})
+        pics = []
+        for k in range(1, 10):
+            p = inputs.get(f"picture_{k}") or inputs.get(f"ref_image_{k}")
+            if isinstance(p, list) and len(p) >= 1:
+                pics.append(k)
+        if pics:
+            cnt = max(pics)
+            max_pics = cnt if max_pics is None else max(max_pics, cnt)
+    return max_pics
+
+
 class BFSVideoSegmentPicker:
     DESCRIPTION = __doc__.split("\n\n")[0]
 
@@ -577,6 +611,10 @@ class BFSVideoSegmentPicker:
                                   "tooltip": "openpose mark: how opaque the gray region is (1.0 = fully hidden). Lower lets the "
                                              "background show through, but also the original person (clothes, body), which the "
                                              "result may then copy."}),
+            "max_subjects": (["auto", "1", "2", "3"], {"default": "auto",
+                             "tooltip": "Limit active subjects: 'auto' automatically detects connected picture inputs in downstream H3 conditioning (ignoring extra subjects like green if only 2 pictures are connected), or force 1, 2, or 3."}),
+            "molmo_descriptions": ("STRING", {"multiline": True, "default": "",
+                                   "tooltip": "Optional explicit visual description per subject for Molmo2 tracking (line 1 = Subject 1, line 2 = Subject 2, line 3 = Subject 3). When provided, Molmo2 tracks using these exact text descriptions instead of guessing from crops, avoiding tracking errors."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
@@ -593,11 +631,12 @@ class BFSVideoSegmentPicker:
              selection, track=True, strip_frames=16, normals=None, normals_convention="normal_directx", hybrid_base=None, subject=None,
              mark_style=MARK_STYLES[0], molmo_clip=None, pose_keypoint=None,
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
-             pose_gray_opacity=1.0, unique_id=None, prompt=None):
+             pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", unique_id=None, prompt=None, **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
-                              molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity)
+                              molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
+                              max_subjects, molmo_descriptions, prompt)
         finally:
             self._free(sam3_model, free_after)
 
@@ -651,7 +690,8 @@ class BFSVideoSegmentPicker:
 
     def _pick(self, image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style, molmo_clip,
-              pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0):
+              pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
+              max_subjects="auto", molmo_descriptions="", prompt=None):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -670,7 +710,23 @@ class BFSVideoSegmentPicker:
             segment_only = False
         if segment_only:
             st("segment only (picking): no tracking, no Molmo2 - press Propagate to track", None, log=True)
+        user_descs = [l.strip().strip('. ') for l in str(molmo_descriptions or '').splitlines()]
+        while user_descs and not user_descs[-1]: user_descs.pop()
+
         subjects = sorted({int(sk) for st in states.values() for sk, sv in st.items() if (sv.get("selected") or [])} or {1})
+        max_allowed = None
+        if str(max_subjects) in ("1", "2", "3"):
+            max_allowed = int(max_subjects)
+        else:
+            max_allowed = find_connected_picture_count(prompt, unique_id)
+        if max_allowed is not None:
+            active = [s for s in subjects if s <= max_allowed]
+            if not active:
+                active = [1]
+            if set(active) != set(subjects):
+                dropped = sorted(set(subjects) - set(active))
+                st(f"auto-desmarcação: sujeito(s) {dropped} desativado(s) automaticamente (limite de {max_allowed} referências no H3)", None, log=True)
+                subjects = active
         panels, overlays = [], []
         own = {sj: {} for sj in subjects}
         for k_strip, i in enumerate(strip):
@@ -737,9 +793,13 @@ class BFSVideoSegmentPicker:
                     st(f"Molmo2: describing and tracking subject {sj} from frame {first_pick} forward", 0.3 + 0.4 * subjects.index(sj) / len(subjects))
                     t0 = time.time()
                     claimed_map = {f: claimed_at(f) for f in range(first_pick + 1, n)}
+                    desc_override = user_descs[sj - 1] if 0 <= sj - 1 < len(user_descs) and user_descs[sj - 1] else None
+                    if desc_override:
+                        st(f"Molmo2 subject {sj}: using explicit text description '{desc_override}'", None, log=True)
                     extra, note, pts = molmo_relocate(
                         molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
-                        shots, has, float(threshold), memo=(vkey, sj, float(threshold)), claimed_by_frame=claimed_map
+                        shots, has, float(threshold), memo=(vkey, sj, float(threshold), desc_override or ""),
+                        claimed_by_frame=claimed_map, text_override=desc_override
                     )
                     note += f" ({time.time() - t0:.0f}s)"
                     st(f"subject {sj}: {note}", None, log=True)

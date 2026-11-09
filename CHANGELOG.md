@@ -2,6 +2,16 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.119.4] - 2026-11-09
+
+### Added
+- **BFS Video Segment Picker (`BFSVideoSegmentPicker`)**:
+  - **Automatic Unmarking / Subject Limiting (`max_subjects`)**: Added `"max_subjects"` parameter (`["auto", "1", "2", "3"]`, default `"auto"`). In `"auto"` mode, the node dynamically inspects the execution workflow graph (`prompt`) to count connected reference pictures (`picture_N`) on downstream conditioning nodes (e.g. `BFSH3KeyframeConditioning`). If only 2 pictures are connected, Subject 3 (`3 · green`) is automatically excluded from tracking, masking, and hybrid guide rendering, preventing unmatched green skeletons or normal maps from reaching MiniMax H3.
+  - **One-Click Subject Clear (`✕`)**: Added a clear button `✕` on each subject badge (`1 · red`, `2 · blue`, `3 · green`) in the UI header. Clicking it instantly removes all picks for that subject across all frames and triggers auto-propagation.
+  - **Explicit Text Tracking (`molmo_descriptions`)**: Added optional `"molmo_descriptions"` multiline input (line $k$ = Subject $k$). When provided, Molmo2 tracks using the exact text descriptions across camera cuts and shots instead of guessing from low-resolution crops, avoiding tracking errors.
+
+---
+
 ## [1.119.3] - 2026-11-09
 
 ### Changed

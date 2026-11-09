@@ -45,6 +45,8 @@ function styles() {
 .bvsp .chk{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:11px;cursor:pointer;user-select:none}
 .bvsp .subj{display:flex;gap:4px}
 .bvsp .subj .t{display:flex;align-items:center;gap:5px;border:1px solid var(--line);background:#23262c;border-radius:999px;padding:3px 10px 3px 6px;cursor:pointer;color:var(--muted);font-weight:600}
+.bvsp .subj .t .clr{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;margin-left:4px;font-size:10px;line-height:1;background:rgba(255,255,255,.15);color:#fff;cursor:pointer}
+.bvsp .subj .t .clr:hover{background:#f43f5e;color:#fff}
 .bvsp .subj .t i{width:10px;height:10px;border-radius:50%;display:block}
 .bvsp .subj .t.on{color:#fff;border-color:currentColor;background:#2b2f37}
 .bvsp .stat{display:flex;align-items:center;gap:8px;font-size:11px;color:#cfd6e0}
@@ -121,6 +123,21 @@ app.registerExtension({
     }
     const frames = reactive({ v: parse(widget?.value) });
     const save = () => { if (widget) widget.value = JSON.stringify({ frames: frames.v }); node.graph?.setDirtyCanvas(true); };
+    const hasPicks = k => Object.values(frames.v).some(f => f?.[k]?.selected?.length);
+    const clearSubject = k => {
+      let changed = false;
+      for (const f of Object.keys(frames.v)) {
+        if (frames.v[f]?.[k]) {
+          delete frames.v[f][k];
+          changed = true;
+        }
+      }
+      if (changed) {
+        save();
+        mountPanel();
+        autoPropagate();
+      }
+    };
     const run = reactive({ data: null });          // {frames: [panel data per frame], report: [...]}
     const active = ref(0);
     const subject = ref("1");                      // which subject the clicks select (its color = Picture number)
@@ -233,7 +250,15 @@ app.registerExtension({
               class: ["t", subject.value === k ? "on" : ""], style: subject.value === k ? { color: col } : null,
               title: `Subject ${k} (${name}) = Picture ${k}: clicks select this subject`,
               onClick: () => { if (subject.value !== k) { subject.value = k; mountPanel(); } } },
-              [h("i", { style: { background: col } }), h("span", { style: "color:#fff" }, `${k} · ${name}`)]))),
+              [
+                h("i", { style: { background: col } }),
+                h("span", { style: "color:#fff" }, `${k} · ${name}`),
+                hasPicks(k) ? h("span", {
+                  class: "clr",
+                  title: `Clear all picks for Subject ${k} (${name})`,
+                  onClick: (e) => { e.stopPropagation(); clearSubject(k); }
+                }, "✕") : null,
+              ]))),
             h("span", { class: "sp" }),
             h("label", { class: "chk", title: "After the first Propagate: picking a person on a frame propagates by itself (1.5 s after the last click)" }, [
               h("input", { type: "checkbox", checked: auto.value, onChange: e => { auto.value = e.target.checked;
