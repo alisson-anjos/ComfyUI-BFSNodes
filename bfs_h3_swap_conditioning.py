@@ -146,6 +146,18 @@ class BFSH3KeyframeConditioning:
                 out.append((round(float(kw.get(f"time_{i}", 0.0)) * fps), kw[f"keyframe_{i}"]))
         return sorted(out, key=lambda x: x[0])
 
+    @staticmethod
+    def _free_gpu():
+        """Unload TE and VAE from GPU and flush CUDA cache so MiniMaxH3 has full VRAM for sampling."""
+        try:
+            import gc
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            gc.collect()
+            mm.soft_empty_cache(True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[BFS H3 keyframe] could not free GPU models: {e!r}", flush=True)
+
     def encode(self, clip, vae, guide_video, width, height, length, picture_1, mode=PINS, keyframe_until=0.7,
                keyframe_until_drops="keyframes only", prompt_override="", model=None, **kw):
         if mode not in MODES:
@@ -172,12 +184,16 @@ class BFSH3KeyframeConditioning:
         times = [f / 24.0 for f in placed]
         prompt = prompt_override.strip() or pins_caption(len(pictures), times)
         print("[BFS H3 keyframe] prompt:\n" + prompt, flush=True)
-        positive, latent = MiniMaxH3ReferenceToVideo.execute(
-            clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
-            ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
-        positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
-        for f, frame in zip(placed, frames):
-            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae, image=frame[None]).args[0]
+        try:
+            positive, latent = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
+                ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
+            self._free_gpu()
+            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+            for f, frame in zip(placed, frames):
+                positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae, image=frame[None]).args[0]
+        finally:
+            self._free_gpu()
         print(f"[BFS H3 keyframe] {mode}: {len(placed)} keyframes at frames {placed}; {len(pictures)} Pictures", flush=True)
         return (self._until(model, keyframe_until, keyframe_until_drops.startswith("keyframes")), positive, latent, prompt, video,
                 pictures)
@@ -190,10 +206,14 @@ class BFSH3KeyframeConditioning:
             raise ValueError(f"guide has {len(guide_video)} frames, length is {length}: connect Prepare's length.")
         prompt = prompt_override.strip() or (pose_caption if pose else normals_caption)(len(pictures))
         print("[BFS H3 keyframe] guide prompt:\n" + prompt, flush=True)
-        positive, latent = MiniMaxH3ReferenceToVideo.execute(
-            clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
-            ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
-        positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+        try:
+            positive, latent = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip, vae=vae, prompt=prompt, width=width, height=height, length=length, ref_image_size="match",
+                ref_images={f"ref_image_{i}": p for i, p in enumerate(pictures, 1)}).args[:2]
+            self._free_gpu()
+            positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=0, vae=vae, image=guide_video).args[0]
+        finally:
+            self._free_gpu()
         # the guide carries the background: it stays in every step (keyframe_until does not apply)
         return model, positive, latent, prompt, guide_video, pictures
 
