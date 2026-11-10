@@ -242,3 +242,10 @@ for _mod in ("bfs_keyframe_marks", "bfs_video_segment_picker", "bfs_h3_swap_cond
 WEB_DIRECTORY = "./web/js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+
+try:
+    from .bfs_h3_image_swap_conditioning import BFSH3ImageCharacterSwapConditioning
+    NODE_CLASS_MAPPINGS["BFSH3ImageCharacterSwapConditioning"] = BFSH3ImageCharacterSwapConditioning
+    NODE_DISPLAY_NAME_MAPPINGS["BFSH3ImageCharacterSwapConditioning"] = "BFS H3 Image Character Swap Conditioning"
+except ImportError as _e:
+    print(f"[BFSNodes] H3 Image conditioning requires updated ComfyUI: {_e}")

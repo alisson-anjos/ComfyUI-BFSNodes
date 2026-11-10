@@ -2,6 +2,20 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.120.0] - 2026-11-10
+
+### Added
+- **BFS H3 Image Character Swap Conditioning**: native H3 Image conditioning and automatic still-image prompts. The guide is Picture 1; red, blue and green references are Pictures 2, 3 and 4. Supports normal maps, DWPose, overlays and outlines. Requires ComfyUI 0.45.0 or later.
+- **Add Guide for MiniMax H3 Image (BFS)**: experimental frozen guide reference aligned to the target image positions through a cloned ModelPatcher. Uses native H3 Image latents without an audio stream.
+- **Video Segment Picker**: optional `point_model` input and MolmoPoint-8B tracking method. Connect the loader from ComfyUI-Molmo2-H3.
+- Protected-object selections, a normal-map-inside-mask mode with feathered edges, translucent overlays and colored outlines.
+
+### Fixed
+- Bound picker mask caches by memory size, keep cached masks as boolean tensors and preserve existing masks when filling empty stretches.
+- Track empty stretches and nearest-anchor windows instead of repeatedly recomputing the full clip.
+- Correct SAM inference tensor handling for point edits, rendering invalidation, normal-map lazy input requests and Apply fix messages.
+- Stabilize compare preview sizing; expose memory cleanup after comparison.
+
 ## [1.119.5] - 2026-11-09
 
 ### Changed

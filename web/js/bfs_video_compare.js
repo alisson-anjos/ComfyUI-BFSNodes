@@ -510,6 +510,11 @@ app.registerExtension({
       const r = created?.apply(this, arguments);
       styles();
       const host = el("div", { style: "width:100%;height:100%;min-height:320px" });
+      // Keep clicks/drags inside the interactive player from reaching LiteGraph. Otherwise a
+      // pointer event on a video/control can be interpreted as a canvas gesture and the node
+      // may recalculate its DOM-widget height, making the compare panel collapse after use.
+      for (const type of ["pointerdown", "pointerup", "pointermove", "click", "dblclick", "contextmenu"])
+        host.addEventListener(type, e => e.stopPropagation());
       this._bfsCompare = buildPlayer(host);
       wheelToCanvas(host);   // the wheel zooms the canvas over the player too
       this.addDOMWidget("bfs_video_compare", "div", host, { serialize: false, hideOnZoom: false, getMinHeight: () => 320 });

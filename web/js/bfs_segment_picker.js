@@ -103,6 +103,7 @@ function loadMask(o, color) {
 
 export function Panel(io, options = {}) {   // exported: BFS Video Segment Picker shows one per frame
   const showEraser = options.showEraser !== false;
+  const showRemove = options.showRemove !== false;
   const state = reactive(parseState(io.get()));
   const data = ref(null);            // {session, width, height, image, objects} from the last run
   const loaded = new Map();          // object id -> loadMask result (not reactive: canvases and big arrays)
@@ -119,6 +120,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
   const fit = reactive({ w: 0, h: 0 });
 
   const save = () => io.set(JSON.stringify({ selected: state.selected, added: state.added, next: state.next }));
+  const entryId = kind => `${options.entryPrefix || ""}${kind}${state.next}`;
   const objects = computed(() => data.value?.objects || []);
   const colorOf = id => {
     const i = Math.max(0, objects.value.findIndex(o => o.id === id));
@@ -138,7 +140,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     await Promise.all(objs.map(async (o, i) => {
       const key = `${o.id}|${o.mask.filename}`;
       if (loaded.get(o.id)?.key === key) return;
-      try { loaded.set(o.id, { key, ...(await loadMask(o, o.remove ? CUT : PALETTE[i % PALETTE.length])) }); } catch { /* shown as missing */ }
+      try { loaded.set(o.id, { key, ...(await loadMask(o, o.remove ? CUT : (options.maskColor || PALETTE[i % PALETTE.length]))) }); } catch { /* shown as missing */ }
     }));
     ready.value++;
   }
@@ -222,7 +224,9 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
       return;
     }
     const o = objectAt(p);
-    if (o) toggle(o.id);
+    if (options.autoPointOnClick && (!o || !o.entry)) {
+      add({ id: entryId("p"), points: [{ x: +p.x.toFixed(4), y: +p.y.toFixed(4), label: 1 }] });
+    } else if (o) toggle(o.id);
   }
   function onMove(e) {
     if (data.value && brushing()) {
@@ -247,7 +251,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
       if (!r.ok || j.error) throw new Error(j.error || r.statusText);
       if (!j.objects.length) { error.value = entry.text ? `Nothing found for “${entry.text}”: try other words or a lower threshold.` : "The points gave an empty mask."; return; }
       state.added = [...state.added.filter(a => a.id !== entry.id), entry];
-      state.next = Math.max(state.next, parseInt(entry.id.slice(1)) + 1);
+      state.next = Math.max(state.next, Number(entry.id.match(/(\d+)$/)?.[1] || 0) + 1);
       data.value = { ...data.value, objects: [...data.value.objects.filter(o => o.entry !== entry.id), ...j.objects] };
       state.selected = [...state.selected, ...j.objects.map(o => o.id).filter(id => !isSel(id))];   // what you add is what you want
       save();
@@ -256,16 +260,16 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
       error.value = String(err.message || err);
     } finally { busy.value = ""; }
   }
-  const addText = () => { const t = text.value.trim(); if (t) { add({ id: `t${state.next}`, text: t }); text.value = ""; } };
+  const addText = () => { const t = text.value.trim(); if (t) { add({ id: entryId("t"), text: t }); text.value = ""; } };
   const addPoints = async () => {
     if (!points.value.some(p => p.label)) return;
-    await add(cutting() ? { id: `r${state.next}`, remove: true, points: points.value } : { id: `p${state.next}`, points: points.value });
+    await add(cutting() ? { id: entryId("r"), remove: true, points: points.value } : { id: entryId("p"), points: points.value });
     if (!error.value) setMode("select");
   };
   const addBrush = async () => {
     if (!strokes.value.length) return;
     const stroke = { image: data.value.image_key, strokes: strokes.value };
-    await add(cutting() ? { id: `e${state.next}`, remove: true, ...stroke } : { id: `b${state.next}`, ...stroke });
+    await add(cutting() ? { id: entryId("e"), remove: true, ...stroke } : { id: entryId("b"), ...stroke });
     if (!error.value) setMode("select");
   };
   function removeEntry(entryId) {
@@ -328,8 +332,8 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
           title: "Place points on something the automatic pass missed" }, "📍 Points"),
         h("button", { class: mode.value === "brush" ? "on" : "", disabled: !d, onClick: () => setMode("brush"),
           title: "Paint extra area into the mark by hand (e.g. hair SAM left out)" }, "🖌 Brush"),
-        h("button", { class: mode.value === "remove" ? "on" : "", disabled: !d, onClick: () => setMode("remove"),
-          title: "Place points on something to cut out of the mark (SAM segments it)" }, "➖ Remove"),
+        showRemove ? h("button", { class: mode.value === "remove" ? "on" : "", disabled: !d, onClick: () => setMode("remove"),
+          title: "Place points on something to cut out of the mark (SAM segments it)" }, "➖ Remove") : null,
         showEraser ? h("button", { class: mode.value === "eraser" ? "on" : "", disabled: !d, onClick: () => setMode("eraser"),
           title: "Paint an area to subtract manually from the selected mask" }, "🧽 Eraser") : null,
         h("span", { class: "hint" }, d ? `${objs.length} objects · ${state.selected.length} selected` : ""),

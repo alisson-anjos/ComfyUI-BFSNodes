@@ -319,3 +319,13 @@ them with their spec), **BFS Keyframe Marks** / **BFS Track From Frame (SAM 3)**
 tracked person's mask at each keyframe), **BFS Workflow Loop** (run a part of the
 graph once per item, injecting the item and changing widgets per iteration),
 **BFS XY Sweep** (a grid of any two widgets' values) and **BFS Frame Loop Start/End**.
+
+### MiniMax H3 Image character swap
+
+Requires **ComfyUI 0.45.0+** and the H3 Image model, image VAE and matching text encoder.
+
+Use **BFS H3 Image Character Swap Conditioning** with the Picker's single-image `hybrid` as `guide_image`. Connect character references in red, blue and green order. The generated prompt treats the guide as **Picture 1** and the characters as **Pictures 2–4**. Connect `positive` and `latent` to the sampler; the node also outputs the prompt for inspection. Normal map, DWPose, translucent overlay and outline guides are supported.
+
+**Add Guide for MiniMax H3 Image (BFS)** is an optional experimental alignment step. Connect the model, positive conditioning, native image latent, image VAE and marked guide; use its returned MODEL and positive with the sampler. It aligns the guide's frozen reference positions to the target canvas. It does not use the video/audio Add Guide latent format. Structural checks passed; visual equivalence to a video-trained guide LoRA is not guaranteed.
+
+For **MolmoPoint-8B** in Video Segment Picker, connect `point_model` from the loader in [ComfyUI-Molmo2-H3](https://github.com/alisson-anjos/ComfyUI-Molmo2-H3), select `MolmoPoint-8B` in `propagation_method`, and use **Apply fix** with the desired repair scope. SAM 3 still produces the masks.

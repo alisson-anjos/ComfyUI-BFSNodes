@@ -420,3 +420,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     'BFSMiniMaxH3GuideTarget': 'MiniMax-H3 Guide Target — Image / Video (BFS)',
     'BFSMiniMaxH3IdentityReference': 'MiniMax-H3 Identity Reference + RoPE (BFS)',
 }
+
+from .bfs_h3_image_guide import BFSH3ImageAddGuide
+NODE_CLASS_MAPPINGS['BFSH3ImageAddGuide'] = BFSH3ImageAddGuide
+NODE_DISPLAY_NAME_MAPPINGS['BFSH3ImageAddGuide'] = 'Add Guide for MiniMax H3 Image (BFS)'

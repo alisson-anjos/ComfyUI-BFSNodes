@@ -163,8 +163,11 @@ def detect_text(sam: tuple, frame: torch.Tensor, text: str, threshold: float, ma
     from comfy_extras.nodes_sam3 import SAM3_Detect
     model, clip = sam
     h, w = frame.shape[1:3]
-    masks, boxes = SAM3_Detect.execute(model=model, image=frame, conditioning=_text_cond(clip, text, max_detections),
-                                       threshold=float(threshold), refine_iterations=1, individual_masks=True).args
+    # ComfyUI can materialize SAM weights as inference tensors. Its detector must then
+    # run under inference_mode too; otherwise autograd asks those weights for a version counter.
+    with torch.inference_mode():
+        masks, boxes = SAM3_Detect.execute(model=model, image=frame, conditioning=_text_cond(clip, text, max_detections),
+                                           threshold=float(threshold), refine_iterations=1, individual_masks=True).args
     masks = masks.cpu() > .5 if masks.numel() else torch.zeros(0, h, w, dtype=torch.bool)
     boxes = boxes[0] if boxes else []
     return [(m, {"score": round(float(b.get("score", 0)), 3)}) for m, b in zip(masks, boxes)]
@@ -176,8 +179,9 @@ def detect_points(sam: tuple, frame: torch.Tensor, points: list[dict], threshold
     h, w = frame.shape[1:3]
     pos = [{"x": p["x"] * w, "y": p["y"] * h} for p in points if p["label"]]
     neg = [{"x": p["x"] * w, "y": p["y"] * h} for p in points if not p["label"]]
-    masks = SAM3_Detect.execute(model=model, image=frame, positive_coords=json.dumps(pos), negative_coords=json.dumps(neg),
-                                threshold=float(threshold), refine_iterations=2).args[0]
+    with torch.inference_mode():
+        masks = SAM3_Detect.execute(model=model, image=frame, positive_coords=json.dumps(pos), negative_coords=json.dumps(neg),
+                                    threshold=float(threshold), refine_iterations=2).args[0]
     return (masks[0].cpu() > .5) if masks.numel() else torch.zeros(h, w, dtype=torch.bool)
 
 
@@ -211,8 +215,16 @@ def auto_objects(sam: tuple, frame: torch.Tensor, concepts: list[str], threshold
     found = []
     for concept in concepts:
         for m, info in detect_text(sam, frame, concept, threshold, max_per_concept):
-            if int(m.sum()) >= max(64, min_area * h * w):
-                found.append((m, {**info, "label": concept}))
+            area = int(m.sum())
+            if area < max(64, min_area * h * w):
+                continue
+            # Generic "objects" may segment the entire scene. Such a mask is
+            # unsafe as an auto subject: it paints the background into the guide.
+            if concept.strip().casefold() in {"object", "objects"} and area >= .25 * h * w:
+                _, _, bw, bh = box_of(m)
+                if bw >= .98 * w and bh >= .98 * h:
+                    continue
+            found.append((m, {**info, "label": concept}))
     found = dedupe(found)
     found.sort(key=lambda f: box_of(f[0])[0])         # left to right, so "a1" reads naturally
     return [{"id": f"a{k + 1}", "label": info["label"], "source": "auto", "score": info["score"], "mask": m}
