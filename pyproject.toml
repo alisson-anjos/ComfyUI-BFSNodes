@@ -1,7 +1,7 @@
 [project]
 name = "bfsnodes"
 description = "ComfyUI nodes for video workflows: SAM 3 segmentation and Molmo2 tracking; MiniMax H3 character swapping and sampling; shot planning and looping; LTX video controls and identity transfer; model loaders, LoRA tools, and image/video utilities."
-version = "1.120.0"
+version = "1.121.0"
 license = {file = "LICENSE"}
 dependencies = [
     "torch",

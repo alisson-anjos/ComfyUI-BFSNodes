@@ -322,6 +322,12 @@ graph once per item, injecting the item and changing widgets per iteration),
 
 ### MiniMax H3 Image character swap
 
+**Auto Subjects:** connect the Picker's `hybrid` and `report` outputs to **BFS H3 Image Character Swap • Auto Subjects**, then connect references to the fixed red, blue and green slots. The node reads the actual selected colors; no manual subject count is needed. The guide is Picture 1 and active references follow from Picture 2 in color order. Blue or green may be used without red. Leave `prompt_override` empty for the generated prompt, or provide a complete replacement prompt; reference selection remains automatic.
+
+**BFS Optional Reference Image** loads a reference or returns no image for `[none]`. Both the target `megapixels` and interpolation `scale_method` are editable; 4 MP + Lanczos are defaults. Aspect ratio is preserved, and empty references skip resizing. Native H3 encoding still applies its own reference-size limits.
+
+The Picker's **colored hatching + contour** mode preserves the source pixels between colored lines, with `hatch_width` and `hatch_spacing` controls. MoGe is not executed for hatching. For normal-map guidance, connect rendered MoGe normals to the Picker and keep its normal convention consistent. The automatic prompt follows the Picker mode. **BFS H3 Image Swap Comparison** shows only active references and labels their actual Picture numbers.
+
 Requires **ComfyUI 0.45.0+** and the H3 Image model, image VAE and matching text encoder.
 
 Use **BFS H3 Image Character Swap Conditioning** with the Picker's single-image `hybrid` as `guide_image`. Connect character references in red, blue and green order. The generated prompt treats the guide as **Picture 1** and the characters as **Pictures 2–4**. Connect `positive` and `latent` to the sampler; the node also outputs the prompt for inspection. Normal map, DWPose, translucent overlay and outline guides are supported.
@@ -329,3 +335,9 @@ Use **BFS H3 Image Character Swap Conditioning** with the Picker's single-image 
 **Add Guide for MiniMax H3 Image (BFS)** is an optional experimental alignment step. Connect the model, positive conditioning, native image latent, image VAE and marked guide; use its returned MODEL and positive with the sampler. It aligns the guide's frozen reference positions to the target canvas. It does not use the video/audio Add Guide latent format. Structural checks passed; visual equivalence to a video-trained guide LoRA is not guaranteed.
 
 For **MolmoPoint-8B** in Video Segment Picker, connect `point_model` from the loader in [ComfyUI-Molmo2-H3](https://github.com/alisson-anjos/ComfyUI-Molmo2-H3), select `MolmoPoint-8B` in `propagation_method`, and use **Apply fix** with the desired repair scope. SAM 3 still produces the masks.
+
+### Model surgery
+
+**BFS Model Surgery** takes a MODEL and returns a cloned MODEL with reversible weight scaling. Execute once to populate the layer panel; filter names and add scale rules. Rules are a JSON list using `pattern` (glob by default, or `regex: true`), `scale`, optional `enabled`, and optional `rows: [start, exclusive_stop]`. Overlapping rules multiply in list order. Empty rules preserve the model. Connect after LoRA loaders to scale the materialized weights, including their preceding patches. This scales the model weights themselves, rather than just the LoRA delta; CLIP and VAE are separate.
+
+**BFS H3 PDD Surgery** provides experimental shared-base and per-offset controls for native H3 PDD output heads. All strengths at 1 preserve the original model. Setting offsets to zero does **not** recover a pre-distillation checkpoint, and sigmas stay unchanged.

@@ -2,6 +2,20 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.121.0] - 2026-11-12
+
+### Added
+- **H3 Image Auto Subjects conditioning**: reads the selected colors and guide style from the Picker report, includes only the corresponding character references and generates a matching prompt. Supports non-contiguous colors, an optional full `prompt_override`, and a blocked first pass while the user makes selections.
+- **Optional Reference Image**: an unused `[none]` slot skips loading/resizing. Active images use native proportional resizing with editable `megapixels` and `scale_method` controls (defaults: 4 MP, Lanczos).
+- **H3 Image Swap Comparison**: shows the original, marked guide, active references with their Picture numbering, and result; unused reference branches remain lazy.
+- **H3 Image Character Swap Prompt**: standalone prompt generation, including the new hatching format.
+- **Model Surgery**: inspect model parameter names and shapes, filter layers, and apply reversible scaling rules by glob, regex or row range using native ModelPatcher patches. Includes a browser panel.
+- **H3 PDD Surgery**: experimental independent scaling of the shared output head and PDD offset blocks, without changing sigmas or allocating full-size deltas. It does not undo distillation.
+
+### Changed
+- **Video Segment Picker**: adds colored hatching with a matching contour, editable line width/spacing and protected-object handling. The existing report output now includes the active subject IDs and mark style for automatic downstream conditioning.
+- Register the new modules independently so unavailable optional features do not prevent the rest of BFSNodes from loading.
+
 ## [1.120.0] - 2026-11-10
 
 ### Added

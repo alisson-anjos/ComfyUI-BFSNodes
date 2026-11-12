@@ -38,8 +38,23 @@ FREE_MODES = ["unload all models from the GPU", "unload all models + release Mol
               "keep everything loaded"]
 LEGACY_FREE = {"unload SAM 3 + clear the picker caches": "unload all models + clear the picker caches"}
 PROTECTED_NORMAL_STYLE = "normal map inside mask (needs normals)"
+HATCHING_STYLE = "colored hatching + contour"
 MARK_STYLES = ["normal map (needs normals)", PROTECTED_NORMAL_STYLE, "openpose + face (needs pose_keypoint)", "flat color", "translucent overlay", "colored outline", "shading (needs normals)", "blur",
-               "pixelate", "gray detail", "edges"]
+               "pixelate", "gray detail", "edges", HATCHING_STYLE]
+
+
+def hatching_alpha(mask, scale, width=1.0, spacing=1.0):
+    import cv2
+    line_width = max(2.5, scale * 0.01) * width
+    period = max(max(2.5, scale * 0.01) * 7, scale * 0.09) * spacing
+    h, w = mask.shape
+    y = torch.arange(h, device=mask.device, dtype=torch.float32)[:, None]
+    x = torch.arange(w, device=mask.device, dtype=torch.float32)[None, :]
+    distance = ((y + 0.29 * x + period) % period - period / 2).abs() / (1 + 0.29**2)**0.5
+    lines = (line_width / 2 + 0.5 - distance).clamp(0, 1)
+    inside = cv2.distanceTransform(mask.detach().cpu().numpy().astype('uint8'), cv2.DIST_L2, 5)
+    border = (line_width + 0.5 - torch.from_numpy(inside).to(mask.device)).clamp(0, 1)
+    return torch.maximum(lines, border) * mask
 
 
 def mark_fill(style, frame, normal_rgb, mask, color, alpha=HYBRID_TINT):
@@ -55,7 +70,7 @@ def mark_fill(style, frame, normal_rgb, mask, color, alpha=HYBRID_TINT):
         light = n.new_tensor([-0.35, -0.5, 0.8]); light = light / light.norm()
         lum = (0.30 + 0.70 * (n * light).sum(-1).clamp(0, 1))[..., None]
         return (lum * c).clamp(0, 1)
-    if style in ("flat color", "translucent overlay", "colored outline"):
+    if style in ("flat color", "translucent overlay", "colored outline", HATCHING_STYLE):
         return c.expand_as(frame).clone()
     gray = (frame[..., 0] * 0.299 + frame[..., 1] * 0.587 + frame[..., 2] * 0.114)
     ys, xs = torch.nonzero(mask, as_tuple=True)
@@ -736,7 +751,8 @@ class BFSVideoSegmentPicker:
                                       "keeps objects selected with the padlock or protect_mask unchanged inside the person mask. "
                                       "'translucent overlay' colors the exact mask with mark_opacity. "
                                       "'colored outline' draws only a thin border inside the mask, preserving frame detail "
-                                      "and held objects. Both work without normals."}),
+                                      "and held objects. 'colored hatching + contour' draws lines and a matching inner contour, "
+                                      "preserving the original texture and lighting between lines. These modes need no normals."}),
             "hybrid_grow": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01,
                                       "tooltip": "Margin around the subject in the hybrid guide, relative to its size (normal map: 0.04-0.12; "
                                                  "openpose: 0.08-0.18 around the person's convex hull)."}),
@@ -767,6 +783,10 @@ class BFSVideoSegmentPicker:
             "protect_mask": ("MASK", {"tooltip": "Optional external mask of objects to keep unchanged in 'normal map inside mask'. You can instead select protected objects with the padlock in this node. One mask or one per guide frame."}),
             "edge_feather": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.1, "step": 0.005,
                               "tooltip": "'normal map inside mask': soften the mark inward from the person and protected-object edges. Fraction of the shorter frame side."}),
+            "hatch_width": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                              "tooltip": "Hatching line and contour thickness multiplier. 1 matches the training format."}),
+            "hatch_spacing": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                                "tooltip": "Hatching line spacing multiplier. 1 matches the training format."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
@@ -784,13 +804,15 @@ class BFSVideoSegmentPicker:
              mark_style=MARK_STYLES[0], molmo_clip=None, point_model=None, pose_keypoint=None,
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
              pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
-             propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, protect_mask=None, edge_feather=0.01, **kw):
+             propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, protect_mask=None, edge_feather=0.01,
+             hatch_width=1.0, hatch_spacing=1.0, **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
                               molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
                               max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt,
-                              protect_mask=protect_mask, edge_feather=edge_feather, point_model=point_model)
+                              protect_mask=protect_mask, edge_feather=edge_feather, point_model=point_model,
+                              hatch_width=hatch_width, hatch_spacing=hatch_spacing)
         finally:
             self._free(sam3_model, free_after, point_model or molmo_clip)
 
@@ -863,7 +885,7 @@ class BFSVideoSegmentPicker:
               pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
               max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
               propagation_method="Molmo2 (classic)", prompt=None, protect_mask=None, edge_feather=0.01,
-              point_model=None):
+              point_model=None, hatch_width=1.0, hatch_spacing=1.0):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -1338,7 +1360,7 @@ class BFSVideoSegmentPicker:
                 if protected.shape[0] == 1:
                     protected = protected.expand(n, -1, -1)
                 protected = protected > 0.5
-            if mark_style == PROTECTED_NORMAL_STYLE and locked is not None:
+            if mark_style in (PROTECTED_NORMAL_STYLE, HATCHING_STYLE) and locked is not None:
                 protected = locked if protected is None else (protected | locked)
             if needs_normals and normals is not None:
                 if normals.shape[0] != n:
@@ -1351,7 +1373,7 @@ class BFSVideoSegmentPicker:
                 nm = None
             for sj, m in per_subject.items():   # subject j: the j-th color (= Picture j)
                 selected = m > 0.5
-                if mark_style in ("translucent overlay", PROTECTED_NORMAL_STYLE):
+                if mark_style in ("translucent overlay", PROTECTED_NORMAL_STYLE, HATCHING_STYLE):
                     hm = selected
                 elif mark_style == "colored outline":
                     # Draw inside the selected person only. Keep the scene, held props and
@@ -1362,10 +1384,18 @@ class BFSVideoSegmentPicker:
                 else:
                     hm = grow_masks(selected.float(), float(hybrid_grow)) > 0.5
                 col = HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)]
+                if mark_style == HATCHING_STYLE:
+                    first = next((mask for mask in selected if bool(mask.any())), None)
+                    ys, xs = torch.where(first) if first is not None else ([], [])
+                    hatch_scale = max(64, min(int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1))) if len(xs) else 64
                 for i in range(n):
                     if bool(hm[i].any()):
                         fill = mark_fill(mark_style, image[i, ..., :3].float(), nm[i] if nm is not None else None, hm[i], col)
-                        if mark_style == PROTECTED_NORMAL_STYLE:
+                        if mark_style == HATCHING_STYLE:
+                            target = hm[i] if protected is None else hm[i] & ~protected[i]
+                            alpha = hatching_alpha(target, hatch_scale, hatch_width, hatch_spacing)[..., None].to(base.dtype)
+                            base[i] = base[i] * (1 - alpha) + fill.to(base.dtype) * alpha
+                        elif mark_style == PROTECTED_NORMAL_STYLE:
                             import cv2
                             import numpy as np
                             target = hm[i]
@@ -1404,7 +1434,7 @@ class BFSVideoSegmentPicker:
                                 "timeline": (st("building the timeline previews", 0.9) or timeline_strip(image, per_subject, locked))}]}
         lost_frames = sum(r["end"] - r["start"] + 1 for r in lost_runs)
         st(f"done: {len(subjects)} subject(s), {lost_frames} frames without a mask", 1.0, log=True)
-        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects}), base)}
+        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects, "active_subjects": [int(sj) for sj in subjects if bool(per_subject[sj].any())], "mark_style": mark_style}), base)}
 
 
 NODE_CLASS_MAPPINGS = {"BFSVideoSegmentPicker": BFSVideoSegmentPicker}
