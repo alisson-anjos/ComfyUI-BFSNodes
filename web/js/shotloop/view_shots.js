@@ -178,11 +178,16 @@ function editor(c, cur) {
     h("div", { class: "row", style: "align-items:center;gap:10px;margin-bottom:4px" }, [
       check(!!cg, v => c.setMeta(i, "color_guide", v), "🎨 Colored Mark",
         "Paint each selected subject with the color of the picture it becomes (a translucent marker); the prompt says which color becomes which picture. It does not turn on inpainting."),
+      cg ? select(cur.color_guide_style, [["overlay", "translucent"], ["hatching", "hatching + contour"], ["normal map", "normal map (needs normals)"]],
+        v => c.setMarkStyle(i, v), { style: "width:auto", title: "How the marks are drawn on the guide (the same styles as BFS Video Segment Picker)" }) : null,
       cg ? h("span", { class: "row", style: "gap:6px;align-items:center" }, [hint(`opacity ${Number(cur.color_guide_opacity ?? 0.35).toFixed(2)}`),
-        h("input", { type: "range", min: 0.05, max: 0.8, step: 0.01, value: cur.color_guide_opacity ?? 0.35, style: "width:140px",
+        h("input", { type: "range", min: 0.05, max: cur.color_guide_style === "overlay" ? 0.8 : 1, step: 0.01, value: cur.color_guide_opacity ?? 0.35, style: "width:140px",
           onInput: e => { c.meta(i).color_guide_opacity = parseFloat(e.target.value); }, onChange: c.save })]) : null,
     ]),
+    cg && cur.color_guide_style === "normal map" ? h("div", { class: "note", style: "margin:2px 0 4px;padding:6px 8px" },
+      "Normal map: run MoGe on BFS Shot Unpack's frames (Render MoGe Geometry, normal_directx) and connect it to BFS Shot H3 Conditioning → normals. The preview shows a tint.") : null,
     subject1, ...more,
+    c.files.pointModel ? hint("📍 MolmoPoint is connected: a text selection is pointed by MolmoPoint, then SAM 3 tracks it.", "display:block;margin-top:4px") : null,
     cg ? h("div", { class: "row", style: "margin:4px 0;align-items:center;gap:8px" }, [
       h("button", { disabled: regionsN >= MAX_REFS, onClick: () => c.addMarkRegion(i) }, "+ Add subject"),
       cur.names.length <= regionsN ? hint("add pictures above to give each subject its own") : null,

@@ -230,6 +230,14 @@ node stops at 9 and LoRAs trained like OpenJutsu saw up to 9, so the log notes a
 
 ## Mask & crop (SAM 3)
 
+**MolmoPoint (optional).** Connect *Auto Download & Load MolmoPoint-8B* (ComfyUI-Molmo2-H3) to the planner's
+`point_model` input. While it is connected, a selection written as text (`the man on the left`, `the second car`,
+`the woman holding the cup`) is pointed by MolmoPoint on the shot (the object it follows longest, on its frame
+nearest the middle of the shot) and SAM 3 tracks from that point, instead of reading the text itself. SAM 3's own
+text grounding finds every match of a noun; MolmoPoint understands which one. Points you click always win, and when
+MolmoPoint finds nothing the text goes to SAM 3 as before. The panel's previews use it after the workflow has run
+once with it connected (ComfyUI only hands models to nodes when they run).
+
 Generate only part of the frame. In a shot's editor (**What changes**), type what to select in English
 (`person in white`, `woman with red hair`, `red car`; up to 32 tokens, commas for several things) or click
 **🎯 Points** to pick positive / negative points on any frame of the shot, then **👁 Preview** (red = mask,
@@ -263,7 +271,20 @@ becomes the character from `<Picture 3>`"), for any model or LoRA. Every picture
 green, purple, red, blue, yellow, magenta, cyan, orange, white, brown, pink, olive by default); change it when it is
 too close to a color in the video. In a shot, turn on Colored Mark: every row under it is a subject, with its text or
 🎯 points and **→ Picture N**, the picture it becomes. *Subject 1* is the shot's own selection; **+ Add subject** adds
-another row (the points window has one point set per subject). This is only a visual marker: it does not create an inpainting mask
+another row (the points window has one point set per subject).
+
+The style next to the checkbox sets how the marks are drawn (the same styles as **BFS Video Segment Picker**):
+
+| style | what the guide shows | opacity |
+|---|---|---|
+| **translucent** (default) | the subject tinted with its color | 0.35 |
+| **hatching + contour** | colored diagonal lines and a matching inner contour; the original texture and light stay visible between the lines | 1 |
+| **normal map** | the subject's surface-normal map in gray detail, tinted with its color (no original texture) | 1 |
+
+*Normal map* needs MoGe normals of the same frames: run MoGe on **BFS Shot Unpack**'s frames (Run MoGe Inference →
+Render MoGe Geometry, `normal_directx`) and connect it to **BFS Shot H3 Conditioning → normals**. The panel's preview
+draws the hatching; for the normal map it shows a tint. The prompt says how each subject is marked ("the subject
+marked with green hatching lines and a green contour uses the character appearance from `<Picture 1>`"). This is only a visual marker: it does not create an inpainting mask
 or change **Full frame**, **Mask only** or crop behavior. More than one marked subject needs Crop off, and the
 shot must have every picture the marks use. The overlay keeps movement and facial
 expression visible. Plans before 1.113 (a second region for ref 2) open with that region as `<Picture 2>`.

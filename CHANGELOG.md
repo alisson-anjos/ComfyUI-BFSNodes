@@ -7,6 +7,10 @@ All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 ### Changed
 - **Shot Planner panel reorganized**: four tabs in working order (Video → Pictures & prompt → Shots → Run). The shot editor's selection is one list under **What changes**: *Subject 1* is the shot's own selection and, with Colored Mark on, each row says which picture it becomes (**→ Picture N**); **+ Add subject** adds rows. The five generation-mode cards are one **Generate** dropdown. Rare settings (cut detector, frame grid, fps, VLM, picture descriptions, memory, second pass, mask settings) are collapsed. Shorter labels and tooltips; Portuguese, Spanish and Chinese updated.
 
+### Added
+- **Shot Planner Colored Mark styles**: *translucent* (as before), *hatching + contour* and *normal map*, the BFS Video Segment Picker styles. The normal map takes MoGe normals of the shot's frames from the new optional `normals` input of BFS Shot H3 Conditioning (both nodes). The prompt names the style of the marks.
+- **Shot Planner MolmoPoint**: optional `point_model` input (MolmoPoint-8B). While connected, a text selection is pointed by MolmoPoint and SAM 3 tracks from that point, so phrases like "the man on the left" pick the right subject. Falls back to SAM 3 text when MolmoPoint finds nothing.
+
 ### Removed
 - **Shot Planner shot filters and face cast**: *Analyse people & faces*, the person/face/dark/static filters, the per-shot *filters decide / always run / always skip* selector, *Find people*, *Split where the main person changes* and *Only run shots with a detected person*, with their server routes. Use **⏸ Disable** to turn a shot off. Saved plans still load: a shot skipped by hand opens disabled, and the old filter and cast settings are ignored.
 

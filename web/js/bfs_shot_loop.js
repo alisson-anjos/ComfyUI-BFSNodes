@@ -41,7 +41,7 @@ const TABS = [["video", "🎞 Video"], ["prompts", "📝 Pictures & prompt"], ["
 
 function Panel(io) {
   const plan = reactive({ ...DEFAULTS });
-  const files = reactive({ videos: [], images: [] });
+  const files = reactive({ videos: [], images: [], pointModel: false });   // pointModel: MolmoPoint on the planner
   const an = ref(null);          // analysis from the server
   const cuts = ref([]);
   const detectorUsed = ref("");
@@ -154,7 +154,7 @@ function Panel(io) {
       out.push({ start: b[i], end: b[i + 1], len: b[i + 1] - b[i], gen: snapUp(b[i + 1] - b[i], plan.grid),
                  cut: cs.has(b[i]), enabled: m.enabled !== false, refs: refList(m.refs, m.ref, m.ref2), prompt: m.prompt || "",
                  chain: m.chain || "head", chainFrame: m.chain_frame || "first", chainHistory: historyLen(m.chain_history),
-                 color_guide: !!m.color_guide, color_guide_picture: +m.color_guide_picture || 1,
+                 color_guide: !!m.color_guide, color_guide_picture: +m.color_guide_picture || 1, color_guide_style: m.color_guide_style || "overlay",
                  color_guide_opacity: m.color_guide_opacity ?? 0.35, regions: markRegions(m),
                  crop: !!m.crop, inpaint: !!m.inpaint, paste: !!m.paste, pasteText: m.paste_text || "", strength: m.strength ?? 1, mask: m.mask || {}, target: m.target || "",
                  extMask: !!plan.mask_video || !!(plan.track?.points?.length), trackMask: !!(plan.track?.points?.length) });
@@ -256,7 +256,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   const checksFor = i => checks.value.filter(c => c.shot === i);
 
   async function refreshFiles() {
-    try { const r = await api.fetchApi("/bfs/shotloop/files"); const j = await r.json(); files.videos = j.videos || []; } catch (e) { /* ignore */ }
+    try { const r = await api.fetchApi("/bfs/shotloop/files"); const j = await r.json(); files.videos = j.videos || []; files.pointModel = !!j.point_model; } catch (e) { /* ignore */ }
   }
   async function analyze() {
     an.value = null; error.value = "";
@@ -288,6 +288,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
           chain: keep[i]?.chain || "head", chain_frame: keep[i]?.chain_frame || "first", chain_history: historyLen(keep[i]?.chain_history),
           crop: !!keep[i]?.crop, inpaint: !!keep[i]?.inpaint, paste: !!keep[i]?.paste, paste_text: keep[i]?.paste_text || "", strength: keep[i]?.strength ?? 1, mask: keep[i]?.mask || {}, target: keep[i]?.target || "",
           color_guide: !!keep[i]?.color_guide, color_guide_picture: keep[i]?.color_guide_picture || 1, color_guide_opacity: keep[i]?.color_guide_opacity ?? 0.35,
+          ...(keep[i]?.color_guide_style ? { color_guide_style: keep[i].color_guide_style } : {}),
           color_guide_regions: (keep[i]?.color_guide_regions || []).map(r => ({ ...r })) }));
         sel.value = 0; save();
       }
@@ -367,6 +368,11 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   const setMarkRegion = (i, j, field, v) => {
     const m = meta(i); m.color_guide_regions = markRegions(m).map((r, q) => (q === j ? { ...r, [field]: v } : r)); save();
   };
+  // how the marks are drawn; each style starts at its usual opacity (the overlay is translucent, the others solid)
+  const setMarkStyle = (i, style) => {
+    Object.assign(meta(i), { color_guide_style: style, color_guide_opacity: style === "overlay" ? 0.35 : 1 }); save();
+    const s = segs.value[i]; if (s && maskPrev.value[segKey(s)]) previewMask(i);
+  };
   const removeMarkRegion = i => j => { const m = meta(i); m.color_guide_regions = markRegions(m).filter((_, q) => q !== j); save(); };
   const setPictureColor = (k, color) => {
     const list = [...(plan.picture_colors || [])];
@@ -433,7 +439,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       if (fields.target) m.target = src.target;
       if (fields.color_guide) {
         m.color_guide = src.color_guide; m.color_guide_picture = src.color_guide_picture;
-        m.color_guide_opacity = src.color_guide_opacity;
+        m.color_guide_opacity = src.color_guide_opacity; m.color_guide_style = src.color_guide_style;
         m.color_guide_regions = src.regions.map(r => ({ ...r, points: [...(r.points || [])] }));
       }
       if (fields.chain && i > 0) { m.chain = src.chain; m.chain_frame = src.chainFrame; m.chain_history = src.chainHistory; }
@@ -480,6 +486,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   const autoFor = s => {
     const marks = s.color_guide ? [[s.color_guide_picture, pictureColor(plan, s.color_guide_picture)],
       ...s.regions.filter(r => String(r.text || "").trim() || (r.points || []).length).map(r => [r.picture, pictureColor(plan, r.picture)])] : [];
+    if (marks.length && s.color_guide_style !== "overlay") marks.push(s.color_guide_style);   // same as auto_prompt_for
     return JSON.stringify([s.prompt || plan.global_prompt || "", s.names, marks, modeOf(s), s.mask?.text || "", s.target || "",
       plan.auto_prompt?.template || "", plan.auto_prompt?.style || "h3", plan.auto_prompt?.trigger ?? "motion_transfer", "motion-trigger-bindings-v7"]);
   };
@@ -835,7 +842,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     openPoints, switchPointRegion, savePoints, savePointsAll, saveTrack, clearTrack, pointsTo, clearMask, copyFrom, analyseVLM, setVlmCfg,
     applySug, applyAllSug, setGlobalMaskVideo, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
     frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describePictures, setPictureDetail, setPictureCfg,
-    setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
+    setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor, setMarkStyle,
     autoFor, writtenOf, setAuto, setWritten, writePrompts,
   };
 

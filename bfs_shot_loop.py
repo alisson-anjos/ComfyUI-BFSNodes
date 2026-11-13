@@ -568,7 +568,11 @@ def resolve_plan(plan: dict, analysis: dict, path: str | None = None) -> list[di
         s["color_guide_color2"] = str(m.get("color_guide_color2") or "")
         s["color_guide_points2"] = list(m.get("color_guide_points2") or [])
         s["color_guide_key2"] = int(m.get("color_guide_key2") or 0)
-        s["color_guide_opacity"] = min(0.8, max(0.05, float(m.get("color_guide_opacity") or 0.35)))
+        style = str(m.get("color_guide_style") or COLOR_GUIDE_STYLES[0])
+        if style in COLOR_GUIDE_STYLES[1:]:   # only set when not the default, so older stored shots keep their signature
+            s["color_guide_style"] = style
+        cap = 0.8 if style not in COLOR_GUIDE_STYLES[1:] else 1.0
+        s["color_guide_opacity"] = min(cap, max(0.05, float(m.get("color_guide_opacity") or 0.35)))
         s["strength"] = min(1.0, max(0.05, float(m.get("strength") or 1.0)))
         s["mask"] = m.get("mask") or {}
         s["target"] = m.get("target") or ""
@@ -854,6 +858,42 @@ def segment_frames(imgs: torch.Tensor, spec: dict) -> torch.Tensor:
     return torch.cat([back[:-1], fwd], 0)
 
 
+_POINT: dict[str, Any] = {}          # the MolmoPoint model connected to a planner (its last run)
+
+
+def _molmo_active(spec: dict) -> bool:
+    """A text selection (no points, no mask video) is pointed by MolmoPoint while one is connected to the planner."""
+    m = _POINT.get("model")
+    return (m is not None and hasattr(m, "runtime") and bool(str(spec.get("text") or "").strip())
+            and not spec.get("points") and not spec.get("ext"))
+
+
+def molmo_spec(imgs: torch.Tensor, spec: dict, fps: float) -> dict:
+    """The selection's text pointed by MolmoPoint on the shot's frames [N,H,W,3]: the object it follows longest, as a
+    positive point on its frame nearest the middle of the shot, so SAM 3 tracks from there. Falls back to the text
+    when MolmoPoint finds nothing or fails."""
+    text = str(spec.get("text") or "").strip().rstrip(".")
+    noun = re.sub(r"^(the|a|an)\s+", "", text, flags=re.I)
+    try:
+        ans = _POINT["model"].runtime.track_subjects([f"Track the {noun}."], imgs, fps, max_fps=2.0)[0]
+    except Exception as e:  # noqa: BLE001 - SAM 3 text still works
+        print(f"[BFS Shot] MolmoPoint failed ({e}); SAM 3 reads the text '{text}'", flush=True)
+        return spec
+    pts = ans.get("points") or []
+    if not pts:
+        print(f"[BFS Shot] MolmoPoint found no '{text}'; SAM 3 reads the text", flush=True)
+        return spec
+    objs: dict[int, list] = {}
+    for t, o, x, y in pts:
+        objs.setdefault(int(o), []).append((float(t), float(x), float(y)))
+    track = max(objs.values(), key=len)
+    mid = (imgs.shape[0] - 1) / 2.0
+    t, x, y = min(track, key=lambda p: abs(p[0] * fps - mid))
+    key = max(0, min(imgs.shape[0] - 1, int(round(t * fps))))
+    print(f"[BFS Shot] MolmoPoint: '{text}' -> {len(objs)} object(s), point ({x:.2f}, {y:.2f}) on frame {key}", flush=True)
+    return dict(spec, points=[{"x": x, "y": y, "label": 1}], key=key)
+
+
 def _mask_key(path: str, analysis: dict, start: int, length: int, spec: dict) -> tuple:
     ext = spec.get("ext")
     if ext and "track" in ext:
@@ -867,7 +907,8 @@ def _mask_key(path: str, analysis: dict, start: int, length: int, spec: dict) ->
     else:
         e = None
     return (path, os.path.getmtime(path), float(analysis["fps"]), int(start), int(length),
-            json.dumps({k: spec[k] for k in ("text", "points", "key", "threshold", "max_objects")}, sort_keys=True), e)
+            json.dumps({k: spec[k] for k in ("text", "points", "key", "threshold", "max_objects")}, sort_keys=True), e) \
+        + (("molmopoint",) if _molmo_active(spec) else ())
 
 
 def shot_mask(path: str, analysis: dict, start: int, length: int, spec: dict) -> dict:
@@ -890,6 +931,9 @@ def shot_mask(path: str, analysis: dict, start: int, length: int, spec: dict) ->
             return out
         frames = _read_frames(path, src[idx], (w, h), stage="Reading the shot")
         imgs = torch.from_numpy(np.stack(frames).astype(np.float32) / 255.0)
+        if _molmo_active(spec):
+            _status("Pointing the selection with MolmoPoint", force=True)
+            spec = molmo_spec(imgs, spec, float(analysis["fps"]))
         _status(f"Segmenting {len(frames)} frames with SAM 3", force=True)
         what = f"{len(spec.get('points') or [])} points on frame {int(spec.get('key') or 0)}" if spec.get("points") \
             else f"'{spec.get('text', '')}'"
@@ -1102,7 +1146,7 @@ def uncrop(result: torch.Tensor, shot: dict, edge_hardness: float = 0.0, match_c
 
 
 def mask_preview(path: str, analysis: dict, start: int, length: int, spec: dict, count: int = 6,
-                 color: str = "#ff283c", opacity: float = 0.55) -> dict:
+                 color: str = "#ff283c", opacity: float = 0.55, style: str = "overlay") -> dict:
     """A few frames of the shot with the selected region tinted and the crop box, as data URLs."""
     import cv2
     r = shot_mask(path, analysis, start, length, spec)
@@ -1119,7 +1163,11 @@ def mask_preview(path: str, analysis: dict, start: int, length: int, spec: dict,
     for i, fr in zip(picks, frames):
         img = fr.copy()
         m = masks[min(i, masks.shape[0] - 1)].numpy().astype(bool)
-        img[m] = (img[m].astype(np.float32) * (1 - alpha) + tint * alpha).astype(np.uint8)
+        if style == "hatching" and m.any():   # the hatching itself; 'normal map' needs normals, so it previews as a tint
+            frame = torch.from_numpy(img.astype(np.float32) / 255.0)[None]
+            img = (paint_mark(frame, torch.from_numpy(m)[None], color, opacity, "hatching")[0].numpy() * 255).astype(np.uint8)
+        else:
+            img[m] = (img[m].astype(np.float32) * (1 - alpha) + tint * alpha).astype(np.uint8)
         if box:
             x0, y0, x1, y1 = box_px(box, w, h)
             cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), (255, 210, 90), 2)
@@ -1829,6 +1877,8 @@ def shot_mode(seg: dict) -> str:
 def auto_prompt_for(instruction: str, names: list, seg: dict, template: str = "", style: str = "h3", prompt_trigger: str = "motion_transfer") -> str:
     """What a written prompt was made from (the panel computes the same string to show it is out of date)."""
     marks = [[x["picture"], x["color"]] for x in seg.get("color_guide_marks") or []] if seg.get("color_guide") else []
+    if marks and seg.get("color_guide_style") in COLOR_GUIDE_STYLES[1:]:
+        marks.append(seg["color_guide_style"])
     return json.dumps([instruction or "", names, marks, shot_mode(seg), (seg.get("mask") or {}).get("text") or "",
                        seg.get("target") or "", template or "", style or "h3", prompt_trigger, AUTO_PROMPT_REVISION], separators=(",", ":"), ensure_ascii=False)
 
@@ -1850,8 +1900,8 @@ def write_h3_prompt(clip, frames: list, times: list, pictures: list, picture_tex
     notes = []
     if seg.get("color_guide"):
         marks = seg.get("color_guide_marks") or []
-        who = "; ".join(f"the subject marked in {_COLOR_GUIDE_NAMES.get(x['color'], x['color'])} follows the appearance from "
-                        f"<Picture {x['picture']}>" for x in marks)
+        who = "; ".join(f"the subject {mark_phrase(_COLOR_GUIDE_NAMES.get(x['color'], x['color']), seg.get('color_guide_style'))} "
+                        f"follows the appearance from <Picture {x['picture']}>" for x in marks)
         notes.append("In the source frames, colored subject markings identify performers, not their appearance: "
                      f"{who}. Preserve these color-to-picture bindings throughout the performance. Describe markings "
                      "generically; facial highlights convey expression. The target uses the reference identities and "
@@ -1955,7 +2005,7 @@ def tidy_caption(text: str, seg: dict | None = None, trigger: str | None = None)
     t = " ".join(drop_repeats(t).split())
     t = re.sub(r"(?<![<\w])(Picture) (\d+)(?![\w>])", r"<\1 \2>", t)
     if seg and seg.get("color_guide"):
-        t = color_guide_prompt(t, seg.get("color_guide_marks") or [])
+        t = color_guide_prompt(t, seg.get("color_guide_marks") or [], seg.get("color_guide_style"))
     if trigger is not None:
         t = re.sub(r"^(?:motion_transfer|body_swap|vfx_edit):\s*", "", t, flags=re.I)
         if trigger:t = trigger + ": " + t
@@ -2078,7 +2128,7 @@ def tidy_h3_prompt(text: str, seg: dict | None = None, trigger: str = "", cuts: 
     # 'Picture 1' / 'Subject 2' / 'Video 1' written without their brackets
     t = re.sub(r"(?<![<\w])(Picture|Subject|Video|Audio) (\d+)(?![\w>])", r"<\1 \2>", t)
     if seg and seg.get("color_guide"):
-        t = color_guide_prompt(t, seg.get("color_guide_marks") or [])
+        t = color_guide_prompt(t, seg.get("color_guide_marks") or [], seg.get("color_guide_style"))
     return t.strip()
 
 
@@ -3009,8 +3059,12 @@ class BFSShotPlanner:
                                     "frame; a different count is spread over the video."}),
                 "vlm": ("CLIP", {"tooltip": "Optional vision-language model (CLIPLoader with qwen3vl_4b / qwen3vl_8b). "
                                             "It looks at every shot and suggests what to segment, a description of the "
-                                            "shot (fills {shot} in the prompt) and whether to run it. Settings in the "
+                                            "shot (fills {shot} in the prompt). Settings in the "
                                             "panel's VLM card."}),
+                "point_model": ("MOLMO_POINT_MODEL", {"tooltip": "Optional MolmoPoint-8B (Auto Download & Load MolmoPoint-8B). "
+                                "When connected, a selection written as text ('the man on the left', 'the red car') is "
+                                "pointed by MolmoPoint and SAM 3 tracks from those points, instead of SAM 3 reading the "
+                                "text. The panel's previews use it after one run."}),
             },
             # the queued workflow: what renders the shots (LoRA, seed, sampler...) is part of a stored shot's signature
             "hidden": {"graph": "PROMPT", "node_id": "UNIQUE_ID"},
@@ -3050,7 +3104,7 @@ class BFSShotPlanner:
             pass
         return plan
 
-    def plan_shots(self, plan, prompt=None, vlm=None, mask=None, graph=None, node_id=None, ref_image=None,
+    def plan_shots(self, plan, prompt=None, vlm=None, mask=None, graph=None, node_id=None, ref_image=None, point_model=None,
                    ref_image_2=None):
         p = _load_plan(plan)
         if ref_image is not None or ref_image_2 is not None:
@@ -3060,6 +3114,7 @@ class BFSShotPlanner:
                   "are ignored. Set the references in the panel (Prompts & refs tab, up to 100).", flush=True)
         if vlm is not None:
             _VLM["clip"] = vlm       # the panel's Analyse button uses it too
+        _POINT["model"] = point_model   # text selections are pointed by MolmoPoint while it is connected
         vcfg = vlm_cfg(p.get("vlm_cfg"))
         use_vlm = vlm is not None and vcfg["enabled"]
         suggestions = []
@@ -3266,7 +3321,7 @@ class BFSShotPlanner:
                                             tag=f"[BFS Shot Planner] shot {i + 1}", keep_missing=vlm is None)
             shot_prompt = fill_target(template, s.get("target", "") or auto_target.get(i, ""))
             if s.get("color_guide") and i not in written:   # a written prompt already has the mapping
-                shot_prompt = color_guide_prompt(shot_prompt, s["color_guide_marks"])
+                shot_prompt = color_guide_prompt(shot_prompt, s["color_guide_marks"], s.get("color_guide_style"))
             shots.append({
                 "index": i, "count": len(segs), "start": s["start"], "end": s["end"],
                 "length": s["end"] - s["start"], "gen_length": glen, "head": head, "fps": fps,
@@ -3277,6 +3332,7 @@ class BFSShotPlanner:
                 "color_guide": bool(s.get("color_guide")),
                 "color_guide_color": str(s.get("color_guide_color") or "#00ff00"),
                 "color_guide_opacity": float(s.get("color_guide_opacity") or 0.35),
+                "color_guide_style": s.get("color_guide_style") or COLOR_GUIDE_STYLES[0],
                 "color_guide_text2": str(s.get("color_guide_text2") or ""),
                 "color_guide_color2": str(s.get("color_guide_color2") or "#9b30ff"),
                 "color_guide_points2": list(s.get("color_guide_points2") or []),
@@ -3648,6 +3704,59 @@ def color_guide(frames: torch.Tensor, mask: torch.Tensor, color: str = "#00ff00"
     return (frames[..., :3].float() * (1 - alpha) + tint * alpha).clamp(0, 1)
 
 
+# how a Colored Mark is drawn: translucent overlay (default), colored hatching + contour, or the subject's normal map
+# tinted with its color (needs MoGe normals); the last two are BFS Video Segment Picker's mark styles
+COLOR_GUIDE_STYLES = ("overlay", "hatching", "normal map")
+
+
+def paint_mark(frames: torch.Tensor, mask: torch.Tensor, color: str = "#00ff00", opacity: float = 0.35,
+               style: str = "overlay", normals: torch.Tensor | None = None) -> torch.Tensor:
+    """Draw one Colored Mark on the guide frames [N,H,W,3] in the given style. normals: MoGe normals of the same frames
+    (Render MoGe Geometry, normal_directx), only for 'normal map'."""
+    if style not in COLOR_GUIDE_STYLES[1:]:
+        return color_guide(frames, mask, color, opacity)
+    from .bfs_video_segment_picker import hatching_alpha, hybrid_tint, to_opencv_normals
+    try:
+        rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    except (TypeError, ValueError, IndexError):
+        raise ValueError(f"Colored Mark: invalid color {color!r}; expected a hex color such as #00ff00") from None
+    N, H, W = frames.shape[:3]
+    if mask.ndim == 2:
+        mask = mask[None]
+    m = torch.nn.functional.interpolate(mask[:, None].float(), size=(H, W), mode="nearest")[:, 0].cpu() > 0.5
+    m = m[torch.clamp(torch.arange(N), max=m.shape[0] - 1)]
+    op = min(1.0, max(0.05, float(opacity)))
+    out = frames[..., :3].float().clone()
+    if style == "hatching":
+        first = next((x for x in m if bool(x.any())), None)
+        ys, xs = torch.where(first) if first is not None else ([], [])
+        scale = max(64, min(int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))) if len(xs) else 64
+        tint = torch.tensor(rgb, dtype=out.dtype, device=out.device) / 255.0
+        for i in range(N):
+            if bool(m[i].any()):
+                a = hatching_alpha(m[i], scale)[..., None].to(out.device, out.dtype) * op
+                out[i] = out[i] * (1 - a) + tint * a
+        return out.clamp(0, 1)
+    if normals is None:
+        raise ValueError("Colored Mark 'normal map' needs MoGe normals of the shot: run MoGe on BFS Shot Unpack's frames "
+                         "(Render MoGe Geometry, normal_directx) and connect it to BFS Shot H3 Conditioning -> normals, "
+                         "or choose the overlay or hatching style.")
+    if normals.shape[0] != N:
+        raise ValueError(f"Colored Mark 'normal map': {normals.shape[0]} normal maps for {N} guide frames; run MoGe on "
+                         "the same frames (BFS Shot Unpack's frames).")
+    nm = normals[..., :3].float()
+    if nm.shape[1:3] != (H, W):
+        nm = torch.nn.functional.interpolate(nm.movedim(-1, 1), size=(H, W), mode="bilinear",
+                                             align_corners=False).movedim(1, -1)
+    nm = to_opencv_normals(nm.to(out.device), "normal_directx")
+    for i in range(N):
+        if bool(m[i].any()):
+            fill = hybrid_tint(nm[i], rgb)
+            a = m[i].to(out.device, out.dtype)[..., None] * op
+            out[i] = out[i] * (1 - a) + fill.to(out.dtype) * a
+    return out.clamp(0, 1)
+
+
 # one mark color per picture, <Picture 1> first: the first seven are the colors the first Colored Mark sets used
 MARK_PALETTE = ["#00ff00", "#9b30ff", "#ff2020", "#168cff", "#ffe600", "#ff00d4", "#00e5c0", "#ff8000", "#ffffff",
                 "#8b4513", "#ff9ec4", "#808000"]
@@ -3704,7 +3813,16 @@ def extra_mark_masks(shot: dict, log: str = "") -> list[tuple]:
     return out
 
 
-def color_guide_prompt(prompt: str, marks: list[dict]) -> str:
+def mark_phrase(name: str, style: str | None = None) -> str:
+    """How a Colored Mark of this color is drawn, in words ('marked in green' for the translucent overlay)."""
+    if style == "hatching":
+        return f"marked with {name} hatching lines and a {name} contour"
+    if style == "normal map":
+        return f"drawn as a {name} surface-normal map"
+    return f"marked in {name}"
+
+
+def color_guide_prompt(prompt: str, marks: list[dict], style: str | None = None) -> str:
     """Say which picture each mark color becomes, inside the prompt's subject_definitions / detailed_description when
     it has them (else at the end). Written for any model and LoRA: the person marked in a color becomes the character
     of that color's picture."""
@@ -3716,7 +3834,7 @@ def color_guide_prompt(prompt: str, marks: list[dict]) -> str:
             pairs.append((name, x["picture"]))
     if not pairs:
         return str(prompt or "")
-    who = "; ".join(f"the subject marked in {name} uses the character appearance from <Picture {k}>" for name, k in pairs)
+    who = "; ".join(f"the subject {mark_phrase(name, style)} uses the character appearance from <Picture {k}>" for name, k in pairs)
     mapping = (f"Color bindings: {who}. Keep each binding fixed through position changes, occlusion and cuts, "
                "transferring the guide performance and timing. Markings and facial highlights are guidance only; "
                "render reference appearances with the requested visual changes, including scene or style changes, "
@@ -3957,6 +4075,9 @@ class BFSShotH3Conditioning:
                     "tooltip": "Native temporal mode only: spatial scale of the motion video before encoding; output size, frame count and identity references stay unchanged. Try 0.5 to reduce guide tokens/VRAM."}),
                 "native_temporal_backend": (["flash partitions (no compile)", "flex (original)", "comfy kitchen (experimental)"], {"default": "flash partitions (no compile)",
                     "tooltip": "Native temporal mode only. Flash partitions preserves the temporal attention policy without compilation; Flex is the original implementation."}),
+                "normals": ("IMAGE", {"tooltip": "Optional MoGe normals of the shot's frames (BFS Shot Unpack's frames -> "
+                                                 "Run MoGe Inference -> Render MoGe Geometry, normal_directx). Only for shots "
+                                                 "whose Colored Mark style is 'normal map'."}),
             },
         }
 
@@ -3970,7 +4091,8 @@ class BFSShotH3Conditioning:
 
     def condition(self, shot, clip, vae, guide_mode, first_frame, ref_image_size,
                   audio_vae=None, with_audio=False, model=None, vlm=None, setting_ref="off", setting_mask=None, inpaint="off", mask_guide="off", mask_ref_size="1/2", mask_guide_look="grey blurred",
-                  source_blur="off", source_blur_strength=1.0, source_blur_segmenter="SAM 3.1", source_blur_effect="blur", clip_video_fps=2.0, native_guide_scale=1.0, native_temporal_backend="flash partitions (no compile)"):
+                  source_blur="off", source_blur_strength=1.0, source_blur_segmenter="SAM 3.1", source_blur_effect="blur", clip_video_fps=2.0, native_guide_scale=1.0, native_temporal_backend="flash partitions (no compile)",
+                  normals=None):
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide, MiniMaxH3ReferenceToVideo
         # every picture of the shot, <Picture 1> first (chosen in the planner; use_ref_2 left in 1.113)
         refs = {f"ref_image_{k}": r for k, r in enumerate(shot_refs(shot)[:MAX_REFS])}
@@ -3984,7 +4106,7 @@ class BFSShotH3Conditioning:
             for x in marks:
                 if owner.setdefault(x["color"], x["picture"]) != x["picture"]:
                     raise ValueError(f"Colored Mark: <Picture {owner[x['color']]}> and <Picture {x['picture']}> have the "
-                                     f"same mark color ({x['color']}). Give one of them another color (Prompts & refs tab).")
+                                     f"same mark color ({x['color']}). Give one of them another color (Pictures & prompt tab).")
         prev = chain_image(shot)
         if prev is not None and shot.get("chain") == "reference":
             refs[f"ref_image_{len(refs)}"] = prev   # one more <Picture n>, after the shot's own
@@ -4047,16 +4169,17 @@ class BFSShotH3Conditioning:
             if not shot.get("mask_src") and not shot.get("crop"):
                 raise ValueError(f"{gtag}: Colored Mark needs a person selection (SAM 3 text/points or a mask video)")
             cmask = generation_mask(shot, log=gtag)
-            seen = color_guide(seen, cmask, shot.get("color_guide_color", "#00ff00"),
-                               shot.get("color_guide_opacity", 0.35))
+            mstyle = shot.get("color_guide_style") or COLOR_GUIDE_STYLES[0]
+            seen = paint_mark(seen, cmask, shot.get("color_guide_color", "#00ff00"),
+                              shot.get("color_guide_opacity", 0.35), mstyle, normals)
             for mk, x in extra_mark_masks(shot, gtag):
                 cmask2 = torch.nn.functional.interpolate(mk[:, None].float(), size=shot["frames"].shape[1:3],
                                                          mode="nearest")[:, 0]
-                seen = color_guide(seen, cmask2, x["color"], shot.get("color_guide_opacity", 0.35))
+                seen = paint_mark(seen, cmask2, x["color"], shot.get("color_guide_opacity", 0.35), mstyle, normals)
                 print(f"{gtag}: Colored Mark <Picture {x['picture']}> ({len(x.get('points') or [])} points"
                       f"{', ' + repr(x['text']) if x.get('text') else ''}), {x['color']} at "
                       f"{float(shot.get('color_guide_opacity', 0.35)):.2f}, {mask_report(cmask2)}", flush=True)
-            print(f"{gtag}: Colored Mark {shot.get('color_guide_color', '#00ff00')} at "
+            print(f"{gtag}: Colored Mark ({mstyle}) {shot.get('color_guide_color', '#00ff00')} at "
                   f"{float(shot.get('color_guide_opacity', 0.35)):.2f} opacity, {mask_report(cmask)}", flush=True)
         pg = mask_guide if mask_guide in MASK_GUIDES[1:] else None
         if pg and (not use_mask or shot.get("crop")):
@@ -4238,6 +4361,9 @@ class BFSShotH3ConditioningSimple:
                     "tooltip": "Native temporal mode only: spatial scale of the motion video before encoding; output size, frame count and identity references stay unchanged. Try 0.5 to reduce guide tokens/VRAM."}),
                 "native_temporal_backend": (["flash partitions (no compile)", "flex (original)", "comfy kitchen (experimental)"], {"default": "flash partitions (no compile)",
                     "tooltip": "Native temporal mode only. Flash partitions preserves the temporal attention policy without compilation; Flex is the original implementation."}),
+                "normals": ("IMAGE", {"tooltip": "Optional MoGe normals of the shot's frames (BFS Shot Unpack's frames -> "
+                                                 "Run MoGe Inference -> Render MoGe Geometry, normal_directx). Only for shots "
+                                                 "whose Colored Mark style is 'normal map'."}),
             },
         }
 
@@ -4250,13 +4376,15 @@ class BFSShotH3ConditioningSimple:
 
     def condition(self, shot, clip, vae, guide_mode, ref_image_size,
                   audio_vae=None, with_audio=False, vlm=None, inpaint=INPAINT_MODES[0],
-                  source_blur="off", source_blur_strength=1.0, source_blur_segmenter="SAM 3.1", source_blur_effect="blur", clip_video_fps=2.0, model=None, native_guide_scale=1.0, native_temporal_backend="flash partitions (no compile)"):
+                  source_blur="off", source_blur_strength=1.0, source_blur_segmenter="SAM 3.1", source_blur_effect="blur", clip_video_fps=2.0, model=None, native_guide_scale=1.0, native_temporal_backend="flash partitions (no compile)",
+                  normals=None):
         positive, latent, patched_model, prompt = BFSShotH3Conditioning().condition(
             shot, clip, vae, guide_mode, "none", ref_image_size,
             audio_vae=audio_vae, with_audio=with_audio, vlm=vlm, inpaint=inpaint,
             source_blur=source_blur, source_blur_strength=source_blur_strength,
             source_blur_segmenter=source_blur_segmenter, source_blur_effect=source_blur_effect,
-            clip_video_fps=clip_video_fps, model=model, native_guide_scale=native_guide_scale, native_temporal_backend=native_temporal_backend)
+            clip_video_fps=clip_video_fps, model=model, native_guide_scale=native_guide_scale, native_temporal_backend=native_temporal_backend,
+            normals=normals)
         return positive, latent, prompt, patched_model
 
 
@@ -5385,7 +5513,8 @@ try:
     async def _bfs_shot_files(request):
         # images are only listed on request: an input folder can hold thousands of them
         images = _list_input(IMAGE_EXTS) if request.query.get("images") in ("1", "true") else []
-        return web.json_response({"videos": _list_input(VIDEO_EXTS), "images": images})
+        return web.json_response({"videos": _list_input(VIDEO_EXTS), "images": images,
+                                  "point_model": _POINT.get("model") is not None})
 
     @PromptServer.instance.routes.get("/bfs/shotloop/analyze")
     async def _bfs_shot_analyze(request):
@@ -5456,7 +5585,8 @@ try:
                 None, lambda: _like_a_node(lambda: mask_preview(path, a, seg["start"], seg["end"] - seg["start"], spec,
                                            int(body.get("count", 6)),
                                            preview_color,
-                                           seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55)))
+                                           seg.get("color_guide_opacity") if seg.get("color_guide") else 0.55,
+                                           seg.get("color_guide_style") or "overlay" if seg.get("color_guide") else "overlay")))
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         return web.json_response(out)

@@ -343,6 +343,11 @@ const TEXT = {
   "Crop": ["Recorte", "Recorte", "裁剪"],
   "Crop + mask": ["Recorte + máscara", "Recorte + máscara", "裁剪 + 蒙版"],
   "runs": ["executa", "se ejecuta", "运行"],
+  "translucent": ["translúcida", "translúcida", "半透明"],
+  "hatching + contour": ["hachura + contorno", "rayado + contorno", "斜线 + 轮廓"],
+  "normal map (needs normals)": ["normal map (precisa de normals)", "normal map (necesita normals)", "法线贴图（需要 normals）"],
+  "Normal map: run MoGe on BFS Shot Unpack's frames (Render MoGe Geometry, normal_directx) and connect it to BFS Shot H3 Conditioning → normals. The preview shows a tint.": ["Normal map: rode o MoGe nos frames do BFS Shot Unpack (Render MoGe Geometry, normal_directx) e conecte em BFS Shot H3 Conditioning → normals. A prévia mostra só a cor.", "Normal map: ejecuta MoGe sobre los fotogramas de BFS Shot Unpack (Render MoGe Geometry, normal_directx) y conéctalo a BFS Shot H3 Conditioning → normals. La vista previa muestra solo el color.", "法线贴图：对 BFS Shot Unpack 的帧运行 MoGe（Render MoGe Geometry，normal_directx），并连接到 BFS Shot H3 Conditioning → normals。预览只显示颜色。"],
+  "📍 MolmoPoint is connected: a text selection is pointed by MolmoPoint, then SAM 3 tracks it.": ["📍 MolmoPoint conectado: a seleção por texto é apontada pelo MolmoPoint e o SAM 3 rastreia a partir daí.", "📍 MolmoPoint conectado: la selección por texto la señala MolmoPoint y SAM 3 la sigue.", "📍 已连接 MolmoPoint：文本选区先由 MolmoPoint 定位，再由 SAM 3 跟踪。"],
 };
 export function t(value) {
   const s = String(value ?? ""), lang = uiLanguage.value;

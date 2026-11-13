@@ -212,6 +212,29 @@ class JoinTest(unittest.TestCase):
         self.assertGreater((comp - 200 / 255).abs().lt(0.05).float().mean().item(), 0.05)   # original column shown
 
 
+class MarkStyleTest(unittest.TestCase):
+    MARKS = [{"picture": 1, "color": "#00ff00"}]
+
+    def test_prompt_names_the_style_and_keeps_the_overlay_wording(self):
+        self.assertIn("the subject marked in green uses", SL.color_guide_prompt("x", self.MARKS))
+        self.assertIn("green hatching lines", SL.color_guide_prompt("x", self.MARKS, "hatching"))
+        self.assertIn("green surface-normal map", SL.color_guide_prompt("x", self.MARKS, "normal map"))
+
+    def test_overlay_fingerprint_is_unchanged(self):
+        seg = {"color_guide": True, "color_guide_marks": self.MARKS}
+        self.assertIn('[[1,"#00ff00"]]', SL.auto_prompt_for("r", [], seg))
+        self.assertNotEqual(SL.auto_prompt_for("r", [], seg), SL.auto_prompt_for("r", [], dict(seg, color_guide_style="hatching")))
+
+    def test_molmopoint_only_for_text_selections(self):
+        SL._POINT["model"] = type("M", (), {"runtime": object()})()
+        try:
+            self.assertTrue(SL._molmo_active({"text": "the man on the left"}))
+            self.assertFalse(SL._molmo_active({"text": "x", "points": [{"x": 0.1, "y": 0.1}]}))
+        finally:
+            SL._POINT.clear()
+        self.assertFalse(SL._molmo_active({"text": "the man on the left"}))
+
+
 class RunTest(unittest.TestCase):
     def test_enabled_shots_run_and_old_force_skip_is_kept(self):
         segs = [{"enabled": True}, {"enabled": False}, {"enabled": True}]
