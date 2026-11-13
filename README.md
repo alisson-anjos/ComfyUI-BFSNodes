@@ -268,7 +268,8 @@ segmented again on load.
 
 Hand edits (1.118.0): **🖌 Brush** paints extra area into the mark (e.g. hair SAM left
 out), **➖ Remove** cuts out what SAM segments at the points you place, and **🧽 Eraser**
-paints what to cut out. Each becomes a chip; unselect it to switch it off. Brush and
+paints what to cut out; **shift** while painting does the opposite of the tool (the brush
+erases, the eraser paints back). Each becomes a chip; unselect it to switch it off. Brush and
 eraser strokes belong to the image they were painted on and are dropped when the image
 changes. Fixed: clicking inside the node no longer shrinks its canvas while the side
 panel is open.
@@ -289,6 +290,13 @@ change (per subject and per shot). After the first Propagate, picking on a frame
 propagates by itself (**auto**). The **Whole video** scrubber shows every frame with
 its masks, the lost stretches in red; **＋ add this frame** puts any frame in the strip
 to fix it. A status line with a progress bar and a log shows what runs.
+
+Hand fixes on a picked frame (1.121.1): **🖌 Brush** paints into the active color's
+mark and **shift** while painting erases from it (e.g. a stray piece of mask over a
+hand). Strokes not applied yet are applied when you change color or frame, or press
+Apply fix, so they are never lost. What any color adds on a frame (brush, points, text)
+is shared by every color there: each color selects from the same objects, and ✕ on an
+added object removes it for all of them.
 
 Outputs: `masks`, `marked` (tinted), `overlay`, `report`, and `hybrid`: the guide
 with each subject drawn in its color, by `mark_style`:

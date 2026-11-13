@@ -689,6 +689,21 @@ def parse_frames(text):
     return out
 
 
+def shared_state(frame_state, key):
+    """One subject's selection on a frame, with the objects every subject added there: a region painted or found while
+    another color was active can be selected by this one too. Its own entries win an id clash (older states)."""
+    own = dict(frame_state.get(key) or {})
+    added = list(own.get("added") or [])
+    ids = {str(e.get("id")) for e in added if isinstance(e, dict)}
+    for k, v in frame_state.items():
+        for e in (v.get("added") or []) if k != key and isinstance(v, dict) else []:
+            if isinstance(e, dict) and str(e.get("id")) not in ids:
+                ids.add(str(e.get("id")))
+                added.append(e)
+    own["added"] = added
+    return own
+
+
 def find_connected_picture_count(prompt, unique_id):
     """Inspects the prompt workflow graph to find downstream nodes consuming this node's output,
     and returns the maximum index of connected picture inputs (e.g. 2 if only picture_1 and picture_2 are linked)."""
@@ -936,7 +951,7 @@ class BFSVideoSegmentPicker:
             sid, sess = sp.session_for((sam3_model, sam3_clip), frame, spec)
             chosen_all = set()
             for sj in subjects:
-                state = sp.parse_state(json.dumps(states.get(str(i), {}).get(str(sj), {})))
+                state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), str(sj))))
                 objects = sp.all_objects(sess, state)
                 by_id = {o["id"]: o for o in objects}
                 chosen = [by_id[k] for k in state["selected"] if k in by_id]
@@ -945,7 +960,7 @@ class BFSVideoSegmentPicker:
                 cut = torch.stack(cut).any(0) if cut else torch.zeros(h, w, dtype=torch.bool)
                 mask, _ = sp.compose([o["mask"] & ~cut for o in chosen if not o.get("remove")], h, w)
                 own[sj][i] = mask.reshape(h, w).float()
-            lock_state = sp.parse_state(json.dumps(states.get(str(i), {}).get("lock", {})))
+            lock_state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), "lock")))
             lock_objects = sp.all_objects(sess, lock_state)
             lock_by_id = {o["id"]: o for o in lock_objects}
             lock_chosen = [lock_by_id[k] for k in lock_state["selected"] if k in lock_by_id]
@@ -959,7 +974,7 @@ class BFSVideoSegmentPicker:
                 st(f"frame {i}: lock overlaps the selected subject; pick the object by text or add negative points", None, log=True)
                 lock_mask = torch.zeros_like(lock_mask)
             own_locked[i] = lock_mask
-            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": [a for st in states.get(str(i), {}).values() for a in st.get("added", [])]})))
+            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": shared_state(states.get(str(i), {}), "1")["added"]})))
             panels.append(sp.panel_data(sid, sess, objects))
             overlays.append(sp.overlay(frame, objects, chosen_all))
         cuts = detect_cuts(image) if n > 1 else []

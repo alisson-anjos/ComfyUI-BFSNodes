@@ -2,6 +2,15 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.121.1] - 2026-11-13
+
+### Fixed
+- **Video Segment Picker**: a region painted with the brush no longer disappears when you switch to another color and back. Strokes not applied yet are applied to their color before the color or frame changes or a run starts, and the tool and brush size stay selected.
+
+### Changed
+- **Video Segment Picker**: objects added on a frame (brush, points, text) are shared by every color there; each color selects its own. Removing an added object removes it for every color.
+- **Segment Picker / Video Segment Picker**: hold **shift** while painting to do the opposite of the tool: the brush erases from the mark, the eraser paints back. Erasing and painting over the same spot keeps whatever was painted last.
+
 ## [1.121.0] - 2026-11-12
 
 ### Added

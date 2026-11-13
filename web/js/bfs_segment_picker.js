@@ -3,6 +3,7 @@
  * see it, click to select it. Objects the automatic pass missed are added by text (a SAM 3 prompt), by points
  * (keep / exclude), segmented at once by /bfs/segpick/add, or painted with the brush (to grow the mark by hand).
  * ➖ Remove (points) and 🧽 Eraser (brush) make the same kinds of objects, cut out of the mark instead of added to it.
+ * Shift while painting does the opposite of the mode: with the brush it erases the mark, with the eraser it paints back.
  *
  * All state lives in the hidden `selection` STRING widget (JSON: selected ids and the added entries), so a workflow
  * saves, reloads and shares the selection. The objects themselves come from the node's last run (onExecuted).
@@ -109,11 +110,11 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
   const loaded = new Map();          // object id -> loadMask result (not reactive: canvases and big arrays)
   const ready = ref(0);              // bumps when masks finish loading, to redraw
   const hover = ref(null);
-  const mode = ref("select");        // "select" | "points" | "brush" | "remove" (points) | "eraser" (brush)
+  const mode = ref(options.mode || "select");        // "select" | "points" | "brush" | "remove" (points) | "eraser" (brush)
   const points = ref([]);            // the point entry being built
   const strokes = ref([]);           // the brush entry being built: [{r, pts: [[x, y], ...]}], relative to the image
-  const brush = ref(.02);            // brush radius, relative to the image width
-  let painting = false, cursor = null;
+  const brush = ref(options.brush || .02);   // brush radius, relative to the image width
+  let painting = false, cursor = null, shiftHeld = false;
   const text = ref("");
   const busy = ref(""); const error = ref("");
   const stageEl = ref(null); const canvasEl = ref(null);
@@ -133,6 +134,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
   function setMode(m) {
     if (m !== mode.value) { points.value = []; strokes.value = []; }   // unfinished points / strokes mean something else in another mode
     mode.value = m; hover.value = null;
+    options.onMode?.(m);
   }
 
   async function loadAll() {
@@ -174,8 +176,9 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     }
     g.globalAlpha = 1;
     if (!brushing()) return;
-    g.strokeStyle = g.fillStyle = cutting() ? "rgba(20,20,20,.6)" : "rgba(255,0,255,.55)"; g.lineCap = g.lineJoin = "round";
+    g.lineCap = g.lineJoin = "round";
     for (const st of strokes.value) {
+      g.strokeStyle = g.fillStyle = cutting() !== !!st.erase ? "rgba(20,20,20,.6)" : "rgba(255,0,255,.55)";
       const [x0, y0] = st.pts[0];
       g.beginPath(); g.arc(x0 * W, y0 * H, st.r * W, 0, 2 * Math.PI); g.fill();
       if (st.pts.length < 2) continue;
@@ -184,7 +187,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
       g.stroke();
     }
     if (cursor) {
-      g.lineWidth = Math.max(1, W / 500); g.strokeStyle = "#fff";
+      g.lineWidth = Math.max(1, W / 500); g.strokeStyle = cutting() !== shiftHeld ? "#f43f5e" : "#fff";
       g.beginPath(); g.arc(cursor.x * W, cursor.y * H, brush.value * W, 0, 2 * Math.PI); g.stroke();
     }
   }
@@ -220,7 +223,9 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     if (brushing()) {
       canvasEl.value.setPointerCapture(e.pointerId);
       painting = true;
-      strokes.value = [...strokes.value, { r: +brush.value.toFixed(4), pts: [[+p.x.toFixed(4), +p.y.toFixed(4)]] }];
+      const st = { r: +brush.value.toFixed(4), pts: [[+p.x.toFixed(4), +p.y.toFixed(4)]] };
+      if (e.shiftKey) st.erase = true;       // shift: the opposite of the mode (erase with the brush, paint back with the eraser)
+      strokes.value = [...strokes.value, st];
       return;
     }
     const o = objectAt(p);
@@ -230,7 +235,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
   }
   function onMove(e) {
     if (data.value && brushing()) {
-      cursor = at(e);
+      cursor = at(e); shiftHeld = e.shiftKey;
       const pts = strokes.value.at(-1)?.pts, last = pts?.at(-1);
       // a point every ~quarter radius keeps the stroke smooth without bloating the saved JSON
       if (painting && Math.hypot(cursor.x - last[0], cursor.y - last[1]) > brush.value / 4) pts.push([+cursor.x.toFixed(4), +cursor.y.toFixed(4)]);
@@ -249,12 +254,13 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
         body: JSON.stringify({ session: data.value.session, entry }) });
       const j = await r.json();
       if (!r.ok || j.error) throw new Error(j.error || r.statusText);
-      if (!j.objects.length) { error.value = entry.text ? `Nothing found for “${entry.text}”: try other words or a lower threshold.` : "The points gave an empty mask."; return; }
+      if (!j.objects.length) { error.value = entry.text ? `Nothing found for “${entry.text}”: try other words or a lower threshold.` : entry.strokes ? "The painted area is empty." : "The points gave an empty mask."; return; }
       state.added = [...state.added.filter(a => a.id !== entry.id), entry];
       state.next = Math.max(state.next, Number(entry.id.match(/(\d+)$/)?.[1] || 0) + 1);
       data.value = { ...data.value, objects: [...data.value.objects.filter(o => o.entry !== entry.id), ...j.objects] };
       state.selected = [...state.selected, ...j.objects.map(o => o.id).filter(id => !isSel(id))];   // what you add is what you want
       save();
+      options.onObjects?.(data.value.objects);
       await loadAll();
     } catch (err) {
       error.value = String(err.message || err);
@@ -266,10 +272,23 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     await add(cutting() ? { id: entryId("r"), remove: true, points: points.value } : { id: entryId("p"), points: points.value });
     if (!error.value) setMode("select");
   };
+  // The strokes become up to two entries, in painting order: what they add (cut strokes painted as holes in it) and what
+  // they cut (painting strokes after a cut painted back), so erasing and painting over the same spot ends as painted last.
+  const commitStrokes = async () => {
+    const all = strokes.value;
+    if (!all.length || !data.value) return;
+    const cutOf = st => cutting() !== !!st.erase;
+    const part = cutPart => {
+      const k = all.findIndex(st => cutOf(st) === cutPart);
+      return k < 0 ? [] : all.slice(k).map(st => (cutOf(st) === cutPart ? { r: st.r, pts: st.pts } : { r: st.r, pts: st.pts, erase: true }));
+    };
+    const keep = part(false), cut = part(true), image = data.value.image_key;
+    strokes.value = [];
+    if (keep.length) await add({ id: entryId("b"), image, strokes: keep });
+    if (cut.length) await add({ id: entryId("e"), remove: true, image, strokes: cut });
+  };
   const addBrush = async () => {
-    if (!strokes.value.length) return;
-    const stroke = { image: data.value.image_key, strokes: strokes.value };
-    await add(cutting() ? { id: entryId("e"), remove: true, ...stroke } : { id: entryId("b"), ...stroke });
+    await commitStrokes();
     if (!error.value) setMode("select");
   };
   function removeEntry(entryId) {
@@ -279,6 +298,8 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     if (data.value) data.value = { ...data.value, objects: data.value.objects.filter(o => o.entry !== entryId) };
     gone.forEach(i => loaded.delete(i));
     save(); ready.value++;
+    options.onRemoveEntry?.(entryId);
+    if (data.value) options.onObjects?.(data.value.objects);
   }
 
   async function runNode() {
@@ -307,6 +328,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
       nextTick(() => { relayout(); loadAll(); });
     },
     reload: () => { Object.assign(state, parseState(io.get())); ready.value++; },
+    commit: commitStrokes,        // paint strokes not added yet become entries (the video picker calls it before it remounts)
   });
 
   let ro;
@@ -352,9 +374,9 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
         ] : null,
         brushing() ? [
           h("input", { type: "range", min: .003, max: .1, step: .001, value: brush.value, title: "Brush size",
-            onInput: e => { brush.value = +e.target.value; } }),
+            onInput: e => { brush.value = +e.target.value; options.onBrush?.(brush.value); } }),
           h("button", { class: "pri", disabled: !strokes.value.length || !!busy.value, onClick: addBrush },
-            `${cutting() ? "✓ Erase painted area" : "✓ Add painted area"} (${strokes.value.length})`),
+            `${cutting() ? "✓ Erase painted area" : "✓ Apply painted area"} (${strokes.value.length})`),
           h("button", { disabled: !strokes.value.length, onClick: () => { strokes.value = strokes.value.slice(0, -1); } }, "Undo"),
           h("button", { disabled: !strokes.value.length, onClick: () => { strokes.value = []; } }, "Clear"),
         ] : null,
@@ -370,8 +392,8 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
         hovered ? h("div", { class: "tip" }, `${hovered.id} · ${hovered.label}${hovered.score != null ? ` · ${hovered.score}` : ""}`) : null,
         mode.value === "points" ? h("div", { class: "tip" }, "click = keep · right-click or shift+click = exclude · click a point to remove it") : null,
         mode.value === "remove" ? h("div", { class: "tip" }, "click on what to cut out of the mark · right-click or shift+click = keep it in · then ✓ Remove this") : null,
-        mode.value === "brush" ? h("div", { class: "tip" }, "paint what the mark should also cover · then ✓ Add painted area") : null,
-        mode.value === "eraser" ? h("div", { class: "tip" }, "paint what to cut out of the mark · then ✓ Erase painted area") : null,
+        mode.value === "brush" ? h("div", { class: "tip" }, "paint what the mark should also cover · shift = erase · then ✓ Apply painted area") : null,
+        mode.value === "eraser" ? h("div", { class: "tip" }, "paint what to cut out of the mark · shift = paint back · then ✓ Erase painted area") : null,
       ] : h("div", { class: "empty" }, ["Connect an image and press ▶ Segment (or run the workflow).", h("br"),
         "Then click objects to select them; add what was missed by text or 📍 points."])),
       busy.value ? h("div", { class: "hint" }, busy.value) : null,

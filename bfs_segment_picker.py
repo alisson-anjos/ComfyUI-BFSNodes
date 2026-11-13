@@ -68,7 +68,7 @@ def parse_state(text: str | None) -> dict:
             if any(p["label"] for p in pts):
                 added.append({"id": str(e["id"]), "points": pts})
         elif e.get("strokes"):
-            strokes = [{"r": float(st["r"]), "pts": [[float(x), float(y)] for x, y in st["pts"]]}
+            strokes = [{"r": float(st["r"]), "pts": [[float(x), float(y)] for x, y in st["pts"]], **({"erase": True} if st.get("erase") else {})}
                        for st in e["strokes"] if isinstance(st, dict) and st.get("pts")]
             if strokes:
                 added.append({"id": str(e["id"]), "image": str(e.get("image") or ""), "strokes": strokes})
@@ -118,16 +118,18 @@ def compose(masks: list[torch.Tensor], h: int, w: int) -> tuple[torch.Tensor, to
 
 
 def paint(strokes: list[dict], h: int, w: int) -> torch.Tensor:
-    """Brush strokes (relative points, radius relative to the width) as a bool mask [h, w]."""
+    """Brush strokes (relative points, radius relative to the width) as a bool mask [h, w]; an "erase" stroke clears what
+    the strokes before it painted (shift while painting in the panel)."""
     img = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(img)
     for st in strokes:
         r = max(1., st["r"] * w)
         pts = [(x * w, y * h) for x, y in st["pts"]]
+        fill = 0 if st.get("erase") else 255
         if len(pts) > 1:
-            draw.line(pts, fill=255, width=round(2 * r), joint="curve")
+            draw.line(pts, fill=fill, width=round(2 * r), joint="curve")
         for x, y in pts:
-            draw.ellipse([x - r, y - r, x + r, y + r], fill=255)
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=fill)
     return torch.from_numpy(np.array(img) > 127)
 
 
