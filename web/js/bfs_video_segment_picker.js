@@ -188,11 +188,12 @@ app.registerExtension({
            onMode: m => { if (sj !== "lock") ui.mode = m; }, onBrush: b => { ui.brush = b; },
            // added objects live in the run's frame data too, so the next mount (another color, back here) still has them
            onObjects: objs => { const fd = run.data?.frames?.[active.value]; if (fd) run.data.frames[active.value] = { ...fd, objects: objs }; },
-           onRemoveEntry: id => {      // an added object goes for every color: no color keeps selecting a gone object
+           allAdded: () => Object.values(frames.v[String(i)] || {}).flatMap(v => (v && v.added) || []),
+           onRemoveEntry: (id, how) => {      // an added object goes for every color: no color keeps selecting a gone object
              for (const v of Object.values(frames.v[String(i)] || {})) {
                if (!v || typeof v !== "object") continue;
                if (v.added) v.added = v.added.filter(a => a.id !== id);
-               if (v.selected) v.selected = v.selected.filter(s => s !== id && !s.startsWith(`${id}.`));
+               if (v.selected && !how?.keepSelection) v.selected = v.selected.filter(s => s !== id && !s.startsWith(`${id}.`));
              }
              save();
            } }) });

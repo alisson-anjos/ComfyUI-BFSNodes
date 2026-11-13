@@ -4,6 +4,8 @@
  * (keep / exclude), segmented at once by /bfs/segpick/add, or painted with the brush (to grow the mark by hand).
  * ➖ Remove (points) and 🧽 Eraser (brush) make the same kinds of objects, cut out of the mark instead of added to it.
  * Shift while painting does the opposite of the mode: with the brush it erases the mark, with the eraser it paints back.
+ * With an object selected, the brush edits that object's own mask (grows it, shift trims it) instead of adding a new one:
+ * the selected object the stroke starts on, otherwise the nearest selected one. ↺ on its chip drops the edits.
  *
  * All state lives in the hidden `selection` STRING widget (JSON: selected ids and the added entries), so a workflow
  * saves, reloads and shares the selection. The objects themselves come from the node's last run (onExecuted).
@@ -246,8 +248,31 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     hover.value = objectAt(at(e))?.id ?? null;
   }
 
+  // every brush edit on one object, in order: the video picker passes the ones every color made on the frame
+  const editsOf = target => (options.allAdded?.() || state.added).filter(a => a.target === target);
+  async function editObject(target, edits) {
+    const r = await api.fetchApi("/bfs/segpick/edit", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: data.value.session, target, edits }) });
+    const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+    const o = j.objects[0];
+    data.value = { ...data.value, objects: data.value.objects.map(x => (x.id === o.id ? o : x)) };
+    options.onObjects?.(data.value.objects);
+    await loadAll();
+  }
   async function add(entry) {
     if (!data.value) { error.value = "Run the node first (▶ Segment)."; return; }
+    if (entry.target) {
+      busy.value = "Painting on the mask…"; error.value = "";
+      try {
+        await editObject(entry.target, [...editsOf(entry.target).filter(a => a.id !== entry.id), entry]);
+        state.added = [...state.added.filter(a => a.id !== entry.id), entry];
+        state.next = Math.max(state.next, Number(entry.id.match(/(\d+)$/)?.[1] || 0) + 1);
+        if (!isSel(entry.target)) state.selected = [...state.selected, entry.target];
+        save();
+      } catch (err) { error.value = String(err.message || err); } finally { busy.value = ""; }
+      return;
+    }
     busy.value = entry.text ? `Finding “${entry.text}”…` : entry.strokes ? "Adding the painted area…" : "Segmenting the points…"; error.value = "";
     try {
       const r = await api.fetchApi("/bfs/segpick/add", { method: "POST", headers: { "Content-Type": "application/json" },
@@ -274,9 +299,25 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
   };
   // The strokes become up to two entries, in painting order: what they add (cut strokes painted as holes in it) and what
   // they cut (painting strokes after a cut painted back), so erasing and painting over the same spot ends as painted last.
+  // The object a brush stroke edits: the selected one it starts on (the smallest), otherwise the nearest selected one
+  const targetFor = st => {
+    const [x, y] = st.pts[0];
+    const sel = objects.value.filter(o => isSel(o.id) && !o.remove && loaded.get(o.id));
+    if (!sel.length) return null;
+    const under = sel.filter(o => { const m = loaded.get(o.id); return m.hit[Math.min(m.h - 1, Math.floor(y * m.h)) * m.w + Math.min(m.w - 1, Math.floor(x * m.w))]; });
+    if (under.length) return under.sort((a, b) => a.area - b.area)[0].id;
+    const dist = o => { const [bx, by, bw, bh] = o.box || [0, 0, 1, 1]; return Math.hypot(Math.max(bx - x, 0, x - bx - bw), Math.max(by - y, 0, y - by - bh)); };
+    return sel.sort((a, b) => dist(a) - dist(b))[0].id;
+  };
   const commitStrokes = async () => {
     const all = strokes.value;
     if (!all.length || !data.value) return;
+    const target = mode.value === "brush" ? targetFor(all[0]) : null;
+    if (target) {          // one edit of that object's mask, the strokes in painting order
+      strokes.value = [];
+      await add({ id: entryId("g"), image: data.value.image_key, target, strokes: all.map(st => (st.erase ? { r: st.r, pts: st.pts, erase: true } : { r: st.r, pts: st.pts })) });
+      return;
+    }
     const cutOf = st => cutting() !== !!st.erase;
     const part = cutPart => {
       const k = all.findIndex(st => cutOf(st) === cutPart);
@@ -287,10 +328,15 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
     if (keep.length) await add({ id: entryId("b"), image, strokes: keep });
     if (cut.length) await add({ id: entryId("e"), remove: true, image, strokes: cut });
   };
-  const addBrush = async () => {
-    await commitStrokes();
-    if (!error.value) setMode("select");
-  };
+  const addBrush = () => commitStrokes();     // the brush stays on: painting usually goes on
+  async function resetEdits(o) {          // ↺: the object as segmented, without the brush edits
+    const ids = editsOf(o.id).map(a => a.id);
+    state.added = state.added.filter(a => !ids.includes(a.id));
+    save();
+    ids.forEach(id => options.onRemoveEntry?.(id, { keepSelection: true }));
+    busy.value = "Restoring the mask…"; error.value = "";
+    try { await editObject(o.id, []); } catch (err) { error.value = String(err.message || err); } finally { busy.value = ""; }
+  }
   function removeEntry(entryId) {
     state.added = state.added.filter(a => a.id !== entryId);
     const gone = objects.value.filter(o => o.entry === entryId).map(o => o.id);
@@ -392,7 +438,7 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
         hovered ? h("div", { class: "tip" }, `${hovered.id} · ${hovered.label}${hovered.score != null ? ` · ${hovered.score}` : ""}`) : null,
         mode.value === "points" ? h("div", { class: "tip" }, "click = keep · right-click or shift+click = exclude · click a point to remove it") : null,
         mode.value === "remove" ? h("div", { class: "tip" }, "click on what to cut out of the mark · right-click or shift+click = keep it in · then ✓ Remove this") : null,
-        mode.value === "brush" ? h("div", { class: "tip" }, "paint what the mark should also cover · shift = erase · then ✓ Apply painted area") : null,
+        mode.value === "brush" ? h("div", { class: "tip" }, "paint to grow the selected mask the stroke starts on (or the nearest) · shift = erase from it · then ✓ Apply painted area") : null,
         mode.value === "eraser" ? h("div", { class: "tip" }, "paint what to cut out of the mark · shift = paint back · then ✓ Erase painted area") : null,
       ] : h("div", { class: "empty" }, ["Connect an image and press ▶ Segment (or run the workflow).", h("br"),
         "Then click objects to select them; add what was missed by text or 📍 points."])),
@@ -403,7 +449,8 @@ export function Panel(io, options = {}) {   // exported: BFS Video Segment Picke
         onClick: () => toggle(o.id), onPointerenter: () => { hover.value = o.id; }, onPointerleave: () => { hover.value = null; },
       }, [
         h("span", { class: "sw", style: `background:${rgb(colorOf(o.id))}` }),
-        `${o.remove ? "➖ " : ""}${o.id} ${o.label}`,
+        `${o.remove ? "➖ " : ""}${o.id} ${o.label}${o.edits ? " ✎" : ""}`,
+        o.edits ? h("span", { class: "x", title: "undo the brush edits on this object", onClick: e => { e.stopPropagation(); resetEdits(o); } }, "↺") : null,
         o.entry ? h("span", { class: "x", title: "remove this added object", onClick: e => { e.stopPropagation(); removeEntry(o.entry); } }, "×") : null,
       ]))) : null,
       d ? h("div", { class: "hint" }, "The outputs follow the selection on the next run.") : null,

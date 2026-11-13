@@ -298,6 +298,16 @@ Apply fix, so they are never lost. What any color adds on a frame (brush, points
 is shared by every color there: each color selects from the same objects, and ✕ on an
 added object removes it for all of them.
 
+With an object selected, the brush edits that object's own mask (1.121.2): a stroke grows
+the selected mask it starts on (or the nearest selected one) and shift trims it, with no
+new object on top. The chip shows ✎; ↺ drops the edits.
+
+`clean_masks` cleans the subject masks where people touch (arms around each other, hands
+crossing): on every frame, and on the picked frames before tracking, any piece smaller
+than that % of its subject's area joins what surrounds it. A speck of blue on the red
+arm becomes red, a hole in a mask is filled, a stray bit on the background goes away;
+each subject's main body always stays. 0 = off; 0.5–2 is usually enough.
+
 Outputs: `masks`, `marked` (tinted), `overlay`, `report`, and `hybrid`: the guide
 with each subject drawn in its color, by `mark_style`:
 - `normal map` — its MoGe normal map in gray detail, tinted (connect `normals`:

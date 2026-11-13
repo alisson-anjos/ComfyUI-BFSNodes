@@ -2,6 +2,12 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.121.2] - 2026-11-13
+
+### Added
+- **Segment Picker / Video Segment Picker**: with an object selected, the brush edits that object's mask instead of adding a new object on top: a stroke grows the selected mask it starts on (or the nearest selected one), shift trims it. The chip shows ✎ and ↺ drops the edits. The brush stays on after ✓ Apply painted area.
+- **Video Segment Picker**: `clean_masks` (default 0 = off) cleans the masks where subjects touch: on every frame, and on the picked frames before tracking, any piece smaller than that % of its subject's area joins what surrounds it (stray specks of one color on another subject switch to it, holes are filled, stray bits on the background go away). A subject's largest piece always stays; overlaps elsewhere are left as they were.
+
 ## [1.121.1] - 2026-11-13
 
 ### Fixed
