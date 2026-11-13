@@ -125,10 +125,6 @@ const CSS = `
 .bsl .thumbs{display:flex;gap:4px;margin-top:4px}
 .bsl .rt{width:34px;height:34px;border-radius:5px;object-fit:cover;background:#2a2a33;border:1px solid #3a3a45}
 .bsl .rt.ph2{display:flex;align-items:center;justify-content:center;color:#666;font-size:9px}
-.bsl .who{display:flex;gap:3px;margin-top:3px;align-items:center}
-.bsl .who img{width:22px;height:22px;border-radius:50%;object-fit:cover;border:1px solid #3a3a45;opacity:.7}
-.bsl .who img.main{width:26px;height:26px;opacity:1;border-color:#fff}
-.bsl .who img.lk{border-color:#8fd18f}
 
 /* shot editor */
 .bsl .edhd{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
@@ -157,12 +153,6 @@ const CSS = `
 .bsl .recent img{width:30px;height:30px;border-radius:5px;object-fit:cover;cursor:pointer;border:1px solid #3a3a45}
 .bsl .recent img:hover{border-color:var(--acc)}
 .bsl .recent.sm img{width:22px;height:22px}
-.bsl .modes{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin-bottom:6px}
-.bsl .mode{border:1px solid var(--line2);border-radius:7px;padding:6px 8px;cursor:pointer;background:#18181d}
-.bsl .mode:hover{border-color:#55556a}
-.bsl .mode.on{border-color:var(--acc);background:#1a2034}
-.bsl .mode b{display:block;color:var(--hi);font-size:11px}
-.bsl .mode span{font-size:10px;color:var(--txt2)}
 .bsl .mstrip{display:flex;gap:4px;margin-top:6px;align-items:center;flex-wrap:wrap}
 .bsl .mstrip img{height:90px;border-radius:5px;border:1px solid #3a3a45}
 .bsl .vsug{margin-top:6px;padding:6px 8px;border:1px dashed #4a4a58;border-radius:6px;display:flex;flex-direction:column;gap:3px}
@@ -174,12 +164,7 @@ const CSS = `
 .bsl .tc{font-family:ui-monospace,monospace;font-size:12px;color:#e6e6ea;background:#101014;border:1px solid var(--line);border-radius:6px;padding:6px 8px;line-height:1.6}
 .bsl .tc b{color:#ffd34d}
 
-/* cast, VLM, checks */
-.bsl .cast{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-.bsl .person{background:#141418;border:1px solid var(--line);border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px;align-items:flex-start}
-.bsl .person.ign{opacity:.45}
-.bsl .person .face{width:64px;height:64px;border-radius:50%;object-fit:cover;cursor:pointer;border:2px solid #3a3a45}
-.bsl .person .t{font-size:10px;color:#9a9aa6}
+/* VLM, checks */
 .bsl .dlist{display:flex;flex-direction:column;gap:6px;margin-top:6px}
 .bsl .drow{display:flex;gap:8px;align-items:flex-start}
 .bsl .dthumbs{display:flex;gap:3px}

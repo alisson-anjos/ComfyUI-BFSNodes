@@ -30,22 +30,21 @@ Use the language selector in the top bar to switch the interface between English
 Chinese. The choice is saved in this browser and does not alter the workflow plan or prompt text. **Tour** opens an
 optional step-by-step introduction when clicked; it never appears automatically.
 
-The planner's panel has five tabs, in the order you work. The timeline stays on top of every tab.
+The planner's panel has four tabs, in the order you work. The timeline stays on top of every tab.
 
 | tab | what is there |
 |---|---|
-| 🎞 **Video** | pick or upload the video, audio, how it is split into shots (cuts or fixed length), generation size |
-| 🎬 **Shots** | one card per shot (scroll sideways, **← →** move between shots), the preview player and the selected shot's editor: reference & prompt, who is replaced (mask, generation mode, `{target}`), continuity, **Copy to other shots** |
-| 👥 **People / Filters / Masks** | the cast found by face, shot filters and the global mask settings |
-| 📝 **Prompts & refs** | the global reference and prompt, the VLM and the reference descriptions (`{details}`) |
-| ▶ **Run** | **Checks** (what to fix before running, with a button to each shot) and how the shots run (shot by shot / queue loop / auto loop) |
+| 🎞 **Video** | pick or upload the video, the range, how it is split into shots (cuts or fixed length), generation size. The cut detector, frame grid and fps are under *More*. |
+| 📝 **Pictures & prompt** | the pictures and prompt every shot uses, 🤖 Auto prompt, and (collapsed) the VLM and the picture descriptions (`{details}`) |
+| 🎬 **Shots** | one card per shot (scroll sideways, **← →** move between shots), the preview player and the selected shot's editor: pictures & prompt, **What changes** (the selection, Colored Mark, how it is generated, `{target}`), continuity, **Copy to other shots**; then the mask settings shared by every shot (collapsed) |
+| ▶ **Run** | **Checks** (what to fix before running, with a button to each shot), how the shots run (shot by shot / queue loop / auto loop) and the stored shots |
 
 Shot cards show badges for what each shot has: 🎯 mask, 🎭 / ✂ generation mode, 🧑 `{target}`, ⛓ continuity and ⚠ problems.
 The header's ⚠ count opens the checks.
 
 **Copy to other shots** (in the shot editor) copies the chosen parts of the selected shot to all shots, or to the
 shots after it: references, prompt, mask text, mask points (each shot gets them on its frame at the same relative
-position), generation mode, `{target}`, continuity. It replaces the old "→ all" buttons.
+position), generation mode, `{target}`, continuity.
 
 ## How the loop works
 
@@ -197,44 +196,14 @@ that will not run. The panel shows the shot's start, end and current time (and f
 playhead follows on the timeline, and clicking the timeline seeks. The source video streams from
 the input folder, so only what you play is loaded.
 
-## Shot filters (People / Filters / Masks tab)
+## Turning shots off
 
-Skip shots that should not run, decided per shot from a few sampled frames:
+**⏸ Disable** in a shot's editor turns a shot off. Shots that are off do not run. Connect the planner's `timeline`
+output to BFS Shot Join and they are filled with the original video, keeping the full duration and soundtrack, or
+removed (with the matching audio) when *Skipped shots in the output* is set to remove them.
 
-| filter | skips a shot when |
-|---|---|
-| Needs a person | no person is detected |
-| Min person size | the largest person covers less than that fraction of the frame (wide shots) |
-| Max people | more people than that (crowds) |
-| Needs a face | no face is detected |
-| Skip dark / fades | the mean brightness is below the level |
-| Skip static | there is almost no motion (title cards, freeze frames) |
-| Min frames | the shot is shorter than that |
-
-People and faces use YOLO from `models/ultralytics` (`person_yolov8m-seg.pt`, `face_yolov8m.pt`, the
-Impact Pack files) with OpenCV fallbacks. *Analyse people & faces* shows the numbers on every shot
-card. Each shot can override the filters (always run / always skip).
-
-Skipped shots do not run. Connect the planner's `timeline` output to BFS Shot Join and they are
-filled with the original video, keeping the full duration and soundtrack, or removed (with the
-matching audio) when *Skipped shots in the output* is set to remove them.
-
-## Cast (people by face)
-
-*Find people* samples the video every 0.5 s, detects faces and groups them into people by face
-identity, on the CPU (it never touches the GPU; the result is cached per video). **No extra package is needed**: by
-default it uses OpenCV Zoo's **YuNet** (detection) + **SFace** (recognition), Apache-2.0 models run by OpenCV itself and
-downloaded once into `models/opencv_face` (0.2 + 37 MB). If **InsightFace** is installed (`buffalo_l` in
-`models/insightface`) it is used instead (a bit more accurate; mind its license). Last resort, without either: SAM 3.1
-faces grouped by colours (hair, skin, clothes). Each
-person card shows the face, screen share and first/last appearance (click the face to seek). The *ignore* checkbox excludes a detected identity from cast-based filters. Every shot card shows the people detected in it, with the main person highlighted.
-
-| option | effect |
-|---|---|
-| Split where the main person changes | adds a boundary where the largest face switches to another person for at least a second, then re-splits |
-| Only run shots with a detected person | shots with no detected, non-ignored person are skipped |
-
-Face identities are used for filtering and optional shot splitting. References and marker colors are selected globally or per shot; they are not assigned to detected identities.
+The shot filters (person / face / dark / static detection) and the face cast were removed in 1.122: a plan that
+skipped a shot by hand opens with that shot disabled, and the old filter and cast settings are ignored.
 
 ## References and prompts
 
@@ -261,10 +230,10 @@ node stops at 9 and LoRAs trained like OpenJutsu saw up to 9, so the log notes a
 
 ## Mask & crop (SAM 3)
 
-Generate only part of the frame. In a shot's editor (*Select region*), type what to segment in English
+Generate only part of the frame. In a shot's editor (**What changes**), type what to select in English
 (`person in white`, `woman with red hair`, `red car`; up to 32 tokens, commas for several things) or click
 **🎯 Points** to pick positive / negative points on any frame of the shot, then **👁 Preview** (red = mask,
-yellow = crop box). Then pick how the shot is generated:
+yellow = crop box). Then pick how the shot is generated in **Generate**:
 
 | mode | what is generated | crop / uncrop |
 |---|---|---|
@@ -282,20 +251,20 @@ result back, feathered by the mask (or the whole box). **BFS Shot Unpack** also 
 e.g. for an inpainting model. In **BFS Shot Join**'s comparison video, cropped shots show their mask (red) and crop
 box (yellow) over the original column (`comparison_mask`, on by default).
 
-**Mask opacity** (mask modes, per shot, slider under the modes): the value of the white inside the generation mask.
+**Mask strength** (mask modes, per shot, slider under **Generate**): the value of the white inside the generation mask.
 1 regenerates the masked area completely. A grey mask (e.g. 0.85) keeps part of the original there: H3 puts those
 rows at *opacity* × the noise level, so they start from the original partly visible. 0.8-0.9 keeps pose, outline and lighting while still swapping; too low copies the original
 person. With `guide_mode = aligned guide` the model also sees the whole original shot as its guide, so it follows
 the motion either way.
 
-**🎨 Colored Mark** is an optional translucent overlay on the source video: each marked person is tinted with the
-color of the picture they become, and the prompt gets the mapping ("the person marked in red becomes the character
-from `<Picture 3>`"), for any model or LoRA. Every picture has its **Mark color** (under it in **Prompts & refs**:
+**🎨 Colored Mark** is an optional translucent overlay on the source video: each selected subject (a person, an object,
+a vehicle) is tinted with the color of the picture it becomes, and the prompt gets the mapping ("the person marked in red
+becomes the character from `<Picture 3>`"), for any model or LoRA. Every picture has its **Mark color** (under it in **Pictures & prompt**:
 green, purple, red, blue, yellow, magenta, cyan, orange, white, brown, pink, olive by default); change it when it is
-too close to a color in the video. In a shot, turn on Colored Mark and pick which picture the shot's selection (its
-SAM 3 text or points) becomes; **+ Mark another person** adds a person with their own picture and text or 🎯 points
-(the points window has one point set per person). This is only a visual marker: it does not create an inpainting mask
-or change **Full frame**, **Mask only** or crop behavior. More than one marked person needs Crop off, and the
+too close to a color in the video. In a shot, turn on Colored Mark: every row under it is a subject, with its text or
+🎯 points and **→ Picture N**, the picture it becomes. *Subject 1* is the shot's own selection; **+ Add subject** adds
+another row (the points window has one point set per subject). This is only a visual marker: it does not create an inpainting mask
+or change **Full frame**, **Mask only** or crop behavior. More than one marked subject needs Crop off, and the
 shot must have every picture the marks use. The overlay keeps movement and facial
 expression visible. Plans before 1.113 (a second region for ref 2) open with that region as `<Picture 2>`.
 
@@ -308,7 +277,7 @@ detailed_description: [Shot 1] Replace the person marked by the translucent gree
 ```
 
 The VLM's shot analysis suggests a SAM 3 text selection from the original frames; it does not assign guide colors or
-decide that two detections are the same identity. **Describe target** only describes the first shot selection. For
+decide that two detections are the same identity. **🧑 Describe** only describes the first shot selection. For
 two-color swaps, choose both selections and identities yourself, and use the explicit mapping above (or let
 🤖 Auto prompt write it: it is told which tinted person becomes which picture).
 
@@ -330,7 +299,7 @@ Crop + mask), `{target}`, the setting picture and the comparison overlay. Three 
 | shot editor → **🎞 mask video** | only that shot (its first frame = the shot's first frame) | everything |
 | the shot's own SAM 3 text / points | that shot | the two below |
 | the planner's optional **`mask`** input (MASK or IMAGE batch, e.g. Load Video + Convert Image to Mask) | the whole video, one mask per source frame | the panel's mask video |
-| People / Filters / Masks → **🎞 Mask video (whole video)** | the whole video, matched by time | SAM 3 for shots without a mask |
+| Shots → **Mask settings** → **🎞 Mask video (whole video)** | the whole video, matched by time | SAM 3 for shots without a mask |
 
 Any size and frame rate: it is matched to the shot by time and resized. The console says which mask each shot used.
 
@@ -355,9 +324,9 @@ Credit to **Neko (Nekodificador)** and **AbleJones**, whose workflow and nodes t
 ComfyUI builds without native H3 generation masks need a per-row mask patch on the model
 (e.g. ComfyUI-MiniMaxH3-PerRowMasking).
 
-The **People / Filters / Masks** tab holds the global mask settings, with defaults that work as they are: fill holes on,
+**Mask settings (every shot)**, at the bottom of the Shots tab, holds the global mask settings, with defaults that work as they are: fill holes on,
 temporal expand 2 frames (less flicker), expand 16 px, feather 12 px, padding 15 %, paste the whole box with feathered edges, blockify off
-(16 aligns the mask to H3's latent grid), threshold 0.5, 4 objects. *Show masks on shots* overlays the preview
+(16 aligns the mask to H3's latent grid), threshold 0.5, 4 objects. *show mask previews* (top of the Shots tab) overlays the preview
 on the shot cards. SAM 3 uses the official `sam3.1_multiplex_fp16.safetensors` in `models/checkpoints`,
 downloaded from Comfy-Org/sam3.1 the first time.
 
@@ -365,15 +334,15 @@ downloaded from Comfy-Org/sam3.1 the first time.
 
 Connect a vision-language model to the planner's `vlm` input (CLIPLoader with `qwen3vl_4b` or `qwen3vl_8b`).
 It looks at a few frames of every shot and suggests what to segment, a description of the shot (camera,
-framing, action) and whether to run it. In the **Prompts & refs** tab: *Use the VLM when the workflow runs* applies the
-suggestions at run time (mask text for shots without one; `{shot}` in a prompt becomes that shot's
+framing, action). In the **Pictures & prompt** tab (*VLM*): *Use the VLM when the workflow runs* applies the
+suggestions at run time (selection text for shots without one; `{shot}` in a prompt becomes that shot's
 description), *Analyse shots* asks from the panel (after one run with the VLM connected), and each shot's
 editor shows its suggestion with buttons to apply it. The summary output lists them too.
 
 ## Describe references ({details})
 
 The VLM can describe the references, for any task (not tied to swaps), and any subject: a person, a creature, a robot,
-an animal or a cartoon character (it says what the subject is first). In the **Prompts & refs** tab pick an instruction
+an animal or a cartoon character (it says what the subject is first). In the **Pictures & prompt** tab (*Describe references*) pick an instruction
 preset: *object* (a noun phrase for a prop, product, vehicle...: what it is, shape, materials, colors, text), *short* (the default: one noun phrase of at most ~20 words that fits inside a sentence, e.g. `green goblin with
 long pointed ears in a torn brown leather vest`, for `<Subject 1> is the {details} shown in <Picture 1>`), *full body* (face, hair, skin, age, build, clothing piece by piece), *head / face*, *face attributes* (a
 short comma-separated list), *outfit*, or *custom* (your own instruction). **📝 Describe refs** writes one
@@ -417,7 +386,7 @@ paste/crop-only composition and inpainting outside a subject mask, set **first_f
 **setting_ref** off (that option adds the original source location). The full aligned guide still contains source
 scene geometry, so a correct prompt alone does not guarantee complete background replacement by a checkpoint.
 
-In **Prompts & refs → 🤖 Auto prompt**, *Write the prompts with the VLM* turns the prompt boxes (global and per shot)
+In **Pictures & prompt → 🤖 Auto prompt**, *Write the prompts with the VLM* turns the prompt boxes (global and per shot)
 into **requests** ("replace the bottle with the red can from Picture 2", "Picture 1 dances in the rain"), and the VLM
 writes each shot's MiniMax H3 prompt in the official full-reference format (MiniMaxAI/MiniMax-H3
 `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`): `subject_definitions`, `summary` with its task type, `retention_analysis`,
@@ -699,12 +668,12 @@ Then save:
 **🎯 Track → whole video** (in the points window) is for a person who moves around: the selection is tracked by SAM 3
 through the whole video (or the range), forward and backward from the frame you clicked on, and every shot without
 its own selection takes its part of that track. Also type a short text (e.g. `woman in pink top`): after a camera cut
-the tracker uses it to find the subject again. The People / Filters / Masks tab shows the track and removes it. The first run
+the tracker uses it to find the subject again. **Mask settings** (Shots tab) shows the track and removes it. The first run
 tracks the whole range (a minute or two per few hundred frames); the result is cached until the selection changes.
 
 ### 3. Describe the person
 
-Click **🧑 Describe target** in the shot's editor:
+Click **🧑 Describe** next to `{target}` in the shot's editor:
 - SAM 3 cuts the person out of the selected frame, and a thumbnail of the cut-out appears next to the field.
 - The VLM writes a short phrase into the **`{target}`** field.
 - The field stays editable: correct it or write your own. Keep it short and visual (who, hair, main clothes with
@@ -721,7 +690,7 @@ Click **🧑 Describe target** in the shot's editor:
 
 ### What happens when the workflow runs
 
-Every shot's prompt gets its own `{target}` text: the one you wrote or made with 🧑 Describe target; when the field is
+Every shot's prompt gets its own `{target}` text: the one you wrote or made with 🧑 Describe; when the field is
 empty but the shot has a selection (mask text, points or a mask video) and the VLM is connected, the subject is cut out
 and described automatically (written for the prompt's `{target}` sentence). A shot with neither gets "the person". The selection is
 only used to make the description: it does not crop or mask anything unless the shot's mode is *Mask only*, *Crop*
@@ -730,7 +699,7 @@ or *Crop + mask*.
 ### Examples
 
 - **Two people, swap only one:** in the first shot, click on the woman's torso, put an exclude point on the man,
-  then **Save → all shots** and **🧑 Describe target** → "the young woman with long black hair in a white blouse".
+  then **Save → all shots** and **🧑 Describe** → "the young woman with long black hair in a white blouse".
   **Copy to other shots** with *{target}* ticked.
 - **The person changes between shots:** describe shot by shot, e.g. shot 1 "the man in the grey suit", shot 2
   "the woman in the red dress". Each shot keeps its own text.

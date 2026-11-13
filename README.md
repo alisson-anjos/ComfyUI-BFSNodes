@@ -46,9 +46,8 @@ cd ComfyUI-BFSNodes
 pip install -r requirements.txt
 ```
 
-Optional: `pip install insightface` with `onnxruntime` or `onnxruntime-gpu`, only for LTX Identity. The Shot Planner's
-*Find people* / Cast no longer needs it (1.93.0): it uses OpenCV's YuNet + SFace (Apache-2.0, downloaded once), and uses
-InsightFace only when it is installed. They are not in the requirements because insightface pins packages
+Optional: `pip install insightface` with `onnxruntime` or `onnxruntime-gpu`, only for LTX Identity. It is not in the
+requirements because insightface pins packages
 that conflict with many environments; without them everything else works and those features say what to install.
 
 Restart ComfyUI after installation.
@@ -146,18 +145,13 @@ workflow once per shot, and join the results back with the original timing and s
 - **BFS Shot Join** — concatenates, trims to the true lengths, cross-fades soft joins, returns audio. With `comparison` on, its `guide` output is the original video frame for frame.
 - **BFS Video Compare** — one player for two videos (Join's `guide` and `images`): wipe ↔ / ↕, overlay or side by side, any of guide / target / difference on top, plus a per-pixel difference map and the difference per frame (click to jump). 🖼 PNG downloads the frame on screen as shown; with two images (one frame) ⬇ save PNG downloads it from lossless PNGs at the compared size.
 
-**Cast (1.49.0)**: *Find people* tracks faces through the video (InsightFace) and groups them
-into people. Link each person to a reference and every shot uses the reference of the person
-with the most screen time in it; optionally split where the main person changes and run only the
-shots where a linked person appears.
-
 Two run modes: *auto loop* (all shots in one run) and *queue loop* (one shot per run, stored on
 disk, re-queued automatically; nodes after the join only run on the last shot). See
 [`web/js/docs/BFSShotPlanner.md`](web/js/docs/BFSShotPlanner.md).
 
 Shots can also be cropped to a **SAM 3 mask** (text or points per shot) and pasted back by the join, continue
 from the previous shot's result, and get **VLM suggestions** (what to segment, a shot description for the
-prompt, run/skip) from a Qwen3-VL connected to the planner.
+prompt) from a Qwen3-VL connected to the planner. It works for people, objects and vehicles alike.
 
 ## H3 Duet / Side Panel (1.50.0)
 

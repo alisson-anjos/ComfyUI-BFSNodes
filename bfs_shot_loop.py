@@ -455,8 +455,8 @@ DEFAULT_PLAN = {
     "global_refs": [], "global_ref": "", "global_ref2": "", "global_prompt": "", "global_color_guide_ref1": "#00ff00",
     "global_color_guide_ref2": "#9b30ff", "picture_colors": [], "megapixels": 0.5, "multiple": 32,
     "generation_size_mode": "megapixels", "custom_width": 1024, "custom_height": 1024,
-    "detector": "adaptive", "run": "recursive", "filters": {}, "skip_fill": "original",
-    "cast": {}, "cast_split": False, "cast_only": False, "mask_cfg": {}, "vlm_cfg": {}, "audio_mode": "auto", "ref_details": {},
+    "detector": "adaptive", "run": "recursive", "skip_fill": "original",
+    "mask_cfg": {}, "vlm_cfg": {}, "audio_mode": "auto", "ref_details": {},
     "picture_details": {}, "picture_cfg": {}, "auto_prompt": {}, "auto_prompts": {}, "between_shots": "keep", "shot_cache": "output", "shot_storage": "lossless", "unload_before_join": True,
 }
 
@@ -547,13 +547,6 @@ def resolve_plan(plan: dict, analysis: dict, path: str | None = None) -> list[di
         cuts = detect_cuts(analysis["score"], analysis["raw"], float(plan["sensitivity"]), fps)
     manual = plan.get("bounds") or None
     mode = "manual" if manual else plan["mode"]
-    cast = cached_cast(path, analysis) if path else None   # only once the people were analysed
-    if cast is not None and plan.get("cast_split") and not manual:
-        extra = []
-        bounds = [0] + cuts + [analysis["n"]]
-        for a, b in zip(bounds[:-1], bounds[1:]):
-            extra += person_change_points(cast, a, b, max(min_len, int(round(fps))))
-        cuts = sorted(set(cuts) | set(extra))
     segs = plan_segments(hi, cuts, mode, max_len, min_len, int(plan.get("max_parts") or 0), 0, manual, start=lo)
     meta = plan.get("segs") or []
     for i, s in enumerate(segs):
@@ -581,28 +574,27 @@ def resolve_plan(plan: dict, analysis: dict, path: str | None = None) -> list[di
         s["target"] = m.get("target") or ""
         s["cut_before"] = bool(s.get("cut_before")) or (s["start"] in cuts)
         s["gen_len"] = snap_up(s["end"] - s["start"], grid)
-        s["people"], s["main"] = [], -1
         s["color_guide_color"] = s["color_guide_color"] or str(plan.get("global_color_guide_ref1") or "#00ff00")
         s["color_guide_color2"] = s["color_guide_color2"] or str(plan.get("global_color_guide_ref2") or "#9b30ff")
         s["color_guide_marks"] = color_marks(plan, m)
         s["color_guide_color"] = s["color_guide_marks"][0]["color"]
-        if cast is not None:
-            sp = shot_people(cast, s["start"], s["end"])
-            s["people"], s["main"] = sp["people"], sp["main"]
-            included = [p for p in sp["people"] if not (plan.get("cast") or {}).get(str(p), {}).get("ignore")]
-            s["cast_skip"] = bool(plan.get("cast_only")) and not included
     return segs
 
 
-# ---------------------------------------------------------------------------- content filters
+# ---------------------------------------------------------------------------- which shots run
 
-DEFAULT_FILTERS = {
-    "person": False, "min_person_area": 0.0, "max_persons": 0, "face": False,
-    "skip_dark": False, "dark_level": 0.06, "skip_static": False, "static_level": 0.004,
-    "min_frames": 0, "samples": 6,
-}
+def mark_runs(plan: dict, segs: list[dict]) -> list[dict]:
+    """A shot runs when it is enabled. Plans before 1.122 could also skip one by hand (force = 'skip')."""
+    meta = plan.get("segs") or []
+    for i, s in enumerate(segs):
+        m = meta[i] if i < len(meta) and isinstance(meta[i], dict) else {}
+        s["run"] = bool(s["enabled"]) and m.get("force") != "skip"
+    return segs
+
+
+# ---------------------------------------------------------------------------- YOLO models (pose mask guide)
+
 _DET: dict[str, Any] = {}
-_STATS_CACHE: dict[tuple, dict] = {}
 
 
 def _yolo(kind: str):
@@ -624,375 +616,6 @@ def _yolo(kind: str):
         model = None
     _DET[kind] = model
     return model
-
-
-def _detect(frames: list[np.ndarray]) -> list[dict]:
-    """Per frame: person boxes (area fraction) and face count."""
-    import cv2
-    out = [{"persons": [], "faces": 0} for _ in frames]
-    pm, fm = _yolo("person"), _yolo("face")
-    if pm is not None:
-        for i, r in enumerate(pm(frames, verbose=False, conf=0.35, classes=[0])):
-            h, w = frames[i].shape[:2]
-            for b in r.boxes.xyxy.cpu().numpy() if r.boxes is not None else []:
-                out[i]["persons"].append(float((b[2] - b[0]) * (b[3] - b[1]) / (w * h)))
-    else:
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        for i, fr in enumerate(frames):
-            h, w = fr.shape[:2]
-            rects, _ = hog.detectMultiScale(cv2.cvtColor(fr, cv2.COLOR_RGB2GRAY), winStride=(8, 8))
-            out[i]["persons"] = [float(rw * rh / (w * h)) for (_, _, rw, rh) in rects]
-    if fm is not None:
-        for i, r in enumerate(fm(frames, verbose=False, conf=0.4)):
-            out[i]["faces"] = int(len(r.boxes)) if r.boxes is not None else 0
-    else:
-        casc = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
-        for i, fr in enumerate(frames):
-            out[i]["faces"] = int(len(casc.detectMultiScale(cv2.cvtColor(fr, cv2.COLOR_RGB2GRAY), 1.1, 5)))
-    return out
-
-
-def shot_stats(path: str, analysis: dict, seg: dict, samples: int = 6) -> dict:
-    """Sampled content statistics for one shot (cached)."""
-    key = (path, os.path.getmtime(path), float(analysis["fps"]), seg["start"], seg["end"], samples)
-    if key in _STATS_CACHE:
-        return _STATS_CACHE[key]
-    src = _timeline(analysis["n_src"], analysis["fps_src"], float(analysis["fps"]))
-    k = max(1, min(samples, seg["end"] - seg["start"]))
-    pick = np.linspace(seg["start"], seg["end"] - 1, k).round().astype(int)
-    w = 640
-    h = max(32, int(round(w * analysis["height"] / max(1, analysis["width"]))))
-    frames = _read_frames(path, src[pick], (w, h))
-    det = _detect(frames)
-    raw = analysis.get("raw") or []
-    motion = float(np.mean(raw[seg["start"] + 1:seg["end"]])) if seg["end"] - seg["start"] > 1 and raw else 0.0
-    st = {
-        "persons": int(max(len(d["persons"]) for d in det)),
-        "person_area": round(float(max([max(d["persons"]) for d in det if d["persons"]] or [0.0])), 4),
-        "person_frames": int(sum(1 for d in det if d["persons"])),
-        "faces": int(max(d["faces"] for d in det)),
-        "brightness": round(float(np.mean([f.mean() / 255.0 for f in frames])), 4),
-        "motion": round(motion, 4), "sampled": int(k),
-    }
-    _STATS_CACHE[key] = st
-    return st
-
-
-def skip_reason(stats: dict, length: int, f: dict) -> str:
-    """Why a shot should be skipped under these filters ('' = keep)."""
-    if f.get("min_frames") and length < int(f["min_frames"]):
-        return f"shorter than {int(f['min_frames'])} frames"
-    if f.get("skip_dark") and stats["brightness"] < float(f.get("dark_level", 0.06)):
-        return "dark / fade"
-    if f.get("skip_static") and stats["motion"] < float(f.get("static_level", 0.004)):
-        return "static"
-    if f.get("person") and stats["persons"] == 0:
-        return "no person"
-    if f.get("person") and float(f.get("min_person_area") or 0) > 0 and stats["person_area"] < float(f["min_person_area"]):
-        return f"person smaller than {float(f['min_person_area']) * 100:.0f}% of the frame"
-    if int(f.get("max_persons") or 0) > 0 and stats["persons"] > int(f["max_persons"]):
-        return f"more than {int(f['max_persons'])} people"
-    if f.get("face") and stats["faces"] == 0:
-        return "no face"
-    return ""
-
-
-def filters_active(f: dict) -> bool:
-    return any(f.get(k) for k in ("person", "face", "skip_dark", "skip_static")) or \
-        int(f.get("max_persons") or 0) > 0 or int(f.get("min_frames") or 0) > 0
-
-
-def apply_filters(plan: dict, analysis: dict, path: str, segs: list[dict]) -> list[dict]:
-    """Mark each shot with stats and an automatic skip reason; per-shot 'force' overrides it."""
-    f = dict(DEFAULT_FILTERS); f.update(plan.get("filters") or {})
-    meta = plan.get("segs") or []
-    need = filters_active(f)
-    for i, s in enumerate(segs):
-        force = (meta[i] or {}).get("force", "auto") if i < len(meta) and isinstance(meta[i], dict) else "auto"
-        s["force"] = force
-        s["stats"] = shot_stats(path, analysis, s, int(f.get("samples") or 6)) if need else None
-        s["skip_reason"] = skip_reason(s["stats"], s["end"] - s["start"], f) if need else ""
-        if not s["skip_reason"] and s.get("cast_skip"):
-            s["skip_reason"] = "no detected person"
-        s["run"] = s["enabled"] and (force == "run" or (force != "skip" and not s["skip_reason"]))
-    return segs
-
-
-# ---------------------------------------------------------------------------- cast (people by face)
-
-_FACE_APP: Any = None
-_CAST_CACHE: dict[tuple, dict] = {}
-
-
-def _face_app():
-    """InsightFace detector + ArcFace recogniser (buffalo_l), or None when unavailable."""
-    global _FACE_APP
-    if _FACE_APP is not None:
-        return _FACE_APP or None
-    try:
-        import insightface
-        root = os.path.join(folder_paths.models_dir, "insightface")
-        # CPU only: light, no VRAM, and no CUDA/cuDNN loading (a missing cuDNN aborts the whole process)
-        app = insightface.app.FaceAnalysis(name="buffalo_l", root=root, allowed_modules=["detection", "recognition"],
-                                           providers=["CPUExecutionProvider"])
-        app.prepare(ctx_id=-1, det_size=(320, 320))
-        # small models: a few threads are faster than onnxruntime's default pool (one per core) and stay light
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = min(4, os.cpu_count() or 4)
-        so.inter_op_num_threads = 1
-        for model in app.models.values():
-            model.session = ort.InferenceSession(model.model_file, so, providers=["CPUExecutionProvider"])
-        _FACE_APP = app
-    except Exception as exc:  # noqa: BLE001
-        print(f"[BFS Shot Planner] face analysis unavailable: {exc!r}")
-        _FACE_APP = False
-    return _FACE_APP or None
-
-
-def _cast_key(path: str, analysis: dict, step_s: float = 0.5, threshold: float = 0.42, min_share: float = 0.01) -> tuple:
-    return (path, os.path.getmtime(path), float(analysis["fps"]), round(step_s, 3), round(threshold, 3), round(min_share, 4),
-            "insightface" if _face_app() is not None else "opencv" if _cv_face() is not None else "sam3")
-
-
-APPEARANCE_THRESHOLD = 0.86   # cosine on the colour signature (only when DINOv2 cannot load)
-SFACE_THRESHOLD = 0.36        # cosine on SFace features (OpenCV's same-identity threshold is 0.363)
-_CV_FACE: dict = {}
-CV_FACE_MODELS = {
-    "face_detection_yunet_2023mar.onnx":
-        "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
-    "face_recognition_sface_2021dec.onnx":
-        "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
-}
-
-
-def _cv_face():
-    """OpenCV Zoo's YuNet (detection) + SFace (recognition): Apache-2.0, run by OpenCV itself (no extra package),
-    downloaded once into models/opencv_face (0.2 + 37 MB). None when it cannot load."""
-    if "m" not in _CV_FACE:
-        try:
-            import cv2
-            import urllib.request
-            d = os.path.join(folder_paths.models_dir, "opencv_face")
-            os.makedirs(d, exist_ok=True)
-            for name, url in CV_FACE_MODELS.items():
-                f = os.path.join(d, name)
-                if not os.path.exists(f) or os.path.getsize(f) < 100000:
-                    print(f"[BFS Shot Planner] downloading {name} (OpenCV Zoo, Apache-2.0)", flush=True)
-                    urllib.request.urlretrieve(url, f + ".part")
-                    os.replace(f + ".part", f)
-            det = cv2.FaceDetectorYN.create(os.path.join(d, "face_detection_yunet_2023mar.onnx"), "", (320, 320), 0.6, 0.3, 50)
-            rec = cv2.FaceRecognizerSF.create(os.path.join(d, "face_recognition_sface_2021dec.onnx"), "")
-            _CV_FACE["m"] = (det, rec)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[BFS Shot Planner] OpenCV face models unavailable ({exc!r})", flush=True)
-            _CV_FACE["m"] = None
-    return _CV_FACE["m"]
-
-
-def appearance_signature(frame: np.ndarray, box) -> np.ndarray:
-    """A license-free identity signature for grouping people inside ONE video: colour histograms of the head (hair,
-    skin) and of the torso under it (clothes), plus a tiny grey thumbnail of the face. Weaker than ArcFace across
-    videos, enough to tell the people of a clip apart."""
-    import cv2
-    H, W = frame.shape[:2]
-    x0, y0, x1, y1 = [int(v) for v in box]
-    bw, bh = max(2, x1 - x0), max(2, y1 - y0)
-    head = frame[max(0, y0 - bh // 4):min(H, y1), max(0, x0 - bw // 6):min(W, x1 + bw // 6)]
-    torso = frame[min(H - 1, y1):min(H, y1 + 2 * bh), max(0, x0 - bw // 3):min(W, x1 + bw // 3)]
-
-    def hist(img):
-        if img.size == 0:
-            return np.zeros(12 * 4 * 4, np.float32)
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        h = cv2.calcHist([hsv], [0, 1, 2], None, [12, 4, 4], [0, 180, 0, 256, 0, 256]).ravel().astype(np.float32)
-        return np.sqrt(h / max(1.0, h.sum()))      # Hellinger: cosine of sqrt-histograms
-    face = frame[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
-    thumb = cv2.resize(cv2.cvtColor(face, cv2.COLOR_RGB2GRAY), (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32).ravel() \
-        if face.size else np.zeros(64, np.float32)
-    thumb = (thumb - thumb.mean()) / (thumb.std() + 1e-6) * 0.05
-    v = np.concatenate([hist(head), 1.3 * hist(torso), thumb])
-    return v / (np.linalg.norm(v) + 1e-8)
-
-
-def _sam3_faces(frames: list, threshold: float = 0.4) -> list:
-    """Faces per frame with SAM 3.1 (ComfyUI core): [[(x0, y0, x1, y1, score), ...], ...] in pixels."""
-    from comfy_extras.nodes_sam3 import SAM3_Detect
-    model, clip = _sam3()
-    cond = clip.encode_from_tokens_scheduled(clip.tokenize("face"))
-    out = []
-    for k in range(0, len(frames), 8):
-        _status("Finding faces (SAM 3.1)", k, len(frames))
-        batch = torch.from_numpy(np.stack(frames[k:k + 8]).astype(np.float32) / 255.0)
-        boxes = SAM3_Detect.execute(model=model, image=batch, conditioning=cond, threshold=threshold,
-                                    refine_iterations=0).args[1]
-        for fb in boxes:
-            out.append([(b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"], b.get("score", 1.0)) for b in (fb or [])])
-    return out
-
-
-def cached_cast(path: str, analysis: dict) -> dict | None:
-    """The cast of a video when it was already analysed with the default settings, else None (never computes)."""
-    try:
-        return _CAST_CACHE.get(_cast_key(path, analysis))
-    except OSError:
-        return None
-
-
-def analyze_cast(path: str, analysis: dict, step_s: float = 0.5, threshold: float = 0.42,
-                 min_share: float = 0.01, max_faces: int = 3) -> dict:
-    """Detect faces every `step_s` seconds (CPU), keep the `max_faces` most probable ones per frame, group them
-    into people by ArcFace similarity.
-
-    Returns {"people": [{id, thumb, count, share}], "samples": [{f, faces: [{pid, area}]}]} where
-    `f` is a timeline frame. Person ids are stable for the same video and settings.
-    """
-    import cv2
-    key = _cast_key(path, analysis, step_s, threshold, min_share)
-    if key in _CAST_CACHE:
-        return _CAST_CACHE[key]
-    # InsightFace (ArcFace) when installed; else OpenCV's YuNet + SFace (Apache-2.0, no extra package); else SAM 3.1
-    # faces grouped by colours (hair, skin, clothes)
-    app = _face_app()
-    cvf = _cv_face() if app is None else None
-    if app is None:
-        threshold = SFACE_THRESHOLD if cvf is not None else APPEARANCE_THRESHOLD
-        print("[BFS Shot Planner] Find people: insightface is not installed, using "
-              + ("OpenCV YuNet + SFace faces" if cvf is not None else "SAM 3.1 faces + colours (hair, skin, clothes)"),
-              flush=True)
-    fps = float(analysis["fps"])
-    step = max(1, int(round(step_s * fps)))
-    frames_idx = np.arange(0, analysis["n"], step)
-    src = _timeline(analysis["n_src"], analysis["fps_src"], fps)
-    w = 960
-    h = max(32, int(round(w * analysis["height"] / max(1, analysis["width"]))))
-    frames = _read_frames(path, src[frames_idx], (w, h), stage="Reading frames for faces")
-    dets = []   # (sample index, embedding, area fraction, crop)
-    if app is None and cvf is not None:
-        det, rec = cvf
-        det.setInputSize((w, h))
-        for si, fr in enumerate(frames):
-            _status("Finding faces", si, len(frames))
-            bgr = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
-            _, faces = det.detect(bgr)
-            cand = []
-            for row in (faces if faces is not None else []):
-                x, y, bw, bh, score = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[-1])
-                area = max(0.0, bw) * max(0.0, bh) / float(w * h)
-                if area >= 0.0015 and score >= 0.6:
-                    cand.append((score, row, area))
-            for score, row, area in sorted(cand, key=lambda c: -c[0])[:max_faces]:
-                feat = rec.feature(rec.alignCrop(bgr, row)).ravel().astype(np.float32)
-                x0, y0, x1, y1 = int(row[0]), int(row[1]), int(row[0] + row[2]), int(row[1] + row[3])
-                pad = int(0.25 * max(x1 - x0, y1 - y0))
-                crop = fr[max(0, y0 - pad):min(h, y1 + pad), max(0, x0 - pad):min(w, x1 + pad)]
-                dets.append((si, feat / (np.linalg.norm(feat) + 1e-8), area, crop))
-    elif app is None:
-        for si, (fr, faces) in enumerate(zip(frames, _sam3_faces(frames, threshold=0.55))):
-            cand = []
-            for x0, y0, x1, y1, score in faces:
-                bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
-                area = bw * bh / float(w * h)
-                if area >= 0.0015 and 0.55 <= bw / bh <= 1.4:     # a face-shaped box (logos and text are skipped)
-                    cand.append((float(score), (x0, y0, x1, y1), area))
-            for score, box, area in sorted(cand, reverse=True)[:max_faces]:
-                x0, y0, x1, y1 = [int(v) for v in box]
-                pad = int(0.25 * max(x1 - x0, y1 - y0))
-                crop = fr[max(0, y0 - pad):min(h, y1 + pad), max(0, x0 - pad):min(w, x1 + pad)]
-                dets.append((si, appearance_signature(fr, box), area, crop))
-    frames_for_faces = frames if app is not None else []
-    from_insight = app is not None
-    if from_insight:
-        from insightface.app.common import Face
-        rec = app.models["recognition"]
-    for si, fr in enumerate(frames_for_faces):
-        _status("Finding faces", si, len(frames))
-        bgr = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
-        boxes, kpss = app.det_model.detect(bgr, max_num=0, metric="default")
-        # only the most probable faces of the frame get recognised, so a crowd stays cheap and out of the cast
-        cand = []
-        for k in range(boxes.shape[0]):
-            x0, y0, x1, y1 = [int(v) for v in boxes[k, :4]]
-            area = max(0, x1 - x0) * max(0, y1 - y0) / float(w * h)
-            if area >= 0.0015 and boxes[k, 4] >= 0.5:
-                cand.append((float(boxes[k, 4]), k, area))
-        for score, k, area in sorted(cand, reverse=True)[:max_faces]:
-            f = Face(bbox=boxes[k, :4], kps=kpss[k] if kpss is not None else None, det_score=score)
-            rec.get(bgr, f)
-            x0, y0, x1, y1 = [int(v) for v in f.bbox]
-            pad = int(0.25 * max(x1 - x0, y1 - y0))
-            crop = fr[max(0, y0 - pad):min(h, y1 + pad), max(0, x0 - pad):min(w, x1 + pad)]
-            dets.append((si, f.normed_embedding.astype(np.float32), area, crop))
-    # greedy online clustering on cosine similarity, then merge close clusters
-    cents, members = [], []
-    for k, (_, e, _, _) in enumerate(dets):
-        if cents:
-            sims = np.array([c @ e / (np.linalg.norm(c) + 1e-8) for c in cents])
-            j = int(sims.argmax())
-            if sims[j] >= threshold:
-                members[j].append(k); cents[j] = cents[j] + e
-                continue
-        cents.append(e.copy()); members.append([k])
-    merged = True
-    while merged:
-        merged = False
-        for a in range(len(cents)):
-            for b in range(a + 1, len(cents)):
-                ca, cb = cents[a] / np.linalg.norm(cents[a]), cents[b] / np.linalg.norm(cents[b])
-                if ca @ cb >= threshold:
-                    cents[a] = cents[a] + cents[b]; members[a] += members[b]
-                    del cents[b]; del members[b]; merged = True
-                    break
-            if merged:
-                break
-    total = max(1, len(frames))
-    groups = [m for m in members if len({dets[k][0] for k in m}) / total >= min_share]
-    groups.sort(key=lambda m: -len({dets[k][0] for k in m}))
-    people, owner = [], {}
-    for pid, m in enumerate(groups):
-        best = max(m, key=lambda k: dets[k][2])
-        crop = cv2.resize(dets[best][3], (96, 96), interpolation=cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 80])
-        seen = sorted({dets[k][0] for k in m})
-        people.append({"id": pid, "thumb": "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode(),
-                       "count": len(seen), "share": round(len(seen) / total, 4),
-                       "first": int(frames_idx[seen[0]]), "last": int(frames_idx[seen[-1]])})
-        for k in m:
-            owner[k] = pid
-    samples = [{"f": int(f), "faces": []} for f in frames_idx]
-    for k, (si, _, area, _) in enumerate(dets):
-        if k in owner:
-            samples[si]["faces"].append({"pid": owner[k], "area": round(float(area), 5)})
-    out = {"people": people, "samples": samples, "step": step}
-    _CAST_CACHE[key] = out
-    return out
-
-
-def shot_people(cast: dict, start: int, end: int) -> dict:
-    """Who appears in [start, end): per person, sampled frames seen and summed face area; plus the main one."""
-    score: dict[int, list[float]] = {}
-    for smp in cast["samples"]:
-        if start <= smp["f"] < end:
-            for fc in smp["faces"]:
-                v = score.setdefault(fc["pid"], [0, 0.0]); v[0] += 1; v[1] += fc["area"]
-    main = max(score, key=lambda p: (score[p][0], score[p][1])) if score else -1
-    return {"people": sorted(score), "main": main}
-
-
-def person_change_points(cast: dict, start: int, end: int, min_run: int) -> list[int]:
-    """Frames inside [start, end) where the main (largest) face switches to another person for at least min_run."""
-    runs = []
-    for smp in cast["samples"]:
-        if start <= smp["f"] < end:
-            main = max(smp["faces"], key=lambda fc: fc["area"])["pid"] if smp["faces"] else -1
-            if main >= 0 and (not runs or runs[-1][1] != main):
-                runs.append([smp["f"], main])
-    pts = []
-    for (f0, p0), (f1, p1) in zip(runs, runs[1:]):
-        if f1 - (pts[-1] if pts else start) >= min_run and end - f1 >= min_run:
-            pts.append(f1)
-    return pts
 
 
 # ---------------------------------------------------------------------------- shot masks (SAM 3) and crop / uncrop
@@ -3447,12 +3070,10 @@ class BFSShotPlanner:
             _EXT_MASK[path] = mask.detach().cpu()
         else:
             _EXT_MASK.pop(path, None)
-        if p.get("cast") or p.get("cast_split") or p.get("cast_only"):
-            analyze_cast(path, a)   # warms the cache so the plan uses the same people as the panel
-        all_segs = apply_filters(p, a, path, resolve_plan(p, a, path))
+        all_segs = mark_runs(p, resolve_plan(p, a, path))
         segs = [s for s in all_segs if s["run"]]
         if not segs:
-            raise ValueError("BFS Shot Planner: no shot is left to run (all disabled or filtered out).")
+            raise ValueError("BFS Shot Planner: no shot is left to run (all disabled).")
         W, H = plan_generation_size(a["width"], a["height"], p, int(p["multiple"]))
         src = _timeline(a["n_src"], a["fps_src"], fps)
         audio = _read_audio(path) if p.get("audio_mode", "auto") != "silent" else None
@@ -3690,7 +3311,7 @@ class BFSShotPlanner:
                     "src": src.tolist(), "n": a["n"]}
         if queue:   # the panel's Combine assembles the stored shots on this timeline (original video where none ran)
             torch.save(timeline, os.path.join(run_dir(rid), "timeline.pt"))
-        skipped = [(i, s.get("skip_reason") or ("disabled" if not s["enabled"] else "skip")) for i, s in enumerate(all_segs) if not s["run"]]
+        skipped = [(i, "disabled") for i, s in enumerate(all_segs) if not s["run"]]
         lines = [f"{len(segs)} shots, {total} frames ({total / fps:.2f}s) at {fps:g} fps, {W}x{H}"
                  + (" | every shot stored: assembling only" if assemble_only else
                     f" | queue loop: running shot {shots[0]['index'] + 1}/{len(segs)}" if queue else "")]
@@ -3934,15 +3555,15 @@ _LIMB_RGB = [(255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0), (170, 255,
 
 def pose_frames(frames: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     """The skeleton (COCO-17, OpenPose colours) of the people inside the mask on black, [F,H,W,3]. Uses a YOLO pose
-    model from models/ultralytics (e.g. pose/yolov8m-pose.pt), the same place and package as the planner's filters."""
+    model from models/ultralytics (e.g. pose/yolov8m-pose.pt), the same place as the other ultralytics models."""
     import cv2
     model = _yolo("pose")
     if model is None:
         try:
             import ultralytics  # noqa: F401
         except ImportError:
-            raise ValueError("mask_guide_look 'pose' needs the ultralytics package (the same one the Impact Pack and "
-                             "the planner's filters use): pip install ultralytics") from None
+            raise ValueError("mask_guide_look 'pose' needs the ultralytics package (the same one the Impact Pack "
+                             "uses): pip install ultralytics") from None
         raise ValueError("mask_guide_look 'pose' needs a YOLO pose model in ComfyUI/models/ultralytics/pose/, e.g. "
                          "yolov8m-pose.pt from https://github.com/ultralytics/assets/releases/download/v8.2.0/"
                          "yolov8m-pose.pt (no restart needed after adding it)")
@@ -4322,7 +3943,7 @@ class BFSShotH3Conditioning:
                     "without colours or a face (default). colour: as it is (can make the model copy the old subject). "
                     "silhouette: only its flat shape. edges: only its outlines. pose (people): the skeleton of the "
                     "people in the mask (OpenPose colours), from a YOLO pose model in models/ultralytics (e.g. "
-                    "pose/yolov8m-pose.pt; uses ultralytics like the planner's filters). The less it shows, the less "
+                    "pose/yolov8m-pose.pt; uses ultralytics). The less it shows, the less "
                     "the model can copy the old subject; the more, the better it follows the pose."}),
                 "mask_ref_size": (list(MASK_REF_SIZES), {"default": "1/2", "tooltip":
                     "mask_guide '+ reference video' only: size of that reference video (fraction of the generation "
@@ -5785,11 +5406,6 @@ try:
             def work():
                 a = analyze(_input_path(p["video"]), float(p["fps"]))
                 path = _input_path(p["video"])
-                if p.get("cast") or p.get("cast_split") or p.get("cast_only"):
-                    try:
-                        analyze_cast(path, a)
-                    except Exception:  # noqa: BLE001 - plan without people
-                        pass
                 segs = resolve_plan(p, a, path)
                 cuts, used = find_cuts(path, a, p.get("detector", "adaptive"), float(p["sensitivity"]))
                 return a, segs, cuts, used
@@ -5799,28 +5415,6 @@ try:
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         return web.json_response({"segs": segs, "cuts": cuts, "width": W, "height": H, "detector": used,
                                   "max_len": snap_down(int(round(float(p["max_s"]) * float(p["fps"]))), p["grid"])})
-    @PromptServer.instance.routes.post("/bfs/shotloop/filters")
-    async def _bfs_shot_filters(request):
-        body = await request.json()
-        try:
-            p = _load_plan(json.dumps(body.get("plan", {})))
-            f = dict(DEFAULT_FILTERS); f.update(p.get("filters") or {})
-            path = _input_path(p["video"])
-
-            def work():
-                a = analyze(path, float(p["fps"]))
-                segs = resolve_plan(p, a, path)
-                for i, s in enumerate(segs):   # stats always, so the panel can show them before any filter is on
-                    _status("Detecting people and faces", i, len(segs))
-                    s["stats"] = shot_stats(path, a, s, int(f.get("samples") or 6))
-                    s["skip_reason"] = skip_reason(s["stats"], s["end"] - s["start"], f)
-                return segs
-            segs = await _off_loop(work)
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
-        return web.json_response({"segs": [{"start": s["start"], "end": s["end"], "stats": s["stats"],
-                                            "skip_reason": s["skip_reason"]} for s in segs]})
-
     @PromptServer.instance.routes.get("/bfs/shotloop/frame")
     async def _bfs_shot_frame(request):
         import cv2
@@ -5986,17 +5580,6 @@ try:
         except Exception as exc:  # noqa: BLE001
             return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
         return web.json_response({"prompts": prompts})
-
-    @PromptServer.instance.routes.post("/bfs/shotloop/cast")
-    async def _bfs_shot_cast(request):
-        body = await request.json()
-        try:
-            p = _load_plan(json.dumps(body.get("plan", {})))
-            path = _input_path(p["video"])
-            c = await _off_loop(lambda: analyze_cast(path, analyze(path, float(p["fps"]))))
-        except Exception as exc:  # noqa: BLE001
-            return web.json_response({"error": f"{type(exc).__name__}: {exc}"}, status=500)
-        return web.json_response({"people": c["people"], "step": c["step"], "samples": len(c["samples"])})
 
     @PromptServer.instance.routes.get("/bfs/shotloop/vram")
     async def _bfs_shot_vram(request):

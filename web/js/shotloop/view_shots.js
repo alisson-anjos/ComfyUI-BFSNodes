@@ -1,21 +1,21 @@
-// 🎬 Shots tab: one card per shot, then the selected shot's editor (preview, reference & prompt, who is replaced,
-// continuity, copy to other shots).
-import { h, hue, fmtT, segKey, hasMask, maskSource, pill, hint, check, section, refBox, promptChips, pictureColor, markName,
-         MAX_REFS } from "./common.js";
+// 🎬 Shots tab: one card per shot, then the selected shot's editor (pictures & prompt, what changes, continuity, copy
+// to other shots), then the mask settings shared by every shot.
+import { h, hue, fmtT, segKey, hasMask, maskSource, pill, hint, check, section, select, fld, refBox, promptChips, pictureColor,
+         markName, MAX_REFS } from "./common.js";
 import { h as rawH } from "../vendor/vue.esm-browser.prod.mjs";
 
 const bdg = (text, kind = "", title = "") => h("span", { class: ["bdg", kind], title }, text);
 
 function shotCard(c, s, i) {
   const { plan, sel, maskPrev, showMasks } = c;
-  const fps = plan.fps, why = c.skipWhy(s), who = c.whoIn(s), st = c.statFor(s), issues = c.checksFor(i);
+  const fps = plan.fps, why = c.skipWhy(s), issues = c.checksFor(i);
   const warnN = issues.filter(x => x.lvl === "warn").length;
   const mp = maskPrev.value[segKey(s)];
   return h("div", { class: ["sc", i === sel.value && "sel", why && "skip"], onClick: () => { sel.value = i; } }, [
     h("button", { class: "play", title: "play this shot", onClick: e => { e.stopPropagation(); c.playShot(i); } }, "▶"),
     h("div", { class: "bar", style: `background:${hue(i)}` }),
     h("div", { class: "row" }, [h("b", `#${i + 1}`), s.cut ? pill("cut") : null,
-      why ? pill("skip", "warn", why) : pill("run", "ok"), s.force !== "auto" ? pill(s.force) : null]),
+      why ? pill("off", "warn", why) : pill("run", "ok")]),
     h("div", { class: "badges" }, [
       { video: bdg("🎞 mask video", "", s.mask.video), global: bdg("🎞 global mask", "", "the plan's mask video for the whole video"),
         track: bdg("🎯 track", "", "its part of the whole-video SAM 3 track"),
@@ -29,12 +29,6 @@ function shotCard(c, s, i) {
         run: bdg("⏳", "", "not stored yet, or its settings changed: the next Queue generates it") }[c.cacheOf(s)] || null,
       warnN ? bdg(`⚠ ${warnN}`, "warn", issues.map(x => x.text).join("\n")) : null,
     ]),
-    who ? h("div", { class: "who" }, who.people.length ? who.people.map(id => h("img", {
-      src: c.personOf(id)?.thumb || "", title: `Person ${id}${id === who.main ? " (main)" : ""}${c.included(id) ? " · included" : ""}`,
-      class: [id === who.main && "main", c.included(id) && "lk"] })) : [h("span", { class: "t" }, "no faces")]) : null,
-    st ? h("div", { class: "t", style: "margin-top:2px" },
-      `👤 ${st.persons} · ${(st.person_area * 100).toFixed(1)}% · 🙂 ${st.faces} · ☀ ${(st.brightness * 100).toFixed(0)}%`) : null,
-    why ? h("div", { class: "t", style: "color:#ffc46b" }, why) : null,
     h("div", { class: "t" }, `${fmtT(s.start, fps)} → ${fmtT(s.end, fps)} · ${s.len}f → ${s.gen}f`),
     h("div", { class: "thumbs" }, [
       ...(s.names.length ? s.names.slice(0, 3).map((name, k) => h("img", { class: "rt", src: c.viewUrl(name),
@@ -83,12 +77,9 @@ function editor(c, cur) {
     h("button", { class: "ghost", disabled: i === 0, title: "previous shot (←)", onClick: () => c.select(i - 1) }, "◀"),
     h("span", { class: "big" }, `Shot #${i + 1}`),
     h("button", { class: "ghost", disabled: i >= S.length - 1, title: "next shot (→)", onClick: () => c.select(i + 1) }, "▶"),
-    c.skipWhy(cur) ? pill(`skip · ${c.skipWhy(cur)}`, "warn") : pill("runs", "ok"),
+    c.skipWhy(cur) ? pill("disabled", "warn") : pill("runs", "ok"),
     hint(`frames ${cur.start}–${cur.end - 1} · ${cur.len} → generate ${cur.gen}`),
     h("span", { class: "grow" }),
-    h("select", { value: cur.force, style: "width:auto", title: "Override the content filters for this shot",
-      onChange: e => c.setMeta(i, "force", e.target.value) },
-      [h("option", { value: "auto" }, "filters decide"), h("option", { value: "run" }, "always run"), h("option", { value: "skip" }, "always skip")]),
     h("button", { onClick: () => c.setMeta(i, "enabled", !cur.enabled) }, cur.enabled ? "⏸ Disable" : "▶ Enable"),
     h("button", { title: "split this shot in two", onClick: () => c.splitAt(cur.start + Math.floor(cur.len / 2)) }, "✂ Split"),
     h("button", { disabled: i >= S.length - 1, title: "merge with the next shot", onClick: () => c.mergeNext(i) }, "⇥ Merge"),
@@ -97,7 +88,7 @@ function editor(c, cur) {
   const problems = warnsHere.length ? h("div", { class: "checks", style: "margin-bottom:6px" }, warnsHere.map(x =>
     h("div", { class: "ck" }, [h("span", { class: "lvl" }, x.lvl === "warn" ? "⚠" : "ℹ"), h("span", x.text)]))) : null;
 
-  const refPrompt = section("Reference & prompt", [
+  const refPrompt = section("Pictures & prompt", [
     refBox(c, i, cur.refs, plan.global_refs),
     h("div", { class: "pbox", style: "margin-top:6px" }, [
       h("textarea", { placeholder: plan.auto_prompt?.enabled
@@ -127,128 +118,123 @@ function editor(c, cur) {
       h("button", { class: "sm", title: "Forget the recent pictures (the ones this plan still uses stay)", onClick: () => c.clearRecent() }, "✕ clear"),
       h("button", { class: "sm dng", title: "Remove EVERY reference from this plan (global and all shots) and the recent list", onClick: () => c.clearAllRefs() }, "✕ clear all")]) : null,
     h("div", { class: "row", style: "margin-top:6px" }, [
-      h("button", { class: "dng", title: "clear this shot's references and prompt: it uses the global ones",
+      h("button", { class: "dng", title: "clear this shot's pictures and prompt: it uses the global ones",
         onClick: () => { Object.assign(c.meta(i), { refs: [], prompt: "" }); c.save(); } }, "Use global"),
-      hint("empty slots use the global references (Prompts & refs tab)"),
     ]),
-  ], { sub: "who the shot becomes" });
+  ], { sub: "faded = the global ones (Pictures & prompt tab)" });
 
-  const mode = (on, title, text, onClick) => h("div", { class: ["mode", on && "on"], onClick }, [h("b", title), h("span", text)]);
   // which picture a marked person becomes: "Picture 3 · red" with its thumbnail (the color is the picture's)
   const picturePick = (k, onPick) => {
     const n = Math.max(cur.names.length, k), color = pictureColor(plan, k);
     return h("span", { class: "row", style: "gap:4px;align-items:center" }, [
       cur.names[k - 1] ? h("img", { class: "mthumb", src: c.viewUrl(cur.names[k - 1]), style: `--mark:${color}`, title: cur.names[k - 1] })
         : h("span", { class: "mthumb", style: `--mark:${color};display:inline-block;background:${color}` }),
-      h("select", { value: String(k), style: "width:auto", title: "The picture this person becomes; the mark is drawn in its color",
+      h("select", { value: String(k), style: "width:auto", title: "The picture this subject becomes; the mark is drawn in its color",
         onChange: e => onPick(+e.target.value) },
         Array.from({ length: Math.min(MAX_REFS, n) }, (_, q) => h("option", { value: String(q + 1) },
           `Picture ${q + 1} · ${markName(pictureColor(plan, q + 1))}${cur.names[q] ? "" : " (no picture)"}`))),
     ]);
   };
-  const who = section("Select region", [
-    h("div", { class: "row", style: "margin-top:4px;align-items:center;gap:8px" }, [
-      check(!!cur.color_guide, v => c.setMeta(i, "color_guide", v), "🎨 Colored Mark",
-        "Color each selected person in the source video with the color of the picture they become, as a translucent marker; the prompt gets 'the person marked in <color> becomes the character from <Picture n>'. It does not create or enable an inpainting mask."),
-      cur.color_guide ? h("span", { class: "hint" }, "this selection becomes") : null,
-      cur.color_guide ? picturePick(cur.color_guide_picture, k => { c.setMarkPicture(i, 1, k); if (maskPrev.value[segKey(cur)]) c.previewMask(i); }) : null,
+  // what changes in this shot: one row per subject. Row 1 is the shot's own selection (its SAM 3 text / points);
+  // with Colored Mark on, every row becomes a picture (drawn in that picture's color) and more rows can be added
+  const cg = cur.color_guide, regionsN = 1 + cur.regions.length;
+  const label = n => (cg ? h("span", { class: "hint", style: "white-space:nowrap;min-width:58px" }, `Subject ${n}`) : null);
+  const becomes = (k, onPick) => (cg ? [h("span", { class: "hint" }, "→"), picturePick(k, onPick)] : []);
+  const subject1 = h("div", { class: "mreg" }, [
+    label(1),
+    h("input", { type: "text", value: cur.mask.text || "", style: "flex:1;min-width:160px",
+      placeholder: "what to select, in English: woman in pink top, red car, black dog… (Enter = preview)",
+      title: "A short phrase (noun + one or two traits); SAM 3 finds and tracks it through the shot. Points, when set, win over the text.",
+      onInput: e => c.setMask(i, "text", e.target.value),
+      onKeydown: e => { if (e.key === "Enter") { e.preventDefault(); c.setMask(i, "text", e.target.value); if (e.target.value || (cur.mask.points || []).length) c.previewMask(i); } } }),
+    h("button", { title: "Click positive / negative points on a frame (more precise than text when subjects look alike)",
+      onClick: () => c.openPoints(i) }, (cur.mask.points || []).length ? `🎯 Points (${cur.mask.points.length})` : "🎯 Points…"),
+    h("button", { class: hasMask(cur) && !mp ? "pri" : "", disabled: !!busy.value || !hasMask(cur),
+      title: "Segment this shot and show a few frames", onClick: () => c.previewMask(i) }, "👁 Preview"),
+    ...becomes(cur.color_guide_picture, k => { c.setMarkPicture(i, 1, k); if (maskPrev.value[segKey(cur)]) c.previewMask(i); }),
+    h("button", { class: "dng", disabled: !(cur.mask.text || (cur.mask.points || []).length || cur.mask.video || cur.crop || cur.inpaint),
+      title: "Clear this shot's selection (text, points, mask video) and its mode", onClick: () => c.clearMask(i) }, "✕"),
+  ]);
+  const more = cg ? cur.regions.map((r, j) => h("div", { class: "mreg" }, [
+    label(j + 2),
+    h("input", { type: "text", value: r.text || "", style: "flex:1;min-width:160px", placeholder: "what to select, e.g. the man on the left",
+      onChange: e => c.setMarkRegion(i, j, "text", e.target.value) }),
+    h("button", { onClick: () => c.openPoints(i, j + 2) }, (r.points || []).length ? `🎯 Points (${r.points.length})` : "🎯 Points…"),
+    h("button", { disabled: !!busy.value || !(r.text || (r.points || []).length),
+      onClick: () => c.previewMask(i, { text: r.text || "", points: r.points || [], key: r.key || 0, max_objects: 1,
+        preview_color: pictureColor(plan, r.picture) }) }, "👁 Preview"),
+    ...becomes(r.picture, k => c.setMarkRegion(i, j, "picture", k)),
+    h("button", { class: "dng", title: "remove this subject", onClick: () => c.removeMarkRegion(i)(j) }, "✕"),
+  ])) : [];
+  const MODE_INFO = {
+    frame: "The whole frame is regenerated.",
+    paste: "The whole frame is generated; BFS Shot Join pastes only the subject back onto the original (background exact).",
+    mask: "Only the selection is regenerated; the rest of the frame stays exactly as it was.",
+    crop: "A box around the selection is regenerated at full size (more detail for a small subject), then pasted back.",
+    cropmask: "Inside the crop, only the selection is regenerated: the most detail, background kept.",
+  };
+  const curMode = c.modeOf(cur);
+  const who = section("What changes", [
+    h("div", { class: "row", style: "align-items:center;gap:10px;margin-bottom:4px" }, [
+      check(!!cg, v => c.setMeta(i, "color_guide", v), "🎨 Colored Mark",
+        "Paint each selected subject with the color of the picture it becomes (a translucent marker); the prompt says which color becomes which picture. It does not turn on inpainting."),
+      cg ? h("span", { class: "row", style: "gap:6px;align-items:center" }, [hint(`opacity ${Number(cur.color_guide_opacity ?? 0.35).toFixed(2)}`),
+        h("input", { type: "range", min: 0.05, max: 0.8, step: 0.01, value: cur.color_guide_opacity ?? 0.35, style: "width:140px",
+          onInput: e => { c.meta(i).color_guide_opacity = parseFloat(e.target.value); }, onChange: c.save })]) : null,
     ]),
-    cur.color_guide ? h("div", { class: "note", style: "margin:4px 0;padding:6px 8px" }, [
-      ...cur.regions.map((r, j) => h("div", { class: "mreg" }, [
-        h("span", { class: "hint", style: "white-space:nowrap" }, `Person ${j + 2}`),
-        picturePick(r.picture, k => c.setMarkRegion(i, j, "picture", k)),
-        h("input", { type: "text", value: r.text || "", style: "flex:1;min-width:160px", placeholder: "who, in English: e.g. the man on the left",
-          onChange: e => c.setMarkRegion(i, j, "text", e.target.value) }),
-        h("button", { disabled: !!busy.value || !(r.text || (r.points || []).length),
-          onClick: () => c.previewMask(i, { text: r.text || "", points: r.points || [], key: r.key || 0, max_objects: 1,
-            preview_color: pictureColor(plan, r.picture) }) }, "👁 Preview"),
-        h("button", { onClick: () => c.openPoints(i, j + 2) }, (r.points || []).length ? `🎯 Points (${r.points.length})` : "🎯 Points…"),
-        h("button", { class: "dng", title: "remove this person's mark", onClick: () => c.removeMarkRegion(i)(j) }, "✕"),
-      ])),
-      h("div", { class: "row", style: "margin-top:6px;align-items:center;gap:8px" }, [
-        h("button", { disabled: 1 + cur.regions.length >= MAX_REFS, onClick: () => c.addMarkRegion(i) }, "+ Mark another person"),
-        hint(cur.names.length > 1 + cur.regions.length ? "each person: a picture (its color) and a text or points"
-          : "add more pictures (Reference & prompt) to give each person their own"),
-      ]),
+    subject1, ...more,
+    cg ? h("div", { class: "row", style: "margin:4px 0;align-items:center;gap:8px" }, [
+      h("button", { disabled: regionsN >= MAX_REFS, onClick: () => c.addMarkRegion(i) }, "+ Add subject"),
+      cur.names.length <= regionsN ? hint("add pictures above to give each subject its own") : null,
     ]) : null,
-    cur.color_guide ? h("details", { style: "margin:4px 0" }, [h("summary", { class: "hint", style: "cursor:pointer" }, `Opacity · ${Number(cur.color_guide_opacity ?? 0.35).toFixed(2)}`),
-      h("div", { class: "row", style: "margin-top:6px;gap:8px;align-items:center" }, [h("input", { type: "range", min: 0.05, max: 0.8, step: 0.01, value: cur.color_guide_opacity ?? 0.35, style: "flex:1;max-width:320px", onInput: e => { c.meta(i).color_guide_opacity = parseFloat(e.target.value); }, onChange: c.save }), hint("Keeps movement and expression visible.")])]) : null,
-    h("div", { class: "row", style: "align-items:center" }, [
-      h("input", { type: "text", value: cur.mask.text || "", style: "flex:1;min-width:160px",
-        placeholder: "mask: what to segment, in English (woman in pink top, black dog…) · Enter = preview",
-        title: "What to segment, in English: a short phrase (noun + one or two traits), e.g. 'woman in pink top'; commas for several things. Enough on its own - no points needed: SAM 3 finds and tracks it through the shot (every match, up to Max objects). Press Enter to preview. Points, when set, take priority.",
-        onInput: e => c.setMask(i, "text", e.target.value),
-        onKeydown: e => { if (e.key === "Enter") { e.preventDefault(); c.setMask(i, "text", e.target.value); if (e.target.value || (cur.mask.points || []).length) c.previewMask(i); } } }),
-      h("button", { title: "Pick positive / negative points on a frame of this shot (more precise than text when several people look alike)",
-        onClick: () => c.openPoints(i) }, (cur.mask.points || []).length ? `🎯 Points (${cur.mask.points.length})` : "🎯 Points…"),
-      h("button", { class: hasMask(cur) && !mp ? "pri" : "", disabled: !!busy.value || !hasMask(cur),
-        title: (cur.mask.points || []).length ? "Segment this shot (the points win over the text)" : "Segment this shot with the text and show a few frames",
-        onClick: () => c.previewMask(i) }, "👁 Preview"),
-      h("button", { class: "dng", disabled: !(cur.mask.text || (cur.mask.points || []).length || cur.mask.video || cur.crop || cur.inpaint), title: "Remove this shot's mask (points, text, mask video) and mode - for shots where it picked the wrong thing",
-        onClick: () => c.clearMask(i) }, "✕ Clear"),
-    ]),
+    cg && !hasMask(cur) ? h("div", { class: "err" }, "Colored Mark needs a selection: a text, points or a mask video.") : null,
     h("div", { class: "row", style: "margin-top:6px;align-items:center" }, [
-      h("span", { class: "hint", style: "white-space:nowrap", title: "A black/white video (white = the subject), e.g. rotoscoped in another tool. It replaces SAM 3 for this shot and covers only this shot: its first frame is the shot's first frame." }, "🎞 mask video"),
-      h("select", { value: cur.mask.video || "", style: "flex:1;min-width:160px",
-        onChange: e => c.setMask(i, "video", e.target.value) },
-        [h("option", { value: "" }, cur.extMask ? "— none: the global mask video (People / Filters / Masks) —" : "— none: SAM 3 (text / points) —"),
-         ...c.files.videos.map(v => h("option", { value: v }, v))]),
+      h("span", { class: "hint", style: "white-space:nowrap", title: "A black/white video (white = the subject) for this shot only; it replaces SAM 3." }, "or a mask video"),
+      h("select", { value: cur.mask.video || "", style: "flex:1;min-width:160px", onChange: e => c.setMask(i, "video", e.target.value) },
+        [h("option", { value: "" }, cur.extMask ? "— none: the whole-video mask —" : "— none —"), ...c.files.videos.map(v => h("option", { value: v }, v))]),
       h("button", { title: "upload a mask video for this shot", onClick: () => c.pickFile("video/*", name => c.setMask(i, "video", name)) }, "⬆ Upload"),
-      cur.mask.video ? h("button", { title: "back to SAM 3 / the global mask", onClick: () => c.setMask(i, "video", "") }, "✕") : null,
     ]),
     maskSource(cur) === "video" ? hint("This shot uses its mask video: the text and points are ignored.", "display:block;margin-top:2px")
-      : maskSource(cur) === "global" ? hint("No mask of its own: this shot uses the global mask video (People / Filters / Masks tab).", "display:block;margin-top:2px")
-      : maskSource(cur) === "track" ? hint("No mask of its own: this shot uses its part of the whole-video track (People / Filters / Masks tab).", "display:block;margin-top:2px") : null,
+      : maskSource(cur) === "global" || maskSource(cur) === "track" ? hint("No selection of its own: this shot uses the whole-video mask (Mask settings, below).", "display:block;margin-top:2px") : null,
     mp ? h("div", { class: "mstrip" }, [
       ...mp.frames.map(f => h("img", { src: f.src, title: `frame ${f.f}` })),
       hint(mp.empty ? "nothing found: the shot runs without a mask" : `mask covers ${(mp.coverage * 100).toFixed(1)}%${cur.crop ? " · yellow = crop box" : ""}`),
     ]) : null,
-    h("div", { class: "modes", style: "margin-top:8px" }, [
-      ["frame", "Full frame", "The whole frame is regenerated. The mask, if any, only feeds {target} / the setting picture."],
-      ["paste", "🧩 Frame + paste", "The whole frame is generated (the pose follows the guide, the new subject may be bigger); BFS Shot Join pastes only the subject onto the original: background exact."],
-      ["mask", "🎭 Mask only", "Only the mask is regenerated, on the whole frame: the rest stays exactly as it was. No crop / uncrop."],
-      ["crop", "✂ Crop", "A box around the mask is regenerated (more pixels for a small subject); BFS Shot Join pastes it back."],
-      ["cropmask", "✂🎭 Crop + mask", "Inside the crop, only the mask is regenerated: the most detail with the background kept."],
-    ].map(([k, t, d]) => mode(c.modeOf(cur) === k, t, d, () => c.setMode(i, k)))),
-    cur.color_guide && !hasMask(cur) ? h("div", { class: "err" }, "Colored Mark needs a region selection: enter a description, add points, or choose a mask video, then preview it.") : null,
-    (cur.crop || cur.inpaint || cur.paste) && !hasMask(cur) ? h("div", { class: "err" }, `${c.modeName(cur)} needs a mask on this shot: a mask text, points or a mask video (or the planner's mask input).`) : null,
-    cur.inpaint ? h("div", { class: "row", style: "margin-bottom:6px;align-items:center",
-      title: "Opacity of the generation mask: the value of the white inside the mask (1 = fully white, the default). H3 reads a grey mask value as 'regenerate this much': at 0.85 the masked area starts at 85% of the noise and keeps ~15% of the original there. 0.8-0.9 keeps pose, outline and lighting while still swapping; too low copies the original person." }, [
-      h("span", { style: "white-space:nowrap" }, `Mask opacity ${Number(cur.strength).toFixed(2)}`),
+    h("div", { class: "row", style: "margin-top:8px;align-items:center" }, [
+      h("span", { style: "white-space:nowrap" }, "Generate"),
+      select(curMode, c.MODES.map(m => [m[0], m[1]]), v => c.setMode(i, v), { style: "width:auto" }),
+      hint(MODE_INFO[curMode]),
+    ]),
+    (cur.crop || cur.inpaint || cur.paste) && !hasMask(cur) ? h("div", { class: "err" }, `${c.modeName(cur)} needs a selection on this shot (text, points or a mask video).`) : null,
+    cur.inpaint ? h("div", { class: "row", style: "margin-top:6px;align-items:center",
+      title: "How much of the selection is regenerated. 0.8-0.9 keeps pose, outline and lighting while still changing it; too low copies the original. Needs BFS Shot H3 Conditioning → inpaint = per shot (planner)." }, [
+      h("span", { style: "white-space:nowrap" }, `Mask strength ${Number(cur.strength).toFixed(2)}`),
       h("input", { type: "range", min: 0.3, max: 1, step: 0.01, value: cur.strength, style: "flex:1;max-width:320px",
         onInput: e => { c.meta(i).strength = parseFloat(e.target.value); }, onChange: c.save }),
       h("button", { class: "ghost", disabled: cur.strength >= 1, onClick: () => c.setMeta(i, "strength", 1) }, "reset"),
-      hint(cur.strength >= 1 ? "regenerates the masked area completely" : `keeps ~${Math.round(100 - cur.strength * 100)}% of the original inside the mask`),
     ]) : null,
-    cur.inpaint ? h("div", { class: "note", style: "margin-bottom:6px" }, [h("b", "Mask only / Crop + mask: "),
-      "set BFS Shot H3 Conditioning → inpaint to ", h("b", "per shot (planner)"), " (the default). Raise Expand (People / Filters / Masks tab) when the new subject is bigger than the old one."]) : null,
-    cur.paste ? h("div", { class: "row", style: "margin-bottom:6px;align-items:center",
-      title: "What the NEW subject is, in English, for SAM 3 on the result: BFS Shot Join also pastes its outline (when it is bigger than the old one). E.g. person, dog, cat, car. Empty = person." }, [
+    cur.paste ? h("div", { class: "row", style: "margin-top:6px;align-items:center",
+      title: "What the NEW subject is, in English, so its outline on the result is pasted too (a bigger silhouette is not cut). Empty = person." }, [
       h("span", { style: "white-space:nowrap" }, "new subject"),
-      h("input", { type: "text", value: cur.pasteText || "", placeholder: "person (or dog, cat, car… what the result shows)", style: "flex:1;max-width:420px",
+      h("input", { type: "text", value: cur.pasteText || "", placeholder: "person (or dog, car… what the result shows)", style: "flex:1;max-width:420px",
         onChange: e => c.setMeta(i, "paste_text", e.target.value) }),
-      hint("its outline on the result is pasted too, so a bigger silhouette is not cut"),
     ]) : null,
-    h("div", { class: "row", style: "margin-top:4px;align-items:center" }, [
+    h("div", { class: "row", style: "margin-top:8px;align-items:center" }, [
       targetCrop.value[k] ? h("img", { src: targetCrop.value[k], style: "height:56px;border-radius:6px" }) : null,
       h("span", { class: "hint", style: "white-space:nowrap" }, "{target}"),
       h("input", { type: "text", value: cur.target, style: "flex:1;min-width:200px",
-        placeholder: "who is replaced, e.g. the young woman in a pink crop top (empty = the person)",
-        title: "Write {target} in the prompt: it becomes this description, so the model knows WHICH person to replace (useful with several people on screen).",
+        placeholder: "what is replaced, for {target} in the prompt (e.g. the young woman in a pink top)",
+        title: "Write {target} in the prompt and it becomes this text, so the model knows WHICH subject changes.",
         onChange: e => c.setMeta(i, "target", e.target.value) }),
-      h("button", { disabled: !!busy.value || !hasMask(cur),
-        title: "Uses this shot's selection (🎯 Points… on the person — click the BODY, not only the face, so the outfit is described — or the mask text): SAM 3 cuts the person out and the VLM describes them",
-        onClick: () => c.describeTarget(i) }, "🧑 Describe target"),
+      h("button", { disabled: !!busy.value || !hasMask(cur), title: "SAM 3 cuts the selection out and the VLM describes it",
+        onClick: () => c.describeTarget(i) }, "🧑 Describe"),
     ]),
     g ? h("div", { class: "vsug" }, [
-      h("div", ["🤖 ", h("b", "segment: "), g.segment || "—", g.segment ? h("button", { onClick: () => c.applySug(i, "segment") }, "Use as mask") : null]),
+      h("div", ["🤖 ", h("b", "select: "), g.segment || "—", g.segment ? h("button", { onClick: () => c.applySug(i, "segment") }, "Use") : null]),
       h("div", [h("b", "shot: "), g.shot || "—", g.shot ? h("button", { title: "copy (the {shot} placeholder in the prompt gets it automatically at run time)",
         onClick: () => navigator.clipboard?.writeText(g.shot) }, "Copy") : null]),
-      h("div", [h("b", "recommend: "), `${g.recommend}${g.people != null ? " · " + g.people + " people" : ""}${g.reason ? " · " + g.reason : ""}`,
-        g.recommend === "skip" ? h("button", { onClick: () => c.applySug(i, "skip") }, "Skip this shot") : null]),
-      g.raw ? hint("unparsed answer: " + g.raw.slice(0, 200)) : null,
     ]) : null,
-  ], { sub: "SAM 3 mask (text or points), crop, {target}" });
+  ], { sub: "the selection, its picture and how it is generated" });
 
   const cont = section("Continuity", h("div", { class: "row" }, [
     h("select", { value: cur.chain, style: "width:auto", disabled: i === 0,
@@ -287,11 +273,48 @@ function editor(c, cur) {
         h("button", { class: copyOpts.scope === v && "on", onClick: () => { copyOpts.scope = v; } }, l))),
       h("button", { class: "pri", disabled: !Object.keys(COPY_FIELDS).some(f => copyOpts[f]) || S.length < 2,
         onClick: e => { const n = c.copyFrom(i); const b = e.currentTarget; b.textContent = `✓ copied to ${n} shot(s)`; setTimeout(() => { b.textContent = "📋 Copy"; }, 1400); } }, "📋 Copy"),
-      hint("replaces the old “→ all” buttons"),
     ]),
   ], { open: false, sub: Object.entries(COPY_FIELDS).filter(([f]) => copyOpts[f]).map(([, l]) => l).join(", ") });
 
   return h("div", { class: "card" }, [head, problems, refPrompt, who, cont, copy]);
+}
+
+// settings every shot's mask shares (SAM 3, crop and paste-back), and the optional mask for the whole video
+function maskSettings(c) {
+  const { plan } = c;
+  const MC = plan.mask_cfg || {};
+  const mnum = (k, step, label, help, scale = 1) => fld(label, h("input", { type: "number", step, min: 0, value: +(MC[k] * scale).toFixed(3),
+    onChange: e => c.setMaskCfg(k, (parseFloat(e.target.value) || 0) / scale) }), help);
+  return h("div", { class: "card" }, [section("Mask settings (every shot)", [
+    h("div", { class: "row", style: "margin-bottom:8px;align-items:center" }, [
+      h("span", { style: "white-space:nowrap", title: "A black/white video of the WHOLE source (white = the subject). Shots without their own selection use it instead of SAM 3. The planner's mask input does the same from the graph and wins over this." }, "🎞 Mask video (whole video)"),
+      h("select", { value: plan.mask_video || "", style: "flex:1;min-width:180px", onChange: e => c.setGlobalMaskVideo(e.target.value) },
+        [h("option", { value: "" }, "— none —"), ...c.files.videos.map(v => h("option", { value: v }, v))]),
+      h("button", { onClick: () => c.pickFile("video/*", c.setGlobalMaskVideo) }, "⬆ Upload"),
+      plan.mask_video ? h("button", { onClick: () => c.setGlobalMaskVideo("") }, "✕") : null,
+    ]),
+    plan.track?.points?.length ? h("div", { class: "note", style: "margin-bottom:8px;display:flex;gap:8px;align-items:center" }, [
+      h("span", { class: "grow" }, [h("b", "🎯 Whole-video track: "), `${plan.track.points.length} point(s) at frame ${plan.track.frame}`,
+        plan.track.text ? ` · re-found by "${plan.track.text}" after cuts` : " · no text: after a cut the subject may be lost",
+        ". Shots without their own selection use it."]),
+      h("button", { class: "ghost", onClick: c.clearTrack }, "✕ remove"),
+    ]) : null,
+    h("div", { class: "row", style: "gap:14px;margin-bottom:6px" }, [
+      check(MC.fill_holes, v => c.setMaskCfg("fill_holes", v), "Fill holes", "Fill enclosed gaps so each region is solid"),
+      check(MC.invert, v => c.setMaskCfg("invert", v), "Invert", "Use everything except the selection"),
+    ]),
+    h("div", { class: "grid" }, [
+      mnum("expand", 1, "Expand (px)", "grow the mask"),
+      mnum("temporal_expand", 1, "Temporal expand (frames)", "less flicker"),
+      mnum("threshold", 0.05, "Detection threshold"),
+      mnum("max_objects", 1, "Max objects", "matches of the text tracked"),
+      mnum("padding", 1, "Crop padding (%)", "crop modes", 100),
+      mnum("feather", 1, "Feather (px)", "crop modes"),
+      fld("Paste back", h("select", { value: MC.paste, onChange: e => c.setMaskCfg("paste", e.target.value) },
+        [h("option", { value: "mask" }, "only the mask (feathered)"), h("option", { value: "box" }, "the whole box (feathered)")]), "crop modes"),
+      mnum("blockify", 1, "Blockify (px, 0 = off)"),
+    ]),
+  ], { open: false, sub: "SAM 3, crop and paste-back" })]);
 }
 
 export function shotsTab(c) {
@@ -307,5 +330,6 @@ export function shotsTab(c) {
     ]),
     cur ? h("div", { class: "card" }, [player(c, cur)]) : null,
     cur ? editor(c, cur) : null,
+    maskSettings(c),
   ]);
 }

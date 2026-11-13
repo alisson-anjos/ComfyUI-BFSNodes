@@ -26,7 +26,7 @@ export function pointsModal(c) {
     ? Array.from({ length: regionsN }, (_, q) => q + 1).flatMap(region => (region === modal.region ? modal.points : modal.groups[region]?.points || []).map((p, k) => h("div", {
       class: ["pt", "cg", region !== modal.region && "other", p.label ? "pos" : "neg"],
       style: `left:${p.x * 100}%;top:${p.y * 100}%;--point-color:${regionColor(region)}`,
-      title: `Region ${region} · Picture ${regionPicture(region)}${region === modal.region ? " · click to remove" : ""}`,
+      title: `Subject ${region} · Picture ${regionPicture(region)}${region === modal.region ? " · click to remove" : ""}`,
       onPointerdown: e => { if (region !== modal.region) return; e.stopPropagation(); modal.points = modal.points.filter((_, j) => j !== k); modal.prev = null; },
     })))
     : modal.points.map((p, k) => h("div", { class: ["pt", p.label ? "pos" : "neg"], style: `left:${p.x * 100}%;top:${p.y * 100}%`,
@@ -34,15 +34,15 @@ export function pointsModal(c) {
   const regionButton = r => {
     const k = regionPicture(r), name = ms.names[k - 1];
     return h("button", { class: modal.region === r ? "pri" : "", onClick: () => c.switchPointRegion(r),
-      title: `Region ${r}: becomes <Picture ${k}> (${markName(regionColor(r))})` }, [
+      title: `Subject ${r} becomes <Picture ${k}> (${markName(regionColor(r))})` }, [
       name ? h("img", { class: "mthumb", src: c.viewUrl(name), style: `--mark:${regionColor(r)}` }) : null,
-      ` Picture ${k} · ${markName(regionColor(r))} (${(r === modal.region ? modal.points : modal.groups[r]?.points || []).length})`]);
+      ` ${r} → Picture ${k} · ${markName(regionColor(r))} (${(r === modal.region ? modal.points : modal.groups[r]?.points || []).length})`]);
   };
   return h(Teleport, { to: "body" }, h("div", { class: "bsl", style: "background:none;padding:0" }, h("div", { class: "mmodal",
     onKeydown: e => e.stopPropagation(), onPointerdown: e => { if (e.target === e.currentTarget) modal.open = false; } }, [
     h("div", { class: "mbox" }, [
       h("div", { class: "row", style: "margin-bottom:6px" }, [h("span", { class: "sect" }, `Shot #${modal.idx + 1} · points`),
-        ms.color_guide ? h("div", { class: "row" }, [hint("One point set per marked person; switch to edit each. All use the frame selected below."),
+        ms.color_guide ? h("div", { class: "row" }, [hint("One point set per subject: switch to edit each. All use the frame below."),
           ...Array.from({ length: regionsN }, (_, q) => regionButton(q + 1))]) : null,
         hint("click = keep · right-click or shift+click = exclude · click a point to remove it")]),
       h("div", { class: "mstage" }, [
@@ -85,12 +85,11 @@ export function pointsModal(c) {
 }
 
 const TOUR_STEPS = [
-  ["video", "Video", "Choose a video, set the frame range, split at camera cuts, then set the generation size."],
-  ["shots", "Shots", "Review each shot, assign its references and prompt, and choose how the result is applied."],
-  ["people", "People", "Track detected face identities to filter or split shots. Set masks here or per shot."],
-  ["prompts", "Prompts", "Set shared references, prompts and optional VLM assistance. Written prompts are kept exactly as authored."],
-  ["shots", "Colored Mark", "Colored Mark adds a translucent color overlay to a selected region in the source video. It does not enable inpainting. Choose the color before marking the region with points or a description."],
-  ["run", "Run", "Check warnings, choose auto or queue loop, and set filters or quick-run limits."],
+  ["video", "Video", "Choose a video, set the range and split it into shots."],
+  ["prompts", "Pictures & prompt", "Add the pictures and the prompt every shot uses. 🤖 Auto prompt can write the prompts for you."],
+  ["shots", "Shots", "Check each shot: its pictures, what changes (a text or points), and how it is generated."],
+  ["shots", "Colored Mark", "Colored Mark paints each selected subject with the color of the picture it becomes. Add one row per subject."],
+  ["run", "Run", "Fix the warnings, then Queue. Stored shots can be redone one by one."],
 ];
 
 export function tourModal(c) {

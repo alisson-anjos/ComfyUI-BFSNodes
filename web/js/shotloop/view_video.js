@@ -68,22 +68,25 @@ export function videoTab(c) {
         onChange: e => { const v = parseFloat(e.target.value) || 0;
           c.setRange("end_f", v > 0 ? c.range.value.lo + Math.round(v * plan.fps) : 0); } }),
         `from the start frame · ${c.range.value.hi - c.range.value.lo} frames`),
-      fld("Detector", sel_("detector", [["adaptive", "PySceneDetect adaptive"], ["content", "PySceneDetect content"], ["builtin", "Built-in"]], () => c.autoSplit(true))),
-      fld(`Sensitivity ${Number(plan.sensitivity).toFixed(2)}`, h("input", { type: "range", min: 0, max: 1, step: 0.05, value: plan.sensitivity,
-        onInput: e => { plan.sensitivity = parseFloat(e.target.value); }, onChange: () => { c.save(); c.autoSplit(true); } })),
-      fld("Frame grid", sel_("grid", Object.keys(GRIDS))),
       fld("Max seconds / shot", num("max_s", 0.1, 0.2), `= ${maxLen.value} frames (${(maxLen.value / fps).toFixed(2)} s)`),
-      fld("Min seconds / shot", num("min_s", 0.1, 0)),
-      fld("Max shots (0 = all)", num("max_parts", 1, 0), "limit how many detected shots are used"),
-      fld("Timeline fps", num("fps", 1, 1), "re-analyses"),
+      fld("Max shots (0 = all)", num("max_parts", 1, 0), "only the first N shots"),
     ]),
+    // the cut detector and the frame grid rarely change
+    h("details", { style: "margin-top:6px" }, [h("summary", { class: "hint", style: "cursor:pointer" }, "More: cut detector, frame grid, fps"),
+      h("div", { class: "grid", style: "margin-top:6px" }, [
+        fld("Detector", sel_("detector", [["adaptive", "PySceneDetect adaptive"], ["content", "PySceneDetect content"], ["builtin", "Built-in"]], () => c.autoSplit(true))),
+        fld(`Sensitivity ${Number(plan.sensitivity).toFixed(2)}`, h("input", { type: "range", min: 0, max: 1, step: 0.05, value: plan.sensitivity,
+          onInput: e => { plan.sensitivity = parseFloat(e.target.value); }, onChange: () => { c.save(); c.autoSplit(true); } })),
+        fld("Min seconds / shot", num("min_s", 0.1, 0)),
+        fld("Frame grid", sel_("grid", Object.keys(GRIDS))),
+        fld("Timeline fps", num("fps", 1, 1), "re-analyses"),
+      ])]),
     h("div", { class: "row", style: "margin-top:8px" }, [
       h("button", { class: "pri", disabled: !plan.video || !!busy.value, onClick: () => c.autoSplit(true) }, "✂ Auto split"),
       h("button", { disabled: !plan.video, onClick: c.analyze }, "↻ Re-analyse"),
       detectorUsed.value ? hint(`detector: ${detectorUsed.value}`) : null,
       c.allSegCount.value > c.segs.value.length ? hint(`Max shots = ${plan.max_parts}: ${c.allSegCount.value - c.segs.value.length} `
         + `more shot(s) on the timeline are left out. Set Max shots to 0 to use them all.`, "color:#f0b429") : null,
-      hint("Auto split replaces the boundaries; per-shot settings stay with the shot at the same position."),
     ]),
   ], { sub: "camera cuts or fixed length, on the model's frame grid" });
 

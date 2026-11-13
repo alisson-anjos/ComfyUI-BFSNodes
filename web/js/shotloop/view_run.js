@@ -69,7 +69,7 @@ function memorySection(c) {
       warn: "⚠ Much bigger than anything that ran here: it may run out of memory. Lower Megapixels or Max seconds / shot, use head 5, or set Between shots = free memory.",
       info: "No shot has run on this GPU yet: after the first one, every shot is compared with what already ran here." }[m.level],
       "display:block;margin-top:4px"),
-  ], { sub: { ok: "within what ran here", note: "a bit bigger", warn: "may run out of memory", info: "no data yet" }[m.level] });
+  ], { open: m.level === "warn", sub: { ok: "within what ran here", note: "a bit bigger", warn: "may run out of memory", info: "no data yet" }[m.level] });
 }
 
 function cacheSection(c) {
@@ -137,7 +137,7 @@ function secondPassSection(c) {
     hint("The planner outputs second_pass (on/off), upscale_width and upscale_height. Upscale the denoised latent of each shot "
       + "to that size (e.g. Minimax H3 Latent Upscaler (3D) in target dimensions mode) and sample it again before decoding; "
       + "use second_pass to switch that branch.", "display:block;margin-top:6px"),
-  ], { sub: sp.enabled ? `on · ${out.w}×${out.h}` : "off" });
+  ], { open: !!sp.enabled, sub: sp.enabled ? `on · ${out.w}×${out.h}` : "off" });
 }
 
 export function runTab(c) {

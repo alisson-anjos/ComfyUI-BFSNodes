@@ -21,7 +21,6 @@ const historyLen = n => (n = Number(n) || 22) <= 5 ? 5 : 5 + Math.ceil((n - 5) /
 import { timelineCard } from "./shotloop/view_timeline.js";
 import { videoTab } from "./shotloop/view_video.js";
 import { shotsTab } from "./shotloop/view_shots.js";
-import { peopleTab } from "./shotloop/view_people.js";
 import { promptsTab } from "./shotloop/view_prompts.js";
 import { runTab } from "./shotloop/view_run.js";
 import { busyBar, pointsModal, tourModal } from "./shotloop/view_modal.js";
@@ -37,7 +36,8 @@ const store = {   // per-browser UI conveniences (never the plan itself)
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
 };
 const DEFAULT_W = 1180, MIN_W = 1040, MIN_H = 1000;   // node size: wide enough for the four-column settings
-const TABS = [["video", "🎞 Video"], ["shots", "🎬 Shots"], ["people", "👥 People / Filters / Masks"], ["prompts", "📝 Prompts & refs"], ["run", "▶ Run"]];
+// the flow, left to right: the video, the pictures and the prompt, each shot, then the run
+const TABS = [["video", "🎞 Video"], ["prompts", "📝 Pictures & prompt"], ["shots", "🎬 Shots"], ["run", "▶ Run"]];
 
 function Panel(io) {
   const plan = reactive({ ...DEFAULTS });
@@ -65,15 +65,13 @@ function Panel(io) {
     try { const r = await api.fetchApi("/bfs/shotloop/vram"); const j = await r.json(); if (!j.error) Object.assign(vram, j); } catch { /* optional */ }
   }
   const tlEl = ref(null);
-  const stats = ref([]);         // per-shot content stats from /bfs/shotloop/filters
-  const people = ref([]);        // cast from /bfs/shotloop/cast: [{id, thumb, share, first, last}]
   const maskPrev = ref({});      // "start-end" -> {frames, box, coverage, empty} from /bfs/shotloop/mask
   const showMasks = ref(true);   // overlay the mask preview on the shot cards
   const vlmSug = ref({});        // "start-end" -> {segment, shot, people, recommend, reason} from the VLM
   const modal = reactive({ open: false, idx: -1, key: 0, points: [], text: "", region: 1, groups: {}, prev: null, busy: "" });
-  const segPeople = ref({});     // "start-end" -> {people, main} from /bfs/shotloop/plan
   const targetCrop = ref({});    // "start-end" -> data URL of the subject the description was made from
-  const tab = ref(store.get("bfs.shotloop.tab", "shots"));
+  const savedTab = store.get("bfs.shotloop.tab", "shots");
+  const tab = ref(TABS.some(([k]) => k === savedTab) ? savedTab : "shots");
   watch(tab, v => store.set("bfs.shotloop.tab", v));
   const tour = ref(0); // opened only by the user's Tour button; never shown automatically
   // what "Copy to other shots" copies (remembered per browser)
@@ -97,8 +95,6 @@ function Panel(io) {
     let p = {};
     try { p = JSON.parse(io.getPlan() || "{}"); } catch { p = {}; }
     Object.assign(plan, DEFAULTS, p);
-    plan.filters = { ...DEFAULTS.filters, ...(p.filters || {}) };
-    plan.cast = { ...(p.cast || {}) };
     plan.mask_cfg = { ...MASK_DEFAULTS, ...(p.mask_cfg || {}) };
     plan.vlm_cfg = { ...VLM_DEFAULTS, ...(p.vlm_cfg || {}) };
     plan.ref_details = { ...(p.ref_details || {}) };
@@ -118,8 +114,10 @@ function Panel(io) {
       m.color_guide_regions = markRegions(m);
       ["color_guide_text2", "color_guide_points2", "color_guide_key2", "color_guide_color", "color_guide_color2"].forEach(k => delete m[k]);
     });
-    Object.values(plan.cast).forEach(person => { if (person && typeof person === "object") { delete person.ref; delete person.ref2; delete person.guide_color; } });
     plan.segs.forEach(meta => { if (meta) { delete meta.color_guide_person; delete meta.color_guide_person2; } });
+    // the shot filters and the face cast are gone (1.122): a shot skipped by hand is a disabled shot now
+    plan.segs.forEach(m => { if (m) { if (m.force === "skip") m.enabled = false; delete m.force; } });
+    ["filters", "cast", "cast_split", "cast_only"].forEach(k => delete plan[k]);
   };
   // any change of the plan (a new video, a prompt, a setting...) is a new loop run on the server: show its progress
   let progTimer = 0;
@@ -155,7 +153,7 @@ function Panel(io) {
       const m = plan.segs[out.length] || {};
       out.push({ start: b[i], end: b[i + 1], len: b[i + 1] - b[i], gen: snapUp(b[i + 1] - b[i], plan.grid),
                  cut: cs.has(b[i]), enabled: m.enabled !== false, refs: refList(m.refs, m.ref, m.ref2), prompt: m.prompt || "",
-                 force: m.force || "auto", chain: m.chain || "head", chainFrame: m.chain_frame || "first", chainHistory: historyLen(m.chain_history),
+                 chain: m.chain || "head", chainFrame: m.chain_frame || "first", chainHistory: historyLen(m.chain_history),
                  color_guide: !!m.color_guide, color_guide_picture: +m.color_guide_picture || 1,
                  color_guide_opacity: m.color_guide_opacity ?? 0.35, regions: markRegions(m),
                  crop: !!m.crop, inpaint: !!m.inpaint, paste: !!m.paste, pasteText: m.paste_text || "", strength: m.strength ?? 1, mask: m.mask || {}, target: m.target || "",
@@ -172,22 +170,7 @@ function Panel(io) {
     const b = [lo, ...plan.bounds.filter(x => x > lo && x < hi), hi].sort((a, c) => a - c);
     return b.reduce((k, x, i) => k + (i && x > b[i - 1] ? 1 : 0), 0);
   });
-  const whoIn = s => segPeople.value[segKey(s)] || null;
-  const castOf = id => plan.cast[String(id)] || {};
-  const included = id => !!personOf(id) && !castOf(id).ignore;
-  const personOf = id => people.value.find(p => p.id === id) || null;
-  const statFor = s => stats.value.find(x => x.start === s.start && x.end === s.end) || null;
-  const filtersOn = computed(() => { const f = plan.filters; return !!(f.person || f.face || f.skip_dark || f.skip_static || f.max_persons > 0 || f.min_frames > 0); });
-  const skipWhy = s => {
-    if (!s.enabled) return "disabled";
-    if (s.force === "run") return "";
-    if (s.force === "skip") return "skipped by hand";
-    const why = filtersOn.value ? (statFor(s)?.skip_reason || "") : "";
-    if (why) return why;
-    const who = whoIn(s);
-    if (plan.cast_only && who && !who.people.some(p => included(p))) return "no detected person";
-    return "";
-  };
+  const skipWhy = s => (s.enabled ? "" : "disabled");
   const active = computed(() => segs.value.filter(s => !skipWhy(s)));
   const pxPerFrame = computed(() => {
     const w = (tlEl.value?.clientWidth || 600) - 2;
@@ -260,7 +243,7 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       if (/\{target\}/.test(p) && !s.target) add("warn", "the prompt uses {target} but the shot has no target description");
       if (/\{details/.test(p) && !detailsOf(s, p) && !plan.vlm_cfg?.enabled) add("info", "the prompt uses {details} but its pictures have no description yet");
       if (/\{details2?\}/.test(p) && (plan.vlm_cfg?.describe_preset || "short") !== "short")
-        add("warn", "{details} sits inside a sentence of the prompt: use the 'short' describe preset (Prompts & refs), the other presets write a paragraph");
+        add("warn", "{details} sits inside a sentence of the prompt: use the 'short' describe preset (Pictures & prompt → Describe references), the other presets write a paragraph");
       if (!p) add("info", "no prompt (fine when the node's prompt input is connected)");
       if (!refOf(s, "ref")) add("info", "no reference picture");
       if (vram.max_tokens && shotTokens(s, i) > 1.3 * vram.max_tokens)
@@ -285,8 +268,6 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       if (j.error) throw new Error(j.error);
       an.value = j;
       await autoSplit(plan.bounds.length === 0);
-      people.value = []; segPeople.value = {};
-      if (Object.keys(plan.cast).length || plan.cast_split || plan.cast_only) await findPeople(false);   // restore the cast of a saved plan
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
@@ -301,8 +282,6 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       const j = await r.json();
       if (j.error) throw new Error(j.error);
       cuts.value = j.cuts || []; detectorUsed.value = j.detector || ""; size.w = j.width; size.h = j.height;
-      segPeople.value = Object.fromEntries(j.segs.filter(s => s.main !== undefined && (s.people.length || people.value.length))
-        .map(s => [`${s.start}-${s.end}`, { people: s.people, main: s.main }]));
       if (apply) {
         plan.bounds = j.segs.slice(1).map(s => s.start);
         const keep = plan.segs; plan.segs = j.segs.map((_, i) => ({ enabled: true, refs: refList(keep[i]?.refs), prompt: keep[i]?.prompt || "",
@@ -315,31 +294,6 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
     } catch (e) { error.value = String(e.message || e); }
     busy.value = "";
   }
-  async function analyzeContent() {
-    if (!plan.video) return;
-    busy.value = "Detecting people and faces…"; error.value = "";
-    try {
-      const r = await api.fetchApi("/bfs/shotloop/filters", { method: "POST", body: JSON.stringify({ plan: { ...plan } }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
-      stats.value = j.segs.map(x => ({ ...x.stats, start: x.start, end: x.end, skip_reason: x.skip_reason }));
-    } catch (e) { error.value = String(e.message || e); }
-    busy.value = "";
-  }
-  async function findPeople(resplit = true) {
-    if (!plan.video) return;
-    busy.value = "Finding people by face…"; error.value = "";
-    try {
-      const r = await api.fetchApi("/bfs/shotloop/cast", { method: "POST", body: JSON.stringify({ plan: { ...plan } }) });
-      const j = await r.json(); if (j.error) throw new Error(j.error);
-      people.value = j.people || [];
-    } catch (e) { error.value = String(e.message || e); busy.value = ""; return; }
-    busy.value = "";
-    await autoSplit(resplit && !!plan.cast_split);
-  }
-  const setCast = (id, k, v) => {
-    plan.cast = { ...plan.cast, [String(id)]: { ...castOf(id), [k]: v } };
-    save();
-  };
   async function describeTarget(i) {
     const s = segs.value[i]; if (!s) return;
     busy.value = "Selecting the person (SAM 3) and describing them (VLM)…"; busySince.value = Date.now(); error.value = "";
@@ -552,19 +506,15 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   const applySug = (i, what) => {
     const s = segs.value[i], g = s && vlmSug.value[segKey(s)]; if (!g) return;
     if (what === "segment" && g.segment) setMask(i, "text", g.segment);
-    if (what === "skip") setMeta(i, "force", g.recommend === "skip" ? "skip" : "auto");
   };
   const applyAllSug = () => {
     segs.value.forEach((s, i) => {
       const g = vlmSug.value[segKey(s)]; if (!g) return;
       const m = meta(i);
       if (g.segment && !(m.mask?.text || (m.mask?.points || []).length)) m.mask = { ...(m.mask || {}), text: g.segment };
-      if (g.recommend === "skip" && (m.force || "auto") === "auto") m.force = "skip";
     });
     save();
   };
-  const setCastOpt = (k, v) => { plan[k] = v; save(); if (k === "cast_split") autoSplit(true); };
-  const setFilter = (k, v) => { plan.filters = { ...plan.filters, [k]: v }; save(); if (stats.value.length) analyzeContent(); };
   const setPlan = (k, v, after) => { plan[k] = v; save(); after && after(); };
   // the range changed: split again inside it (the per-shot settings stay with the shot at the same position)
   // start / end in timeline frames (end 0 = the end of the video); the old seconds fields are cleared
@@ -878,12 +828,12 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
   // everything the views need
   const c = {
     api, plan, files, an, cuts, detectorUsed, size, busy, error, status, busySince, now, upPct, sel, zoom, hover, prog, tlEl,
-    stats, people, maskPrev, showMasks, vlmSug, modal, segPeople, targetCrop, tab, copyOpts, COPY_FIELDS, vid, play, recent, clearRecent, clearAllRefs,
-    n, range, setRange, maxLen, segs, allSegCount, active, pxPerFrame, tlWidth, filtersOn, usedRefs, checks, tour, memory, vram, refreshVram, cache, cacheOf, redo, combine,
-    MODES, modeOf, modeName, viewUrl, save, meta, setMeta, setMode, setPlan, whoIn, castOf, included, personOf, statFor, skipWhy, refOf, promptOf, checksFor,
-    refreshFiles, analyze, autoSplit, analyzeContent, findPeople, setCast, describeTarget, previewMask, setMask, setMaskCfg,
+    maskPrev, showMasks, vlmSug, modal, targetCrop, tab, copyOpts, COPY_FIELDS, vid, play, recent, clearRecent, clearAllRefs,
+    n, range, setRange, maxLen, segs, allSegCount, active, pxPerFrame, tlWidth, usedRefs, checks, tour, memory, vram, refreshVram, cache, cacheOf, redo, combine,
+    MODES, modeOf, modeName, viewUrl, save, meta, setMeta, setMode, setPlan, skipWhy, refOf, promptOf, checksFor,
+    refreshFiles, analyze, autoSplit, describeTarget, previewMask, setMask, setMaskCfg,
     openPoints, switchPointRegion, savePoints, savePointsAll, saveTrack, clearTrack, pointsTo, clearMask, copyFrom, analyseVLM, setVlmCfg,
-    applySug, applyAllSug, setCastOpt, setGlobalMaskVideo, setFilter, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
+    applySug, applyAllSug, setGlobalMaskVideo, pickFile, progress, setVideo, splitAt, mergeNext, removeCut, select, drag,
     frameAt, thumbFor, playShot, playAll, stop, seek, setRef, putRefs, uploadRef, dropRefs, pictures, describePictures, setPictureDetail, setPictureCfg,
     setMarkPicture, addMarkRegion, setMarkRegion, removeMarkRegion, setPictureColor,
     autoFor, writtenOf, setAuto, setWritten, writePrompts,
@@ -911,12 +861,12 @@ const meta = i => { while (plan.segs.length <= i) plan.segs.push({}); return pla
       h("button", { title: t("Shot Planner tour"), onClick: () => { tour.value = 1; tab.value = "video"; } }, t("🧭 Tour")),
       h("button", { title: "Open the full guide (every setting explained, with examples)", onClick: () => showGuide(guideUrl) }, "📖 Guide"),
     ]);
-    const counts = { shots: S.length || null, people: people.value.length || null };
+    const counts = { shots: S.length || null };
     const tabs = h("div", { class: "tabs" }, TABS.map(([k, label]) => h("button", {
       class: ["tab", tab.value === k && "on"], disabled: k !== "video" && !an.value, onClick: () => { tab.value = k; } }, [
       label, counts[k] ? h("span", { class: "n" }, counts[k]) : null, k === "run" && warns ? h("span", { class: "dot", title: `${warns} warning(s)` }) : null,
     ])));
-    const views = { video: videoTab, shots: shotsTab, people: peopleTab, prompts: promptsTab, run: runTab };
+    const views = { video: videoTab, prompts: promptsTab, shots: shotsTab, run: runTab };
     const cur = an.value || tab.value === "video" ? tab.value : "video";
     return h("div", { class: "bsl root", ref: rootEl, tabindex: 0, onKeydown: onKey }, [
       header, tabs,

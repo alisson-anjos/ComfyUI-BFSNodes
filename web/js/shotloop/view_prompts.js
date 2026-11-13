@@ -1,5 +1,5 @@
-// 📝 Prompts & refs tab: the global reference / prompt, the VLM (shot suggestions) and the reference descriptions ({details}).
-import { h, fld, check, section, pill, hint, select, refBox, promptChips, MAX_REFS, MARK_PALETTE, pictureColor } from "./common.js";
+// 📝 Pictures & prompt tab: the pictures and prompt every shot uses, 🤖 Auto prompt, and the VLM helpers (collapsed).
+import { h, fld, check, section, pill, hint, select, refBox, promptChips, MARK_PALETTE, pictureColor } from "./common.js";
 
 const PRESETS = ["short", "object", "full body", "head / face", "face attributes", "outfit", "scene / setting", "custom"];
 
@@ -12,7 +12,7 @@ function globalSection(c) {
       onChange: e => c.setPictureColor(k + 1, e.target.value) },
       MARK_PALETTE.map(([v, name]) => h("option", { value: v }, name))),
   ]);
-  return section("Global reference & prompt", [
+  return section("Pictures & prompt", [
     refBox(c, "global", plan.global_refs, [], marker),
     h("div", { class: "pbox", style: "margin-top:6px" }, [
       h("textarea", { style: "min-height:78px", placeholder: plan.auto_prompt?.enabled
@@ -22,12 +22,10 @@ function globalSection(c) {
       promptChips(c, plan.global_refs.filter(Boolean), v => c.setPlan("global_prompt", v)),
     ]),
     h("div", { class: "hint", style: "margin-top:4px" }, [
-      `Used by shots without their own (up to ${MAX_REFS} pictures, <Picture 1> first; click + or drop image files on the box). A connected prompt input on the node overrides the global prompt. Placeholders: `,
-      h("b", "{target}"), " who is replaced (per shot) · ", h("b", "{details}"), " description of the shot's references · ",
-      h("b", "{details@Picture n}"), " description of picture n alone · ",
-      h("b", "{shot}"), " the VLM's description of the shot · ", h("b", "{setting}"), " the setting picture (H3 Conditioning)."]),
-    h("div", { class: "hint", style: "margin-top:4px" }, "Mark color: the Colored Mark color of each picture. A person marked for <Picture n> in a shot is drawn in that color, and the prompt says which picture the color becomes. Change it when it is too close to a color in the video."),
-  ], { sub: "defaults for every shot" });
+      "Click + or drop images. Placeholders: ", h("b", "{target}"), " what changes (per shot) · ", h("b", "{details}"), " / ",
+      h("b", "{details@Picture n}"), " picture descriptions · ", h("b", "{shot}"), " the VLM's shot description · ",
+      h("b", "{setting}"), " the setting picture. A connected prompt input overrides this prompt."]),
+  ], { sub: "every shot uses these unless it has its own" });
 }
 
 function vlmSection(c) {
@@ -39,7 +37,7 @@ function vlmSection(c) {
     section("VLM", [
       h("div", { class: "row", style: "gap:14px;margin-bottom:6px" }, [
         opt("enabled", "Use the VLM when the workflow runs", "At run time the planner asks the VLM about the shots it runs and applies the options below"),
-        opt("auto_segment", "Fill the mask text", "Shots without a mask text or points get the VLM's segment suggestion"),
+        opt("auto_segment", "Fill the selection text", "Shots without a selection text or points get the VLM's suggestion"),
         opt("auto_shot", "Fill {shot} in the prompt", "Write {shot} in a prompt: it becomes the VLM's description of that shot (camera, framing, action)"),
       ]),
       h("div", { class: "grid" }, [
@@ -53,10 +51,10 @@ function vlmSection(c) {
         value: VC.instruction || "", onChange: e => c.setVlmCfg("instruction", e.target.value) }),
       h("div", { class: "row", style: "margin-top:6px" }, [
         h("button", { class: "pri", disabled: !!busy.value, onClick: c.analyseVLM }, "🤖 Analyse shots"),
-        h("button", { disabled: !sugN, onClick: c.applyAllSug, title: "Mask text for shots without one, skip where the VLM says skip" }, "Apply suggestions → all"),
+        h("button", { disabled: !sugN, onClick: c.applyAllSug, title: "The suggested selection text, on every shot without one" }, "Apply suggestions → all"),
       ]),
-      hint("Connect a Qwen3-VL (CLIPLoader) to the planner's vlm input. The VLM buttons work after the workflow has run once with it connected (ComfyUI only hands models to nodes when they run). Each shot's suggestion shows in its editor.", "display:block;margin-top:4px"),
-    ], { sub: "looks at every shot and suggests the mask, a description and whether to run it",
+      hint("Connect a Qwen3-VL to the planner's vlm input and run the workflow once: then these buttons work.", "display:block;margin-top:4px"),
+    ], { open: false, sub: "suggests each shot's selection and a description",
          right: h("span", { class: "row" }, [VC.enabled ? pill("on", "ok") : pill("off"), sugN ? pill(`${sugN} suggestions`) : null]) }),
     section("Describe references ({details})", [
       h("div", { class: "row", style: "gap:8px" }, [
@@ -101,7 +99,7 @@ function vlmSection(c) {
           ]),
         ]);
       })) : hint("Add a reference (global or per shot) first."),
-    ], { sub: "{details} = picture 1, {details2} = picture 2, {details@Picture n} = picture n: each shot gets the descriptions of its own pictures" }),
+    ], { open: false, sub: "the text of {details} / {details@Picture n}" }),
   ];
 }
 

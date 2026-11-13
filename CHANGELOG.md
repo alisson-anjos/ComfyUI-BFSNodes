@@ -2,6 +2,14 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.122.0] - 2026-11-13
+
+### Changed
+- **Shot Planner panel reorganized**: four tabs in working order (Video → Pictures & prompt → Shots → Run). The shot editor's selection is one list under **What changes**: *Subject 1* is the shot's own selection and, with Colored Mark on, each row says which picture it becomes (**→ Picture N**); **+ Add subject** adds rows. The five generation-mode cards are one **Generate** dropdown. Rare settings (cut detector, frame grid, fps, VLM, picture descriptions, memory, second pass, mask settings) are collapsed. Shorter labels and tooltips; Portuguese, Spanish and Chinese updated.
+
+### Removed
+- **Shot Planner shot filters and face cast**: *Analyse people & faces*, the person/face/dark/static filters, the per-shot *filters decide / always run / always skip* selector, *Find people*, *Split where the main person changes* and *Only run shots with a detected person*, with their server routes. Use **⏸ Disable** to turn a shot off. Saved plans still load: a shot skipped by hand opens disabled, and the old filter and cast settings are ignored.
+
 ## [1.121.0] - 2026-11-12
 
 ### Added
