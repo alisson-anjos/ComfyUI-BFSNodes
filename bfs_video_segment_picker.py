@@ -689,6 +689,74 @@ def parse_frames(text):
     return out
 
 
+def clean_subject_masks(masks, max_frac):
+    """{subject: bool [n, h, w]} -> the same, cleaned frame by frame. Every piece of the label map (a subject's
+    disconnected bit, or background enclosed by subjects) smaller than max_frac of its subject's area joins the label
+    that surrounds it most: a speck of subject 2 on subject 1's arm becomes subject 1, a hole in a mask is filled. Each
+    subject's largest piece always stays, and background touching the frame border is never filled."""
+    import cv2
+    import numpy as np
+    keys = list(masks)
+    if not keys:
+        return masks
+    n, h, w = next(iter(masks.values())).shape
+    out = {k: masks[k].clone().cpu() for k in keys}
+    ring = np.ones((3, 3), np.uint8)
+    for i in range(n):
+        lab = np.zeros((h, w), np.int32)
+        for k, key in enumerate(keys):
+            lab[masks[key][i].cpu().numpy()] = k + 1
+        orig = lab.copy()
+        area = {k + 1: int((lab == k + 1).sum()) for k in range(len(keys))}
+        if not any(area.values()):
+            continue
+        changed = False
+        # subjects' stray pieces first, then the holes they leave or had
+        for L in [k + 1 for k in range(len(keys))] + [0]:
+            cnt, comp, stats, _ = cv2.connectedComponentsWithStats((lab == L).astype(np.uint8), connectivity=8 if L else 4)
+            if cnt <= 1:
+                continue
+            biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) if L else -1
+            for c in range(1, cnt):
+                x, y, bw, bh, a = (int(v) for v in stats[c])
+                if c == biggest or (L == 0 and (x == 0 or y == 0 or x + bw >= w or y + bh >= h)):
+                    continue
+                x0, y0, x1, y1 = max(0, x - 1), max(0, y - 1), min(w, x + bw + 1), min(h, y + bh + 1)
+                piece = comp[y0:y1, x0:x1] == c
+                around = lab[y0:y1, x0:x1][cv2.dilate(piece.astype(np.uint8), ring).astype(bool) & ~piece]
+                if not around.size:
+                    continue
+                vals, counts = np.unique(around, return_counts=True)
+                into = int(vals[np.argmax(counts)])
+                if into == L:
+                    continue
+                ref = area.get(L) if L else area.get(into, 0)
+                if not ref or a > max_frac * ref:
+                    continue
+                lab[y0:y1, x0:x1][piece] = into
+                changed = True
+        if changed:          # only the moved pixels change: where two subjects overlapped elsewhere, both keep it
+            moved = torch.from_numpy(lab != orig)
+            for k, key in enumerate(keys):
+                out[key][i] = (out[key][i] & ~moved) | (torch.from_numpy(lab == k + 1) & moved)
+    return {k: out[k].to(masks[k].device) for k in keys}
+
+
+def shared_state(frame_state, key):
+    """One subject's selection on a frame, with the objects every subject added there: a region painted or found while
+    another color was active can be selected by this one too. Its own entries win an id clash (older states)."""
+    own = dict(frame_state.get(key) or {})
+    added = list(own.get("added") or [])
+    ids = {str(e.get("id")) for e in added if isinstance(e, dict)}
+    for k, v in frame_state.items():
+        for e in (v.get("added") or []) if k != key and isinstance(v, dict) else []:
+            if isinstance(e, dict) and str(e.get("id")) not in ids:
+                ids.add(str(e.get("id")))
+                added.append(e)
+    own["added"] = added
+    return own
+
+
 def find_connected_picture_count(prompt, unique_id):
     """Inspects the prompt workflow graph to find downstream nodes consuming this node's output,
     and returns the maximum index of connected picture inputs (e.g. 2 if only picture_1 and picture_2 are linked)."""
@@ -787,6 +855,12 @@ class BFSVideoSegmentPicker:
                               "tooltip": "Hatching line and contour thickness multiplier. 1 matches the training format."}),
             "hatch_spacing": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
                                 "tooltip": "Hatching line spacing multiplier. 1 matches the training format."}),
+            "clean_masks": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                            "tooltip": "Clean the subject masks on every frame (the picked frames before tracking too): any piece "
+                                       "smaller than this, in % of the subject's area, joins what surrounds it. Stray specks of one "
+                                       "color on another subject (e.g. where hands and arms cross) go to that subject, holes inside "
+                                       "a mask are filled, and a subject's main body is never removed. 0 = off; 0.5-2 is usually "
+                                       "enough. Too high can swallow a small real part, like a fingertip of the other person."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
@@ -805,14 +879,14 @@ class BFSVideoSegmentPicker:
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
              pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
              propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, protect_mask=None, edge_feather=0.01,
-             hatch_width=1.0, hatch_spacing=1.0, **kw):
+             hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0, **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
                               molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
                               max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt,
                               protect_mask=protect_mask, edge_feather=edge_feather, point_model=point_model,
-                              hatch_width=hatch_width, hatch_spacing=hatch_spacing)
+                              hatch_width=hatch_width, hatch_spacing=hatch_spacing, clean_masks=clean_masks)
         finally:
             self._free(sam3_model, free_after, point_model or molmo_clip)
 
@@ -885,7 +959,7 @@ class BFSVideoSegmentPicker:
               pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
               max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
               propagation_method="Molmo2 (classic)", prompt=None, protect_mask=None, edge_feather=0.01,
-              point_model=None, hatch_width=1.0, hatch_spacing=1.0):
+              point_model=None, hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -936,7 +1010,7 @@ class BFSVideoSegmentPicker:
             sid, sess = sp.session_for((sam3_model, sam3_clip), frame, spec)
             chosen_all = set()
             for sj in subjects:
-                state = sp.parse_state(json.dumps(states.get(str(i), {}).get(str(sj), {})))
+                state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), str(sj))))
                 objects = sp.all_objects(sess, state)
                 by_id = {o["id"]: o for o in objects}
                 chosen = [by_id[k] for k in state["selected"] if k in by_id]
@@ -945,7 +1019,7 @@ class BFSVideoSegmentPicker:
                 cut = torch.stack(cut).any(0) if cut else torch.zeros(h, w, dtype=torch.bool)
                 mask, _ = sp.compose([o["mask"] & ~cut for o in chosen if not o.get("remove")], h, w)
                 own[sj][i] = mask.reshape(h, w).float()
-            lock_state = sp.parse_state(json.dumps(states.get(str(i), {}).get("lock", {})))
+            lock_state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), "lock")))
             lock_objects = sp.all_objects(sess, lock_state)
             lock_by_id = {o["id"]: o for o in lock_objects}
             lock_chosen = [lock_by_id[k] for k in lock_state["selected"] if k in lock_by_id]
@@ -954,12 +1028,16 @@ class BFSVideoSegmentPicker:
             lock_cut = torch.stack(lock_cut).any(0) if lock_cut else torch.zeros(h, w, dtype=torch.bool)
             lock_mask, _ = sp.compose([o["mask"] & ~lock_cut for o in lock_chosen if not o.get("remove")], h, w)
             lock_mask = lock_mask.reshape(h, w) > 0.5
+            if clean_masks > 0:      # tracking starts from the cleaned picks
+                cleaned = clean_subject_masks({sj: (own[sj][i] > 0.5)[None] for sj in subjects}, clean_masks / 100.0)
+                for sj in subjects:
+                    own[sj][i] = cleaned[sj][0].float()
             selected_people = torch.stack([own[sj][i] > 0.5 for sj in subjects]).any(0)
             if bool(lock_mask.any()) and mask_overlap(lock_mask, selected_people)[0] >= 0.7:
                 st(f"frame {i}: lock overlaps the selected subject; pick the object by text or add negative points", None, log=True)
                 lock_mask = torch.zeros_like(lock_mask)
             own_locked[i] = lock_mask
-            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": [a for st in states.get(str(i), {}).values() for a in st.get("added", [])]})))
+            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": shared_state(states.get(str(i), {}), "1")["added"]})))
             panels.append(sp.panel_data(sid, sess, objects))
             overlays.append(sp.overlay(frame, objects, chosen_all))
         cuts = detect_cuts(image) if n > 1 else []
@@ -997,7 +1075,7 @@ class BFSVideoSegmentPicker:
             ckey = ("v4", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track),
                     (point_model if propagation_method == "MolmoPoint-8B" else molmo_clip) is not None,
                     float(threshold),
-                    propagate_scope, propagation_method, active_frame)
+                    propagate_scope, propagation_method, active_frame, float(clean_masks))
             if (not segment_only and propagate_scope not in ("all frames", "fill only empty masks") and previous is not None
                     and len(previous) > 2 and previous[2] == mine):
                 per_subject[sj], report_s[sj] = previous[0].clone(), [dict(r) for r in previous[1]]
@@ -1261,6 +1339,9 @@ class BFSVideoSegmentPicker:
                 rep[:fix_frame] = [dict(r) for r in previous[1][:fix_frame]]
             per_subject[sj] = m > 0.5; report_s[sj] = rep
             _cache_track_result(ckey, vkey, sj, m, rep, mine, keep_last=not segment_only)
+        if clean_masks > 0:
+            per_subject.update(clean_subject_masks({sj: per_subject[sj] > 0.5 for sj in subjects}, clean_masks / 100.0))
+            st(f"cleaned the masks: pieces under {clean_masks:g}% of a subject joined their surroundings", None, log=True)
         masks = torch.stack(list(per_subject.values())).amax(0).float()
         anchors = sorted({i for sj in subjects for i in strip if bool(own[sj][i].any())})
         report = [{"frame": i, "subjects": {str(sj): report_s[sj][i]["source"] for sj in subjects}} for i in range(n)]

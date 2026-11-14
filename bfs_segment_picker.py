@@ -68,10 +68,11 @@ def parse_state(text: str | None) -> dict:
             if any(p["label"] for p in pts):
                 added.append({"id": str(e["id"]), "points": pts})
         elif e.get("strokes"):
-            strokes = [{"r": float(st["r"]), "pts": [[float(x), float(y)] for x, y in st["pts"]]}
+            strokes = [{"r": float(st["r"]), "pts": [[float(x), float(y)] for x, y in st["pts"]], **({"erase": True} if st.get("erase") else {})}
                        for st in e["strokes"] if isinstance(st, dict) and st.get("pts")]
             if strokes:
-                added.append({"id": str(e["id"]), "image": str(e.get("image") or ""), "strokes": strokes})
+                added.append({"id": str(e["id"]), "image": str(e.get("image") or ""), "strokes": strokes,
+                              **({"target": str(e["target"])} if e.get("target") else {})})
         if e.get("remove") and len(added) > n:
             added[-1]["remove"] = True
     selected = [str(i) for i in s.get("selected") or [] if isinstance(i, (str, int))]
@@ -84,7 +85,7 @@ def split_concepts(text: str) -> list[str]:
 
 def entry_key(entry: dict) -> str:
     """What an added entry asks SAM for: an entry whose text or points change is segmented again."""
-    return json.dumps({k: entry[k] for k in ("text", "points", "strokes", "remove") if k in entry}, sort_keys=True)
+    return json.dumps({k: entry[k] for k in ("text", "points", "strokes", "remove", "target") if k in entry}, sort_keys=True)
 
 
 # ------------------------------------------------------------------------------------------------------------ geometry
@@ -117,17 +118,19 @@ def compose(masks: list[torch.Tensor], h: int, w: int) -> tuple[torch.Tensor, to
     return (stack.amax(0, keepdim=True)), stack
 
 
-def paint(strokes: list[dict], h: int, w: int) -> torch.Tensor:
-    """Brush strokes (relative points, radius relative to the width) as a bool mask [h, w]."""
-    img = Image.new("L", (w, h), 0)
+def paint(strokes: list[dict], h: int, w: int, base: torch.Tensor | None = None) -> torch.Tensor:
+    """Brush strokes (relative points, radius relative to the width) as a bool mask [h, w]; an "erase" stroke clears what
+    the strokes before it painted (shift while painting in the panel). `base`: a mask to paint on (grow / trim it)."""
+    img = Image.new("L", (w, h), 0) if base is None else Image.fromarray(base.cpu().numpy().astype(np.uint8) * 255)
     draw = ImageDraw.Draw(img)
     for st in strokes:
         r = max(1., st["r"] * w)
         pts = [(x * w, y * h) for x, y in st["pts"]]
+        fill = 0 if st.get("erase") else 255
         if len(pts) > 1:
-            draw.line(pts, fill=255, width=round(2 * r), joint="curve")
+            draw.line(pts, fill=fill, width=round(2 * r), joint="curve")
         for x, y in pts:
-            draw.ellipse([x - r, y - r, x + r, y + r], fill=255)
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=fill)
     return torch.from_numpy(np.array(img) > 127)
 
 
@@ -278,11 +281,49 @@ def ensure_entry(sess: dict, entry: dict) -> list[dict]:
 
 def all_objects(sess: dict, state: dict) -> list[dict]:
     objs = list(sess["auto"])
+    edits = []
     for e in state["added"]:
         if e.get("strokes") and e["image"] and e["image"] != sess["image_key"]:
             continue                                   # painted on another image
+        if e.get("target"):
+            edits.append(e)                            # brush strokes on an existing object: applied after every object exists
+            continue
         objs += ensure_entry(sess, e)
-    return objs
+    return apply_edits(sess, objs, edits)
+
+
+def apply_edits(sess: dict, objs: list[dict], edits: list[dict]) -> list[dict]:
+    """Brush entries with a "target" grow (or, erase strokes, trim) that object's own mask, in order, instead of adding an
+    object of their own: the object keeps its id, so whatever selected it gets the edited mask."""
+    if not edits:
+        return objs
+    cache = sess.setdefault("edited", {})
+    out = []
+    for o in objs:
+        mine = [e for e in edits if e["target"] == o["id"]]
+        if not mine:
+            out.append(o)
+            continue
+        key = (o["id"], id(o["mask"]), json.dumps([e["strokes"] for e in mine]))
+        if key not in cache:
+            m = o["mask"]
+            for e in mine:
+                m = paint(e["strokes"], *m.shape, base=m)
+            cache[key] = {**{k: v for k, v in o.items() if k != "_file"}, "mask": m, "edits": len(mine)}
+        out.append(cache[key])
+    return out
+
+
+def base_object(sess: dict, oid: str) -> dict | None:
+    """An object of the session as segmented, before any brush edit: automatic or from an added entry."""
+    for o in sess["auto"]:
+        if o["id"] == oid:
+            return o
+    for have in sess["entries"].values():
+        for o in have["objects"]:
+            if o["id"] == oid:
+                return o
+    return None
 
 
 # --------------------------------------------------------------------------------------------------------- panel files
@@ -314,7 +355,7 @@ def panel_object(o: dict, size: tuple[int, int], h: int, w: int) -> dict:
     if "_file" not in o:
         o["_file"] = _save(rgba, f"m_{o['id']}")
     return {"id": o["id"], "label": o["label"], "source": o["source"], "entry": o.get("entry"), "score": o["score"],
-            "remove": bool(o.get("remove")), "area": round(float(o["mask"].float().mean()), 5), "box": [round(x / w, 4), round(y / h, 4), round(bw / w, 4), round(bh / h, 4)],
+            "remove": bool(o.get("remove")), "edits": int(o.get("edits") or 0), "area": round(float(o["mask"].float().mean()), 5), "box": [round(x / w, 4), round(y / h, 4), round(bw / w, 4), round(bh / h, 4)],
             "mask": o["_file"]}
 
 
@@ -430,6 +471,22 @@ def _routes():
         h, w = sess["frame"].shape[1:3]
         size = _preview_size(h, w)
         return web.json_response({"objects": [panel_object(o, size, h, w) for o in objs]})
+
+    @PromptServer.instance.routes.post("/bfs/segpick/edit")
+    async def edit(request):
+        """One object with every brush edit made on it ({session, target, edits: [brush entries]}; none = as segmented)."""
+        body = await request.json()
+        sess = _SESSIONS.get(str(body.get("session") or ""))
+        if sess is None:
+            return web.json_response({"error": "This image is no longer in memory: run the node once, then paint again."}, status=404)
+        target = str(body.get("target") or "")
+        o = base_object(sess, target)
+        if o is None:
+            return web.json_response({"error": f"Object {target} is not in this image any more: run the node once."}, status=404)
+        edits = [e for e in parse_state(json.dumps({"added": body.get("edits") or []}))["added"]
+                 if e.get("target") == target and (not e["image"] or e["image"] == sess["image_key"])]
+        h, w = sess["frame"].shape[1:3]
+        return web.json_response({"objects": [panel_object(o2, _preview_size(h, w), h, w) for o2 in apply_edits(sess, [o], edits)]})
 
 
 _routes()

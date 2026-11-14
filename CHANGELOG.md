@@ -2,7 +2,7 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
-## [1.122.0] - 2026-11-13
+## [1.122.0] - 2026-11-14
 
 ### Changed
 - **Shot Planner panel reorganized**: four tabs in working order (Video → Pictures & prompt → Shots → Run). The shot editor's selection is one list under **What changes**: *Subject 1* is the shot's own selection and, with Colored Mark on, each row says which picture it becomes (**→ Picture N**); **+ Add subject** adds rows. The five generation-mode cards are one **Generate** dropdown. Rare settings (cut detector, frame grid, fps, VLM, picture descriptions, memory, second pass, mask settings) are collapsed. Shorter labels and tooltips; Portuguese, Spanish and Chinese updated.
@@ -13,6 +13,26 @@ All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
 ### Removed
 - **Shot Planner shot filters and face cast**: *Analyse people & faces*, the person/face/dark/static filters, the per-shot *filters decide / always run / always skip* selector, *Find people*, *Split where the main person changes* and *Only run shots with a detected person*, with their server routes. Use **⏸ Disable** to turn a shot off. Saved plans still load: a shot skipped by hand opens disabled, and the old filter and cast settings are ignored.
+
+## [1.121.3] - 2026-11-14
+
+### Fixed
+- **BFS Shot H3 Conditioning (`BFSShotH3ConditioningSimple`)**: Reset newly added number and toggle widgets when loading workflows saved with the older `use_ref_2` layout, preventing shifted values such as `blur` from being parsed as `clip_video_fps`.
+
+## [1.121.2] - 2026-11-13
+
+### Added
+- **Segment Picker / Video Segment Picker**: with an object selected, the brush edits that object's mask instead of adding a new object on top: a stroke grows the selected mask it starts on (or the nearest selected one), shift trims it. The chip shows ✎ and ↺ drops the edits. The brush stays on after ✓ Apply painted area.
+- **Video Segment Picker**: `clean_masks` (default 0 = off) cleans the masks where subjects touch: on every frame, and on the picked frames before tracking, any piece smaller than that % of its subject's area joins what surrounds it (stray specks of one color on another subject switch to it, holes are filled, stray bits on the background go away). A subject's largest piece always stays; overlaps elsewhere are left as they were.
+
+## [1.121.1] - 2026-11-13
+
+### Fixed
+- **Video Segment Picker**: a region painted with the brush no longer disappears when you switch to another color and back. Strokes not applied yet are applied to their color before the color or frame changes or a run starts, and the tool and brush size stay selected.
+
+### Changed
+- **Video Segment Picker**: objects added on a frame (brush, points, text) are shared by every color there; each color selects its own. Removing an added object removes it for every color.
+- **Segment Picker / Video Segment Picker**: hold **shift** while painting to do the opposite of the tool: the brush erases from the mark, the eraser paints back. Erasing and painting over the same spot keeps whatever was painted last.
 
 ## [1.121.0] - 2026-11-12
 

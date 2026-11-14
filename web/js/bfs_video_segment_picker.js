@@ -2,6 +2,7 @@
  * BFS Video Segment Picker: a strip with every frame of the batch on top; click a frame to show it in the image
  * Segment Picker's canvas (the same Panel, one selection per frame). The strip marks each frame: ✓ picked by hand,
  * ↔ tracked from a picked frame, ⚠ lost or nothing. State: the hidden `selection` widget, {"frames": {"i": selection}}.
+ * What a color adds on a frame (brush, points, text) is shared by every color there: each one selects from the same objects.
  */
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
@@ -157,8 +158,11 @@ app.registerExtension({
 
     // the image picker's Panel for the active frame, remounted when the frame changes
     let panelApp = null, handle = {};
+    const ui = { mode: "select", brush: .02 };       // the tool and brush size survive a color or frame change
     const panelHost = document.createElement("div");
     panelHost.className = "host";
+    // paint strokes not applied yet are applied (to the color they were painted with) before the panel changes
+    const switchPanel = async change => { try { await handle.commit?.(); } catch { /* shown in the panel */ } change(); mountPanel(); };
     const mountPanel = () => {
       panelApp?.unmount(); panelHost.innerHTML = ""; handle = {};
       const i = run.data?.indices?.[active.value] ?? active.value;   // the real frame index of the strip entry
@@ -176,8 +180,23 @@ app.registerExtension({
           if (JSON.stringify(frames.v[String(i)]?.[sj]?.selected || []) !== before) autoPropagate();
         },
         expose: o => Object.assign(handle, o),
-      }, { showEraser: false, showRemove: false, autoPointOnClick: sj === "lock", entryPrefix: sj === "lock" ? "lock_" : "",
-           maskColor: sj === "lock" ? [251, 191, 36] : null }) });
+      }, { showEraser: false, showRemove: false, autoPointOnClick: sj === "lock",
+           // ids stay unique on the frame, since every color sees the objects the others added
+           entryPrefix: sj === "lock" ? "lock_" : sj === "1" ? "" : `s${sj}_`,
+           maskColor: sj === "lock" ? [251, 191, 36] : null,
+           mode: sj === "lock" ? "select" : ui.mode, brush: ui.brush,
+           onMode: m => { if (sj !== "lock") ui.mode = m; }, onBrush: b => { ui.brush = b; },
+           // added objects live in the run's frame data too, so the next mount (another color, back here) still has them
+           onObjects: objs => { const fd = run.data?.frames?.[active.value]; if (fd) run.data.frames[active.value] = { ...fd, objects: objs }; },
+           allAdded: () => Object.values(frames.v[String(i)] || {}).flatMap(v => (v && v.added) || []),
+           onRemoveEntry: (id, how) => {      // an added object goes for every color: no color keeps selecting a gone object
+             for (const v of Object.values(frames.v[String(i)] || {})) {
+               if (!v || typeof v !== "object") continue;
+               if (v.added) v.added = v.added.filter(a => a.id !== id);
+               if (v.selected && !how?.keepSelection) v.selected = v.selected.filter(s => s !== id && !s.startsWith(`${id}.`));
+             }
+             save();
+           } }) });
       panelApp.mount(el);
       const d = run.data?.frames?.[active.value];
       if (d) setTimeout(() => handle.executed?.(d), 0);
@@ -206,11 +225,13 @@ app.registerExtension({
     wrapQueue();
     const segmentOnly = async () => {      // a picking run: the new frame is segmented, nothing is tracked
       busy.value = "segmenting…";
+      try { await handle.commit?.(); } catch { /* shown in the panel */ }
       try { const p = await app.graphToPrompt(); await api.queuePrompt(0, p, { partialExecutionTargets: [String(node.id)] }); }
       catch (e) { busy.value = String(e.message || e); }
     };
     const propagate = async () => {
       busy.value = "propagating…";
+      try { await handle.commit?.(); } catch { /* shown in the panel */ }
       try {
         const p = await app.graphToPrompt();
         propagating.add(String(node.id));
@@ -264,7 +285,7 @@ app.registerExtension({
             h("div", { class: "subj" }, [...SUBJECTS.map(([k, col, name]) => h("span", {
               class: ["t", subject.value === k ? "on" : ""], style: subject.value === k ? { color: col } : null,
               title: `Subject ${k} (${name}) = Picture ${k}: clicks select this subject`,
-              onClick: () => { if (subject.value !== k) { subject.value = k; mountPanel(); } } },
+              onClick: () => { if (subject.value !== k) switchPanel(() => { subject.value = k; }); } },
               [
                 h("i", { style: { background: col } }),
                 h("span", { style: "color:#fff" }, `${k} · ${name}`),
@@ -276,7 +297,7 @@ app.registerExtension({
               ])), h("span", {
                 class: ["t", "lock", subject.value === "lock" ? "on" : ""],
                 title: "Everything outside the selected subject is already protected. Use this padlock only for an object inside that subject's mask; click it to segment with SAM 3.",
-                onClick: () => { if (subject.value !== "lock") { subject.value = "lock"; mountPanel(); } },
+                onClick: () => { if (subject.value !== "lock") switchPanel(() => { subject.value = "lock"; }); },
               }, [
                 h("span", null, "🔒"),
                 hasPicks("lock") ? h("span", {
@@ -320,7 +341,7 @@ app.registerExtension({
                 const [cls, mark] = status(i);
                 return h("div", { class: ["fr", i === active.value ? "on" : ""], key: i, title: run.data.report?.[i]?.source || "",
                   style: { backgroundImage: `url("${fileUrl(d.image)}")` },
-                  onClick: () => { if (active.value !== i) { active.value = i; focusFrame = run.data.indices?.[i] ?? i; save(); mountPanel(); } } },
+                  onClick: () => { if (active.value !== i) switchPanel(() => { active.value = i; focusFrame = run.data.indices?.[i] ?? i; save(); }); } },
                   [h("span", { class: "b" }, `f${run.data.indices?.[i] ?? i}`), mark ? h("span", { class: ["s", cls] }, mark) : null,
                    h("span", { class: "dots" }, pickedSubjects(i).map(k => k === "lock"
                      ? h("span", { title: "Protected object picked", style: "color:#fbbf24;background:#181818;border-radius:3px;padding:0 2px" }, "🔒")
