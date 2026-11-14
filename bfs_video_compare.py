@@ -140,6 +140,8 @@ class BFSVideoCompare:
                                         "size) or a batch; up to 12."}),
                 "label_guide": ("STRING", {"default": "guide"}),
                 "label_target": ("STRING", {"default": "target"}),
+                "free_memory_after": ("BOOLEAN", {"default": True, "tooltip":
+                                       "After the workflow finishes, release cached node outputs and unloaded model weights from RAM. The next run reloads models."}),
             },
         }
 
@@ -157,10 +159,10 @@ class BFSVideoCompare:
                    "where they differ, pixel by pixel.")
 
     def compare(self, guide, target, fps=24.0, audio=None, gain=2.0, size="guide", preview_height=720,
-                label_guide="guide", label_target="target", reference=None):
+                label_guide="guide", label_target="target", reference=None, free_memory_after=True):
         one = lambda v: v[0] if isinstance(v, list) and v else v
-        fps, audio, gain, size, preview_height, label_guide, label_target = map(
-            one, (fps, audio, gain, size, preview_height, label_guide, label_target))
+        fps, audio, gain, size, preview_height, label_guide, label_target, free_memory_after = map(
+            one, (fps, audio, gain, size, preview_height, label_guide, label_target, free_memory_after))
         guide, target = video_batches(guide, "guide"), video_batches(target, "target")
         ng, nt = sum(x.shape[0] for x in guide), sum(x.shape[0] for x in target)
         if len(guide) > 1 or len(target) > 1:
@@ -226,6 +228,14 @@ class BFSVideoCompare:
                                "refs": refs,
                                "stills": {k: {"filename": f, "subfolder": sub, "type": "temp"} for k, f in stills.items()},
                                "report": report, "notes": notes}]}
+        if free_memory_after:
+            try:
+                from server import PromptServer
+            except ImportError:  # the comparison can also run outside ComfyUI
+                PromptServer = None
+            queue = getattr(getattr(PromptServer, "instance", None), "prompt_queue", None)
+            if queue is not None:
+                queue.set_flag("free_memory", True)
         return {"ui": ui, "result": (diff_map, report, mean)}
 
 

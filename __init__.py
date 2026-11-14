@@ -230,7 +230,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # Character swap with marked guides (Video Segment Picker -> H3 Character Swap Conditioning), keyframe planning, and
 # the loop / sweep helpers. Each module loads on its own: a missing optional dependency only skips that module.
 for _mod in ("bfs_keyframe_marks", "bfs_video_segment_picker", "bfs_h3_swap_conditioning", "bfs_keyframe_planner",
-             "bfs_frame_loop", "bfs_xy_sweep", "bfs_workflow_loop"):
+             "bfs_frame_loop", "bfs_xy_sweep", "bfs_workflow_loop", "bfs_h3_image_swap_prompt",
+             "bfs_h3_image_swap_conditioning", "bfs_h3_image_swap_tools", "bfs_model_surgery",
+             "bfs_h3_pdd_surgery"):
     try:
         import importlib as _il
         _m = _il.import_module(f".{_mod}", __package__)

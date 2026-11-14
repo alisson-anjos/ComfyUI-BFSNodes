@@ -34,11 +34,27 @@ def hybrid_tint(normal_rgb, color, alpha=HYBRID_TINT):
     return (detail * c * alpha + detail * (1 - alpha)).clamp(0, 1)
 
 
-FREE_MODES = ["unload all models from the GPU", "unload SAM 3 from the GPU", "unload all models + clear the picker caches",
+FREE_MODES = ["unload all models from the GPU", "unload all models + release Molmo2 RAM", "unload SAM 3 from the GPU", "unload all models + clear the picker caches",
               "keep everything loaded"]
 LEGACY_FREE = {"unload SAM 3 + clear the picker caches": "unload all models + clear the picker caches"}
-MARK_STYLES = ["normal map (needs normals)", "openpose + face (needs pose_keypoint)", "flat color", "shading (needs normals)", "blur",
-               "pixelate", "gray detail", "edges"]
+PROTECTED_NORMAL_STYLE = "normal map inside mask (needs normals)"
+HATCHING_STYLE = "colored hatching + contour"
+MARK_STYLES = ["normal map (needs normals)", PROTECTED_NORMAL_STYLE, "openpose + face (needs pose_keypoint)", "flat color", "translucent overlay", "colored outline", "shading (needs normals)", "blur",
+               "pixelate", "gray detail", "edges", HATCHING_STYLE]
+
+
+def hatching_alpha(mask, scale, width=1.0, spacing=1.0):
+    import cv2
+    line_width = max(2.5, scale * 0.01) * width
+    period = max(max(2.5, scale * 0.01) * 7, scale * 0.09) * spacing
+    h, w = mask.shape
+    y = torch.arange(h, device=mask.device, dtype=torch.float32)[:, None]
+    x = torch.arange(w, device=mask.device, dtype=torch.float32)[None, :]
+    distance = ((y + 0.29 * x + period) % period - period / 2).abs() / (1 + 0.29**2)**0.5
+    lines = (line_width / 2 + 0.5 - distance).clamp(0, 1)
+    inside = cv2.distanceTransform(mask.detach().cpu().numpy().astype('uint8'), cv2.DIST_L2, 5)
+    border = (line_width + 0.5 - torch.from_numpy(inside).to(mask.device)).clamp(0, 1)
+    return torch.maximum(lines, border) * mask
 
 
 def mark_fill(style, frame, normal_rgb, mask, color, alpha=HYBRID_TINT):
@@ -54,7 +70,7 @@ def mark_fill(style, frame, normal_rgb, mask, color, alpha=HYBRID_TINT):
         light = n.new_tensor([-0.35, -0.5, 0.8]); light = light / light.norm()
         lum = (0.30 + 0.70 * (n * light).sum(-1).clamp(0, 1))[..., None]
         return (lum * c).clamp(0, 1)
-    if style == "flat color":
+    if style in ("flat color", "translucent overlay", "colored outline", HATCHING_STYLE):
         return c.expand_as(frame).clone()
     gray = (frame[..., 0] * 0.299 + frame[..., 1] * 0.587 + frame[..., 2] * 0.114)
     ys, xs = torch.nonzero(mask, as_tuple=True)
@@ -133,6 +149,7 @@ def person_at(sam, frame, x, y, threshold):
 
 _MOLMO_CACHE = OrderedDict()   # (video, subject, anchor frame, anchor mask) -> (description, points): Molmo2 runs once per pick
 _SHOT_CACHE = OrderedDict()    # (video, subject, shot, its anchors + masks, threshold) -> (masks, report) of that shot
+_PICKER_MASK_CACHE_MAX_BYTES = 2 * 1024 ** 3  # keep picker mask caches bounded by RAM as well as entry count
 
 
 def mask_key(m):
@@ -141,10 +158,28 @@ def mask_key(m):
     return hashlib.sha1(np.packbits((m > 0.5).cpu().numpy()).tobytes()).hexdigest()[:16]
 
 
-def _remember(cache, key, value, cap):
+def _cache_tensor_bytes(value, seen=None):
+    """Count unique tensor storages in a cache value; item-count caps alone are unsafe for full videos."""
+    if seen is None:
+        seen = set()
+    if isinstance(value, torch.Tensor):
+        storage = value.untyped_storage()
+        storage_key = (str(value.device), storage.data_ptr(), storage.nbytes())
+        if storage_key in seen:
+            return 0
+        seen.add(storage_key)
+        return storage.nbytes()
+    if isinstance(value, dict):
+        return sum(_cache_tensor_bytes(v, seen) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_cache_tensor_bytes(v, seen) for v in value)
+    return 0
+
+
+def _remember(cache, key, value, cap, max_bytes=None):
     cache[key] = value
     cache.move_to_end(key)
-    while len(cache) > cap:
+    while len(cache) > cap or (max_bytes is not None and sum(_cache_tensor_bytes(v) for v in cache.values()) > max_bytes):
         cache.popitem(last=False)
 
 
@@ -498,9 +533,79 @@ def grow_masks(masks, rel):
     return F.max_pool2d(masks[:, None].float(), 2 * r + 1, 1, r)[:, 0]
 
 
+def feather_inside_mask(mask, radius):
+    """Soften a rendered mask edge without painting outside the selected pixels."""
+    if radius <= 0:
+        return mask.float()
+    import cv2
+    import numpy as np
+    binary = mask.numpy().astype(np.uint8)
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    alpha = np.clip(distance / radius, 0.0, 1.0)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.8)
+    return torch.from_numpy(alpha * binary)
+
+
+def anchor_windows(anchors, start, end):
+    """Split a shot at nearest-anchor midpoints; ties stay with the earlier anchor."""
+    anchors = sorted(a for a in set(anchors) if start <= a < end)
+    for pos, anchor in enumerate(anchors):
+        lo = start if pos == 0 else (anchors[pos - 1] + anchor) // 2 + 1
+        hi = end if pos == len(anchors) - 1 else (anchor + anchors[pos + 1]) // 2 + 1
+        yield anchor, lo, hi
+
+
+def consecutive_runs(indices):
+    run = []
+    for i in indices:
+        if run and i != run[-1] + 1:
+            yield run
+            run = []
+        run.append(i)
+    if run:
+        yield run
+
+
+def fill_empty_mask_runs(image, model, masks, report, shots, active_frame=-1):
+    """Track only empty stretches from the nearest existing mask in the same shot."""
+    filled = 0
+    for s0, s1 in shots:
+        anchors = [i for i in range(s0, s1) if bool(masks[i].any())]
+        if not anchors:
+            continue
+        empty = [i for i in range(s0, s1) if not bool(masks[i].any())]
+        for run in consecutive_runs(empty):
+            lo, hi = run[0], run[-1] + 1
+            if all(report[i].get("source") == "before first pick" for i in run):
+                continue
+            anchor = min(anchors, key=lambda a: (min(abs(a - lo), abs(a - (hi - 1))), a != active_frame, a))
+            begin, end = min(anchor, lo), max(anchor + 1, hi)
+            tracked = BFSTrackFromFrame().track(image[begin:end, ..., :3], model,
+                                                masks[anchor][None].float(), anchor - begin)[0]
+            for i in run:
+                new_mask = tracked[i - begin] > 0.5
+                if bool(new_mask.any()):
+                    masks[i] = new_mask
+                    report[i] = {"frame": i, "source": f"filled from {anchor}"}
+                    filled += 1
+    return filled
+
+
 from collections import OrderedDict
 _TRACK_CACHE = OrderedDict()   # (video, subject, its picks, cuts, options) -> (masks, report), most recent last
 _LAST_TRACK_CACHE = OrderedDict()  # (video, subject) -> last completed propagated masks/report
+_LOCK_CACHE = OrderedDict()    # (video, locked objects and cuts) -> tracked protection masks
+
+
+def _cache_track_result(ckey, vkey, sj, masks, report, picks, keep_last=True):
+    # Masks are binary after propagation. Keep one bool storage shared by both caches instead of
+    # two full-resolution float32 clones (4x larger per frame).
+    compact = masks > 0.5
+    report_copy = [dict(r) for r in report]
+    _remember(_TRACK_CACHE, ckey, (compact, report_copy), 24, _PICKER_MASK_CACHE_MAX_BYTES)
+    if keep_last:
+        _remember(_LAST_TRACK_CACHE, (vkey, sj), (compact, report_copy, picks), 24,
+                  _PICKER_MASK_CACHE_MAX_BYTES)
 
 
 def video_key(image):
@@ -510,7 +615,7 @@ def video_key(image):
     return hashlib.sha1(smp.tobytes() + str(tuple(image.shape)).encode()).hexdigest()[:16]
 
 
-def timeline_strip(image, per_subject, width=256, max_frames=400):
+def timeline_strip(image, per_subject, protected=None, width=256, max_frames=400):
     """Small JPEGs of every frame with each subject's mask tinted in its color, for the panel's whole-video scrubber
     (so a wrong mask can be found on any frame, not only on the strip)."""
     import os, uuid
@@ -527,6 +632,9 @@ def timeline_strip(image, per_subject, width=256, max_frames=400):
             c = torch.tensor(HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)], dtype=fr.dtype) / 255.0
             mk = (m[i] > 0.5)[..., None].to(fr.dtype) * 0.55
             fr = fr * (1 - mk) + c * mk
+        if protected is not None and bool(protected[i].any()):
+            mk = protected[i][..., None].to(fr.dtype) * 0.55
+            fr = fr * (1 - mk) + fr.new_tensor([1.0, 0.78, 0.18]) * mk
         arr = (fr.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         name = f"f{i:05d}.jpg"
         Image.fromarray(arr).resize((sw, sh), Image.BILINEAR).save(os.path.join(out_dir, name), quality=80)
@@ -576,9 +684,77 @@ def parse_frames(text):
             continue
         out[str(k)] = {"1": v} if ("selected" in v or "added" in v) else {
             str(sk): sv for sk, sv in v.items()
-            if isinstance(sv, dict) and str(sk).isdigit() and 1 <= int(sk) <= len(HYBRID_COLORS)
+            if isinstance(sv, dict) and (str(sk) == "lock" or (str(sk).isdigit() and 1 <= int(sk) <= len(HYBRID_COLORS)))
         }
     return out
+
+
+def clean_subject_masks(masks, max_frac):
+    """{subject: bool [n, h, w]} -> the same, cleaned frame by frame. Every piece of the label map (a subject's
+    disconnected bit, or background enclosed by subjects) smaller than max_frac of its subject's area joins the label
+    that surrounds it most: a speck of subject 2 on subject 1's arm becomes subject 1, a hole in a mask is filled. Each
+    subject's largest piece always stays, and background touching the frame border is never filled."""
+    import cv2
+    import numpy as np
+    keys = list(masks)
+    if not keys:
+        return masks
+    n, h, w = next(iter(masks.values())).shape
+    out = {k: masks[k].clone().cpu() for k in keys}
+    ring = np.ones((3, 3), np.uint8)
+    for i in range(n):
+        lab = np.zeros((h, w), np.int32)
+        for k, key in enumerate(keys):
+            lab[masks[key][i].cpu().numpy()] = k + 1
+        orig = lab.copy()
+        area = {k + 1: int((lab == k + 1).sum()) for k in range(len(keys))}
+        if not any(area.values()):
+            continue
+        changed = False
+        # subjects' stray pieces first, then the holes they leave or had
+        for L in [k + 1 for k in range(len(keys))] + [0]:
+            cnt, comp, stats, _ = cv2.connectedComponentsWithStats((lab == L).astype(np.uint8), connectivity=8 if L else 4)
+            if cnt <= 1:
+                continue
+            biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) if L else -1
+            for c in range(1, cnt):
+                x, y, bw, bh, a = (int(v) for v in stats[c])
+                if c == biggest or (L == 0 and (x == 0 or y == 0 or x + bw >= w or y + bh >= h)):
+                    continue
+                x0, y0, x1, y1 = max(0, x - 1), max(0, y - 1), min(w, x + bw + 1), min(h, y + bh + 1)
+                piece = comp[y0:y1, x0:x1] == c
+                around = lab[y0:y1, x0:x1][cv2.dilate(piece.astype(np.uint8), ring).astype(bool) & ~piece]
+                if not around.size:
+                    continue
+                vals, counts = np.unique(around, return_counts=True)
+                into = int(vals[np.argmax(counts)])
+                if into == L:
+                    continue
+                ref = area.get(L) if L else area.get(into, 0)
+                if not ref or a > max_frac * ref:
+                    continue
+                lab[y0:y1, x0:x1][piece] = into
+                changed = True
+        if changed:          # only the moved pixels change: where two subjects overlapped elsewhere, both keep it
+            moved = torch.from_numpy(lab != orig)
+            for k, key in enumerate(keys):
+                out[key][i] = (out[key][i] & ~moved) | (torch.from_numpy(lab == k + 1) & moved)
+    return {k: out[k].to(masks[k].device) for k in keys}
+
+
+def shared_state(frame_state, key):
+    """One subject's selection on a frame, with the objects every subject added there: a region painted or found while
+    another color was active can be selected by this one too. Its own entries win an id clash (older states)."""
+    own = dict(frame_state.get(key) or {})
+    added = list(own.get("added") or [])
+    ids = {str(e.get("id")) for e in added if isinstance(e, dict)}
+    for k, v in frame_state.items():
+        for e in (v.get("added") or []) if k != key and isinstance(v, dict) else []:
+            if isinstance(e, dict) and str(e.get("id")) not in ids:
+                ids.add(str(e.get("id")))
+                added.append(e)
+    own["added"] = added
+    return own
 
 
 def find_connected_picture_count(prompt, unique_id):
@@ -620,6 +796,8 @@ class BFSVideoSegmentPicker:
         t = sp.BFSSegmentPicker.INPUT_TYPES()
         req = dict(t["required"])
         req["image"] = ("IMAGE", {"tooltip": f"The frames: the Keyframe Planner's source_frames or a short clip (at most {MAX_FRAMES})."})
+        req["mark_opacity"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                             "tooltip": "Opacity of the subject mark in both outputs: the marked preview and the H3 hybrid guide. Use 1 for a clearly visible normal map; lower values blend the original frame into both outputs."})
         req["selection"] = ("STRING", {"default": "{}", "multiline": True, "tooltip": "Set by the panel: the selection on each frame."})
         req["track"] = ("BOOLEAN", {"default": True, "tooltip": "Frames without a selection take the nearest selected frame's mask, tracked with SAM 3."})
         opt = {
@@ -632,10 +810,17 @@ class BFSVideoSegmentPicker:
                                                            "for mark_style 'openpose + face'."}),
             "molmo_clip": ("CLIP", {"lazy": True, "tooltip": "Optional: Molmo2 as H3 encoder. It sees the whole video, finds the picked person again after "
                                                "camera cuts and helps recover missed masks. In the default Molmo2 (classic) mode it describes the selected person, tracks that description through the video, and uses its points to guide SAM 3.1."}),
+            "point_model": ("MOLMO_POINT_MODEL", {"lazy": True, "tooltip": "MolmoPoint-8B point tracker. Use with propagation_method 'MolmoPoint-8B'; its native point tokens guide SAM 3 without changing the H3 text encoder."}),
             "mark_style": (MARK_STYLES, {"default": MARK_STYLES[0],
                            "tooltip": "How each subject is drawn in the hybrid output, always in its color: the normal map, the DWPose "
                                       "skeleton with the face, or texture-free alternatives that need no MoGe (flat, blur, pixelate, gray "
-                                      "detail, edges). With a style that needs no normals, 'hybrid' works without the normals input."}),
+                                      "detail, edges). 'normal map inside mask' hides source texture only inside the person: "
+                                      "everything outside is protected automatically. It feathers the boundary and also "
+                                      "keeps objects selected with the padlock or protect_mask unchanged inside the person mask. "
+                                      "'translucent overlay' colors the exact mask with mark_opacity. "
+                                      "'colored outline' draws only a thin border inside the mask, preserving frame detail "
+                                      "and held objects. 'colored hatching + contour' draws lines and a matching inner contour, "
+                                      "preserving the original texture and lighting between lines. These modes need no normals."}),
             "hybrid_grow": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.5, "step": 0.01,
                                       "tooltip": "Margin around the subject in the hybrid guide, relative to its size (normal map: 0.04-0.12; "
                                                  "openpose: 0.08-0.18 around the person's convex hull)."}),
@@ -643,7 +828,7 @@ class BFSVideoSegmentPicker:
                                      "tooltip": "How many frames the panel shows to pick on (SAM segments each one): fewer is faster."}),
             "free_after": (FREE_MODES, {"default": FREE_MODES[0],
                            "tooltip": "After the node: free the GPU for the next nodes (H3). 'all models' also unloads H3 / the text "
-                                      "encoder left from the last generation (they load again when needed). Clearing the caches also "
+                                      "encoder left from the last generation. 'release Molmo2 RAM' drops its CPU weights too, so the next Molmo2 run reloads them. Clearing the caches also "
                                       "frees RAM, but the next run segments and tracks again. Before MoGe / DWPose / Molmo2 run "
                                       "(only on Propagate) every model is unloaded anyway, so a second run does not run out of memory."}),
             "pose_region": (["person outline", "convex hull"], {"default": "person outline",
@@ -659,10 +844,23 @@ class BFSVideoSegmentPicker:
                              "tooltip": "Limit active subjects: 'auto' automatically detects connected picture inputs in downstream H3 conditioning (ignoring extra subjects like green if only 2 pictures are connected), or force 1, 2, or 3."}),
             "propagate_scope": (["all frames", "from first selected frame onward", "only this frame", "from active frame onward", "fill only empty masks"], {"default": "fill only empty masks",
                              "tooltip": "Fill only empty masks keeps every existing non-empty frame unchanged and fills only frames whose mask is empty. Only this frame replaces one mask; from active frame onward recalculates from the open frame and preserves earlier results; all frames recomputes the clip."}),
-            "propagation_method": (["Molmo2 (classic)", "SAM 3 (current)"], {"default": "Molmo2 (classic)",
-                             "tooltip": "Classic uses Molmo2 to describe the selected person, track it through the full video, and re-anchor weak or lost masks. SAM 3 (current) uses mask tracking with Molmo2-assisted recovery."}),
+            "propagation_method": (["Molmo2 (classic)", "MolmoPoint-8B", "SAM 3 (current)"], {"default": "Molmo2 (classic)",
+                             "tooltip": "MolmoPoint-8B uses native point tokens to track and re-anchor the selected person; Molmo2 (classic) uses text coordinates. Both use SAM 3 for per-frame masks."}),
             "molmo_descriptions": ("STRING", {"multiline": False, "default": "",
                                    "tooltip": "Optional tracking description for subject 1. Leave blank to let Molmo2 describe the person you selected automatically. This only overrides the text query; the selected mask remains the visual anchor."}),
+            "protect_mask": ("MASK", {"tooltip": "Optional external mask of objects to keep unchanged in 'normal map inside mask'. You can instead select protected objects with the padlock in this node. One mask or one per guide frame."}),
+            "edge_feather": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.1, "step": 0.005,
+                              "tooltip": "'normal map inside mask': soften the mark inward from the person and protected-object edges. Fraction of the shorter frame side."}),
+            "hatch_width": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                              "tooltip": "Hatching line and contour thickness multiplier. 1 matches the training format."}),
+            "hatch_spacing": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05,
+                                "tooltip": "Hatching line spacing multiplier. 1 matches the training format."}),
+            "clean_masks": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                            "tooltip": "Clean the subject masks on every frame (the picked frames before tracking too): any piece "
+                                       "smaller than this, in % of the subject's area, joins what surrounds it. Stray specks of one "
+                                       "color on another subject (e.g. where hands and arms cross) go to that subject, holes inside "
+                                       "a mask are filled, and a subject's main body is never removed. 0 = off; 0.5-2 is usually "
+                                       "enough. Too high can swallow a small real part, like a fingertip of the other person."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
@@ -670,27 +868,31 @@ class BFSVideoSegmentPicker:
     RETURN_NAMES = ("masks", "marked", "overlay", "report", "hybrid")
     OUTPUT_TOOLTIPS = ("One mask per frame: the person to replace.", "Every frame with the person tinted (mark_color, mark_opacity).",
                        "The strip frames with all objects found, numbered.", "JSON per frame: picked by hand, tracked from frame N, or empty.",
-                       "With normals: the frames (or hybrid_base) with this subject drawn as its tinted normal map; else hybrid_base or the frames.")
+                       "The H3 guide with each subject drawn in its color using mark_style and mark_opacity; 'normal map inside mask' keeps pixels outside the person and protect_mask unchanged.")
     FUNCTION = "pick"
     CATEGORY = "BFS/Mask"
     OUTPUT_NODE = True
 
     def pick(self, image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
              selection, track=True, strip_frames=16, normals=None, normals_convention="normal_directx", hybrid_base=None, subject=None,
-             mark_style=MARK_STYLES[0], molmo_clip=None, pose_keypoint=None,
+             mark_style=MARK_STYLES[0], molmo_clip=None, point_model=None, pose_keypoint=None,
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
              pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
-             propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, **kw):
+             propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, protect_mask=None, edge_feather=0.01,
+             hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0, **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
                               molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
-                              max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt)
+                              max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt,
+                              protect_mask=protect_mask, edge_feather=edge_feather, point_model=point_model,
+                              hatch_width=hatch_width, hatch_spacing=hatch_spacing, clean_masks=clean_masks)
         finally:
-            self._free(sam3_model, free_after)
+            self._free(sam3_model, free_after, point_model or molmo_clip)
 
     def check_lazy_status(self, selection="{}", mark_style=MARK_STYLES[0], track=True, normals=None, pose_keypoint=None,
-                          molmo_clip=None, unique_id=None, prompt=None, **kw):
+                          molmo_clip=None, point_model=None, propagation_method="Molmo2 (classic)", propagate_scope="fill only empty masks",
+                          image=None, unique_id=None, prompt=None, **kw):
         """The heavy optional inputs (MoGe normals, DWPose keypoints, Molmo2) are only needed when propagating, not while
         picking; before they run, every model leaves the GPU (e.g. H3 from the last generation), or MoGe runs out of memory."""
         try:
@@ -700,12 +902,21 @@ class BFSVideoSegmentPicker:
         if segment_only:
             return []
         need = []
-        if normals is None and not mark_style.startswith("openpose"):
+        if normals is None and ("needs normals" in mark_style or mark_style == PROTECTED_NORMAL_STYLE):
             need.append("normals")
         if pose_keypoint is None and mark_style.startswith("openpose"):
             need.append("pose_keypoint")
-        if molmo_clip is None and track:
+        reuse_existing = False
+        if propagate_scope == "fill only empty masks" and isinstance(image, torch.Tensor):
+            states = parse_frames(selection)
+            subjects = {int(sk) for frame_state in states.values() for sk, state in frame_state.items()
+                        if str(sk).isdigit() and state.get("selected")} or {1}
+            vkey = video_key(image)
+            reuse_existing = all((vkey, sj) in _LAST_TRACK_CACHE for sj in subjects)
+        if molmo_clip is None and track and propagation_method == "Molmo2 (classic)" and not reuse_existing:
             need.append("molmo_clip")
+        if point_model is None and track and propagation_method == "MolmoPoint-8B" and not reuse_existing:
+            need.append("point_model")
         links = ((prompt or {}).get(str(unique_id)) or {}).get("inputs", {})
         need = [x for x in need if isinstance(links.get(x), list)]    # only connected inputs can be requested
         if need:
@@ -718,7 +929,7 @@ class BFSVideoSegmentPicker:
         return need
 
     @staticmethod
-    def _free(sam3_model, mode):
+    def _free(sam3_model, mode, molmo_clip=None):
         mode = LEGACY_FREE.get(mode, mode)
         if mode.startswith("keep"):
             return
@@ -731,6 +942,12 @@ class BFSVideoSegmentPicker:
                 mm.unload_model_and_clones(sam3_model)
             if "caches" in mode:
                 sp._SESSIONS.clear(); _TRACK_CACHE.clear(); _LAST_TRACK_CACHE.clear(); _SHOT_CACHE.clear(); _MOLMO_CACHE.clear()
+            if "release Molmo2 RAM" in mode and molmo_clip is not None:
+                runtime = getattr(molmo_clip, "runtime", None)
+                if runtime is not None and hasattr(runtime, "release_ram"):
+                    runtime.release_ram()
+                if hasattr(molmo_clip, "cache"):
+                    molmo_clip.cache.clear()
             gc.collect()
             mm.soft_empty_cache(True)
             print(f"[BFS Video Segment Picker] memory freed ({mode})", flush=True)
@@ -741,7 +958,8 @@ class BFSVideoSegmentPicker:
               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style, molmo_clip,
               pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
               max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
-              propagation_method="Molmo2 (classic)", prompt=None):
+              propagation_method="Molmo2 (classic)", prompt=None, protect_mask=None, edge_feather=0.01,
+              point_model=None, hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0):
         st = Status(unique_id)
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
@@ -762,11 +980,14 @@ class BFSVideoSegmentPicker:
             segment_only = False
             active_frame = -1
         if segment_only:
-            st("segment only (picking): no tracking, no Molmo2 - press Propagate to track", None, log=True)
+            st("segment only (picking): no tracking or Molmo2; press Apply fix to track", None, log=True)
+        if not segment_only and normals is None and (mark_style == PROTECTED_NORMAL_STYLE or "needs normals" in mark_style):
+            raise ValueError("Connect MoGe normals to 'normals' for this mark style, or choose 'translucent overlay' to render without normals.")
         user_descs = [l.strip().strip('. ') for l in str(molmo_descriptions or '').splitlines()]
         while user_descs and not user_descs[-1]: user_descs.pop()
 
-        subjects = sorted({int(sk) for st in states.values() for sk, sv in st.items() if (sv.get("selected") or [])} or {1})
+        subjects = sorted({int(sk) for frame_state in states.values() for sk, sv in frame_state.items()
+                           if str(sk).isdigit() and (sv.get("selected") or [])} or {1})
         max_allowed = None
         if str(max_subjects) in ("1", "2", "3"):
             max_allowed = int(max_subjects)
@@ -782,13 +1003,14 @@ class BFSVideoSegmentPicker:
                 subjects = active
         panels, overlays = [], []
         own = {sj: {} for sj in subjects}
+        own_locked = {}
         for k_strip, i in enumerate(strip):
             st(f"SAM 3: segmenting frame {i} ({k_strip + 1}/{len(strip)})", 0.02 + 0.28 * k_strip / max(1, len(strip)))
             frame = image[i:i + 1, ..., :3].float().cpu()
             sid, sess = sp.session_for((sam3_model, sam3_clip), frame, spec)
             chosen_all = set()
             for sj in subjects:
-                state = sp.parse_state(json.dumps(states.get(str(i), {}).get(str(sj), {})))
+                state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), str(sj))))
                 objects = sp.all_objects(sess, state)
                 by_id = {o["id"]: o for o in objects}
                 chosen = [by_id[k] for k in state["selected"] if k in by_id]
@@ -797,7 +1019,25 @@ class BFSVideoSegmentPicker:
                 cut = torch.stack(cut).any(0) if cut else torch.zeros(h, w, dtype=torch.bool)
                 mask, _ = sp.compose([o["mask"] & ~cut for o in chosen if not o.get("remove")], h, w)
                 own[sj][i] = mask.reshape(h, w).float()
-            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": [a for st in states.get(str(i), {}).values() for a in st.get("added", [])]})))
+            lock_state = sp.parse_state(json.dumps(shared_state(states.get(str(i), {}), "lock")))
+            lock_objects = sp.all_objects(sess, lock_state)
+            lock_by_id = {o["id"]: o for o in lock_objects}
+            lock_chosen = [lock_by_id[k] for k in lock_state["selected"] if k in lock_by_id]
+            chosen_all |= {o["id"] for o in lock_chosen}
+            lock_cut = [o["mask"] for o in lock_chosen if o.get("remove")]
+            lock_cut = torch.stack(lock_cut).any(0) if lock_cut else torch.zeros(h, w, dtype=torch.bool)
+            lock_mask, _ = sp.compose([o["mask"] & ~lock_cut for o in lock_chosen if not o.get("remove")], h, w)
+            lock_mask = lock_mask.reshape(h, w) > 0.5
+            if clean_masks > 0:      # tracking starts from the cleaned picks
+                cleaned = clean_subject_masks({sj: (own[sj][i] > 0.5)[None] for sj in subjects}, clean_masks / 100.0)
+                for sj in subjects:
+                    own[sj][i] = cleaned[sj][0].float()
+            selected_people = torch.stack([own[sj][i] > 0.5 for sj in subjects]).any(0)
+            if bool(lock_mask.any()) and mask_overlap(lock_mask, selected_people)[0] >= 0.7:
+                st(f"frame {i}: lock overlaps the selected subject; pick the object by text or add negative points", None, log=True)
+                lock_mask = torch.zeros_like(lock_mask)
+            own_locked[i] = lock_mask
+            objects = sp.all_objects(sess, sp.parse_state(json.dumps({"added": shared_state(states.get(str(i), {}), "1")["added"]})))
             panels.append(sp.panel_data(sid, sess, objects))
             overlays.append(sp.overlay(frame, objects, chosen_all))
         cuts = detect_cuts(image) if n > 1 else []
@@ -805,10 +1045,37 @@ class BFSVideoSegmentPicker:
             st(f"camera cuts at frames {cuts}", 0.3, log=True)
         per_subject, report_s = {}, {}
         vkey = video_key(image)
+        lock_picks = {k: frame_state["lock"] for k, frame_state in sorted(states.items()) if frame_state.get("lock")}
+        lock_anchors = sorted(i for i in strip if bool(own_locked[i].any()))
+        locked = None
+        if lock_anchors:
+            lock_key = (vkey, json.dumps(spec, sort_keys=True), json.dumps(lock_picks, sort_keys=True),
+                        tuple(cuts), bool(track), bool(segment_only))
+            cached_lock = _LOCK_CACHE.get(lock_key)
+            if cached_lock is not None:
+                locked = cached_lock
+                _LOCK_CACHE.move_to_end(lock_key)
+            else:
+                locked = torch.zeros((n, h, w), dtype=torch.bool)
+                if track and not segment_only and n > 1:
+                    for s0, s1 in shots_of(n, cuts):
+                        shot_anchors = [a for a in lock_anchors if s0 <= a < s1]
+                        for a in shot_anchors:
+                            st(f"SAM 3: tracking protected object from frame {a} through shot {s0}-{s1 - 1}", 0.3)
+                            tracked = BFSTrackFromFrame().track(
+                                image[s0:s1, ..., :3], sam3_model, own_locked[a][None].float(), a - s0
+                            )[0].detach().cpu() > 0.5
+                            locked[s0:s1] |= tracked
+                for a in lock_anchors:
+                    locked[a] = own_locked[a]
+                _remember(_LOCK_CACHE, lock_key, locked, 16, _PICKER_MASK_CACHE_MAX_BYTES)
         for sj in subjects:
             mine = {k: v[str(sj)] for k, v in sorted(states.items()) if v.get(str(sj))}   # only this subject's picks
             previous = _LAST_TRACK_CACHE.get((vkey, sj))
-            ckey = ("v4", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track), molmo_clip is not None, float(threshold), propagate_scope, propagation_method, active_frame)
+            ckey = ("v4", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track),
+                    (point_model if propagation_method == "MolmoPoint-8B" else molmo_clip) is not None,
+                    float(threshold),
+                    propagate_scope, propagation_method, active_frame, float(clean_masks))
             if (not segment_only and propagate_scope not in ("all frames", "fill only empty masks") and previous is not None
                     and len(previous) > 2 and previous[2] == mine):
                 per_subject[sj], report_s[sj] = previous[0].clone(), [dict(r) for r in previous[1]]
@@ -833,30 +1100,46 @@ class BFSVideoSegmentPicker:
             min_valid_frame = (first_pick if propagate_scope in ("from first selected frame onward", "from active frame onward")
                                else (0 if first_pick == 0 else prev_strip))
             if segment_only:   # picking only: the picked frames' masks (the last propagated masks are kept by the cache)
-                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w)
+                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w, dtype=torch.bool)
                 rp_prev = [dict(r) for r in previous[1]] if previous is not None else [
                     {"frame": i, "source": "empty"} for i in range(n)]
                 for i in user_anchors:
-                    m[i] = own[sj][i]
+                    m[i] = own[sj][i] > 0.5
                     rp_prev[i] = {"frame": i, "source": "picked (pending propagate)"}
                 per_subject[sj] = m
                 report_s[sj] = rp_prev
+                continue
+            if propagate_scope == "fill only empty masks" and previous is not None:
+                # A local correction must not trigger Molmo2 or retrack good frames.
+                # Apply changed picks first, then use nearby existing masks only for gaps.
+                m = previous[0].clone()
+                rep = [dict(r) for r in previous[1]]
+                old_picks = previous[2] if len(previous) > 2 else {}
+                edited = {a for a in user_anchors if mine.get(str(a)) != old_picks.get(str(a))}
+                if fix_frame in user_anchors:
+                    edited.add(fix_frame)
+                for a in sorted(edited):
+                    m[a] = own[sj][a] > 0.5
+                    rep[a] = {"frame": a, "source": "picked (frame fix)"}
+                filled = fill_empty_mask_runs(image, sam3_model, m, rep, shots_of(n, cuts), fix_frame) if track else 0
+                st(f"subject {sj}: {len(edited)} picked frame(s) applied, {filled} empty frame(s) filled; "
+                   "existing masks kept", None, log=True)
+                per_subject[sj] = m > 0.5; report_s[sj] = rep
+                _cache_track_result(ckey, vkey, sj, m, rep, mine)
                 continue
             m = torch.zeros(n, h, w)
             for i in anchors:
                 m[i] = own[sj][i]
             rep = [{"frame": i, "source": "picked" if i in anchors else "empty"} for i in range(n)]
             if propagate_scope == "only this frame":
-                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w)
+                m = previous[0].clone() if previous is not None else torch.zeros(n, h, w, dtype=torch.bool)
                 rep = [dict(r) for r in previous[1]] if previous is not None else [
                     {"frame": i, "source": "empty"} for i in range(n)]
                 if 0 <= fix_frame < n and bool(own[sj].get(fix_frame, torch.zeros(h, w)).any()):
-                    m[fix_frame] = own[sj][fix_frame]
+                    m[fix_frame] = own[sj][fix_frame] > 0.5
                     rep[fix_frame] = {"frame": fix_frame, "source": "picked (frame fix)"}
                 per_subject[sj] = m; report_s[sj] = rep
-                _TRACK_CACHE[ckey] = (m.clone(), [dict(r) for r in rep])
-                _LAST_TRACK_CACHE[(vkey, sj)] = (m.clone(), [dict(r) for r in rep], mine)
-                _LAST_TRACK_CACHE.move_to_end((vkey, sj))
+                _cache_track_result(ckey, vkey, sj, m, rep, mine)
                 continue
             if anchors and track and n > 1:
                 def claimed_at(f):
@@ -869,7 +1152,11 @@ class BFSVideoSegmentPicker:
                 shots = shots_of(n, cuts)
                 shot_of = lambda f: next(k for k, (s0, s1) in enumerate(shots) if s0 <= f < s1)
                 has = [any(s0 <= a < s1 for a in anchors) for s0, s1 in shots]
-                use_molmo = molmo_clip is not None and hasattr(molmo_clip, "runtime")
+                tracker = point_model if propagation_method == "MolmoPoint-8B" else molmo_clip
+                use_molmo = (propagation_method in ("Molmo2 (classic)", "MolmoPoint-8B")
+                             and tracker is not None and hasattr(tracker, "runtime"))
+                if propagation_method == "MolmoPoint-8B" and not use_molmo:
+                    raise ValueError("Connect Auto Download & Load MolmoPoint-8B to point_model.")
                 pts = []
                 if use_molmo:
                     st(f"Molmo2: describing and tracking subject {sj} from frame {first_pick} forward", 0.3 + 0.4 * subjects.index(sj) / len(subjects))
@@ -878,11 +1165,12 @@ class BFSVideoSegmentPicker:
                     desc_override = user_descs[sj - 1] if 0 <= sj - 1 < len(user_descs) and user_descs[sj - 1] else None
                     if desc_override:
                         st(f"Molmo2 subject {sj}: using explicit text description '{desc_override}'", None, log=True)
-                    relocate = molmo_relocate_legacy if propagation_method == "Molmo2 (classic)" else molmo_relocate
-                    if propagation_method == "Molmo2 (classic)":
+                    relocate = molmo_relocate_legacy if propagation_method in ("Molmo2 (classic)", "MolmoPoint-8B") else molmo_relocate
+                    if propagation_method in ("Molmo2 (classic)", "MolmoPoint-8B"):
                         extra, note, pts = relocate(
-                            molmo_clip, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
-                            shots, has, float(threshold), memo=(vkey, sj, float(threshold), desc_override or ""),
+                            tracker, (sam3_model, sam3_clip), image, own[sj][first_pick], first_pick,
+                            shots, has, float(threshold), memo=(vkey, sj, propagation_method, id(tracker.runtime),
+                                                                 float(threshold), desc_override or ""),
                             text_override=desc_override
                         )
                     else:
@@ -905,7 +1193,7 @@ class BFSVideoSegmentPicker:
                                 out[i] = torch.zeros(h, w); rp[i] = "before first pick"
                             continue
                         sa = [a for a in anchors if s0 <= a < s1]
-                        skey = ("v2", vkey, sj, s0, s1, min_valid_frame, tuple((a, mask_key(own[sj][a])) for a in sa), float(threshold))
+                        skey = ("v3", vkey, sj, s0, s1, min_valid_frame, tuple((a, mask_key(own[sj][a])) for a in sa), float(threshold))
                         if skey in _SHOT_CACHE and propagate_scope != "fill only empty masks":   # fill mode retries shots with empty masks instead of reusing a failed track
                             cm, cr = _SHOT_CACHE[skey]
                             _SHOT_CACHE.move_to_end(skey)
@@ -915,24 +1203,25 @@ class BFSVideoSegmentPicker:
                             continue
                         st(f"SAM 3: tracking subject {sj}, shot {si_ + 1}/{len(shots)} (frames {s0}-{s1 - 1})",
                            0.3 + 0.4 * (subjects.index(sj) + si_ / max(1, len(shots))) / len(subjects))
-                        if not sa:
+                        seg_s0 = max(s0, min_valid_frame)
+                        windows = list(anchor_windows(sa, seg_s0, s1))
+                        if not windows:
                             for i in range(s0, s1):
                                 out[i] = torch.zeros(h, w)
                                 rp[i] = "before first pick" if i < first_pick else "lost (no anchor in this shot)"
                             continue
-                        seg_s0 = max(s0, min_valid_frame)
-                        seg = image[seg_s0:s1, ..., :3]
-                        tr = {a: (BFSTrackFromFrame().track(seg, sam3_model, own[sj][a][None], a - seg_s0)[0] if s1 - seg_s0 > 1
-                                  else own[sj][a][None]) for a in sa if a >= seg_s0}
                         for i in range(s0, seg_s0):
                             out[i] = torch.zeros(h, w); rp[i] = "before first pick"
-                        for i in range(seg_s0, s1):
-                            if i in sa:
-                                out[i] = own[sj][i]; rp[i] = "picked" if i in user_anchors else "Molmo2 + SAM"; continue
-                            a = min(tr, key=lambda k: (abs(k - i), k))
-                            out[i] = (tr[a][i - seg_s0] > 0.5).float()
-                            rp[i] = f"tracked from {a}" if bool(out[i].any()) else (
-                                "before first pick" if i < first_pick else f"lost (tracked from {a})")
+                        for a, lo, hi in windows:
+                            seg = image[lo:hi, ..., :3]
+                            tr = (BFSTrackFromFrame().track(seg, sam3_model, own[sj][a][None], a - lo)[0]
+                                  if hi - lo > 1 else own[sj][a][None])
+                            for i in range(lo, hi):
+                                if i in sa:
+                                    out[i] = own[sj][i]; rp[i] = "picked" if i in user_anchors else "Molmo2 + SAM"; continue
+                                out[i] = (tr[i - lo] > 0.5).float()
+                                rp[i] = f"tracked from {a}" if bool(out[i].any()) else (
+                                    "before first pick" if i < first_pick else f"lost (tracked from {a})")
                         if first_pick > seg_s0 and seg_s0 <= first_pick < s1:
                             for i in range(first_pick - 1, seg_s0 - 1, -1):
                                 ok_bwd = (
@@ -955,13 +1244,13 @@ class BFSVideoSegmentPicker:
                                         rp[i] = "before first pick" if i < first_pick else rp[i].replace("tracked from", "lost (tracked from") + (")" if not rp[i].endswith(")") else "")
                         if sa:
                             _remember(_SHOT_CACHE, skey, (torch.stack([out[i] > 0.5 for i in range(s0, s1)]),
-                                                          [rp[i] for i in range(s0, s1)]), 64)
+                            [rp[i] for i in range(s0, s1)]), 64, _PICKER_MASK_CACHE_MAX_BYTES)
                     if kept:
                         st(f"subject {sj}: {kept}/{len(shots)} shots unchanged, reused", None, log=True)
                     return out, rp
 
                 out, rp = track_shots(anchors)
-                if pts and propagation_method == "Molmo2 (classic)":
+                if pts and propagation_method in ("Molmo2 (classic)", "MolmoPoint-8B"):
                     # Classic behavior: Molmo points audit the full SAM track; two nearby misses indicate a lost stretch.
                     off = set()
                     for t_, _o, x_, y_ in pts:
@@ -994,7 +1283,7 @@ class BFSVideoSegmentPicker:
                     if added:
                         st(f"subject {sj}: {added} lost stretches re-anchored by Molmo2 (classic mode), tracking again", None, log=True)
                         out, rp = track_shots(anchors)
-                if pts and propagation_method != "Molmo2 (classic)":   # current mode recovery: verify Molmo points against the selected person's appearance
+                if pts and propagation_method not in ("Molmo2 (classic)", "MolmoPoint-8B"):   # current mode recovery
                     ref_crop = person_crop(image[first_pick, ..., :3], own[sj][first_pick])
                     off = set()
                     for t_, _o, x_, y_ in pts:
@@ -1046,24 +1335,14 @@ class BFSVideoSegmentPicker:
                 for i in range(n):
                     m[i] = out[i]; rep[i] = {"frame": i, "source": rp[i]}
             if propagate_scope == "from active frame onward" and previous is not None:
-                m[:fix_frame] = previous[0][:fix_frame]
+                m[:fix_frame] = previous[0][:fix_frame].to(m.dtype)
                 rep[:fix_frame] = [dict(r) for r in previous[1][:fix_frame]]
-            if propagate_scope == "fill only empty masks" and previous is not None:
-                keep = previous[0] > 0.5
-                m[keep] = previous[0][keep]
-                for i in range(n):
-                    if bool(keep[i].any()):
-                        rep[i] = dict(previous[1][i])
-            per_subject[sj] = m; report_s[sj] = rep
-            _TRACK_CACHE[ckey] = (m.clone(), [dict(r) for r in rep])
-            if not segment_only:
-                _LAST_TRACK_CACHE[(vkey, sj)] = (m.clone(), [dict(r) for r in rep], mine)
-                _LAST_TRACK_CACHE.move_to_end((vkey, sj))
-                while len(_LAST_TRACK_CACHE) > 24:
-                    _LAST_TRACK_CACHE.popitem(last=False)
-            while len(_TRACK_CACHE) > 24:
-                _TRACK_CACHE.popitem(last=False)
-        masks = torch.stack(list(per_subject.values())).amax(0)
+            per_subject[sj] = m > 0.5; report_s[sj] = rep
+            _cache_track_result(ckey, vkey, sj, m, rep, mine, keep_last=not segment_only)
+        if clean_masks > 0:
+            per_subject.update(clean_subject_masks({sj: per_subject[sj] > 0.5 for sj in subjects}, clean_masks / 100.0))
+            st(f"cleaned the masks: pieces under {clean_masks:g}% of a subject joined their surroundings", None, log=True)
+        masks = torch.stack(list(per_subject.values())).amax(0).float()
         anchors = sorted({i for sj in subjects for i in strip if bool(own[sj][i].any())})
         report = [{"frame": i, "subjects": {str(sj): report_s[sj][i]["source"] for sj in subjects}} for i in range(n)]
         if not anchors:
@@ -1071,9 +1350,17 @@ class BFSVideoSegmentPicker:
         color = torch.tensor(sp.parse_color(mark_color), dtype=image.dtype) / 255.0
         a = (masks.to(image.dtype) * float(mark_opacity))[..., None]
         marked = image[..., :3] * (1 - a) + color * a
-        base = (hybrid_base if hybrid_base is not None else image)[..., :3].clone()
+        if mark_style == PROTECTED_NORMAL_STYLE and edge_feather > 0:
+            # The marked output should show the same soft boundary as the H3 guide.
+            feather_px = max(1, round(min(h, w) * float(edge_feather)))
+            for i in range(n):
+                alpha = feather_inside_mask(masks[i] > 0.5, feather_px).to(image.dtype)
+                alpha = (alpha * float(mark_opacity))[..., None]
+                marked[i] = image[i, ..., :3] * (1 - alpha) + color * alpha
+        base_source = (hybrid_base if hybrid_base is not None else image)[..., :3]
+        base = base_source.clone()
         if mark_style.startswith("openpose") and pose_keypoint is None and segment_only:
-            st("picking: DWPose runs on Propagate, the hybrid shows the marks then", None, log=True)
+            st("picking: DWPose runs on Apply fix, then the hybrid shows the marks", None, log=True)
         elif mark_style.startswith("openpose"):
             if pose_keypoint is None:
                 raise ValueError("mark_style 'openpose + face' needs the pose_keypoint input (DWPose Estimator on the same frames).")
@@ -1138,26 +1425,77 @@ class BFSVideoSegmentPicker:
                     drawn = cv.amax(-1) > 0
                     base[i][drawn] = cv[drawn]                             # the skeleton may leave the region: the body is free
         needs_normals = "needs normals" in mark_style and not mark_style.startswith("openpose")
+        if mark_style == PROTECTED_NORMAL_STYLE and normals is None and not segment_only:
+            raise ValueError("'normal map inside mask' needs the normals input from MoGe.")
         if not mark_style.startswith("openpose") and (normals is not None or not needs_normals):
             import torch.nn.functional as F
-            if normals is not None:
+            protected = None
+            if mark_style == PROTECTED_NORMAL_STYLE and protect_mask is not None:
+                protected = protect_mask.detach().float().cpu()
+                if protected.ndim == 2:
+                    protected = protected[None]
+                if protected.ndim != 3 or protected.shape[0] not in (1, n):
+                    raise ValueError("protect_mask must be one mask or one mask per guide frame.")
+                if protected.shape[1:] != (h, w):
+                    protected = F.interpolate(protected[:, None], size=(h, w), mode="nearest")[:, 0]
+                if protected.shape[0] == 1:
+                    protected = protected.expand(n, -1, -1)
+                protected = protected > 0.5
+            if mark_style in (PROTECTED_NORMAL_STYLE, HATCHING_STYLE) and locked is not None:
+                protected = locked if protected is None else (protected | locked)
+            if needs_normals and normals is not None:
                 if normals.shape[0] != n:
                     raise ValueError(f"{normals.shape[0]} normal maps for {n} frames: run MoGe on the same frames.")
                 nm = normals[..., :3].float()
                 if nm.shape[1:3] != (h, w):
                     nm = F.interpolate(nm.movedim(-1, 1), size=(h, w), mode="bilinear", align_corners=False).movedim(1, -1)
                 nm = to_opencv_normals(nm, normals_convention)
-            elif needs_normals:
-                nm = None
             else:
-                nm = torch.full((n, h, w, 3), 0.5)
+                nm = None
             for sj, m in per_subject.items():   # subject j: the j-th color (= Picture j)
-                hm = grow_masks((m > 0.5).float(), float(hybrid_grow)) > 0.5
+                selected = m > 0.5
+                if mark_style in ("translucent overlay", PROTECTED_NORMAL_STYLE, HATCHING_STYLE):
+                    hm = selected
+                elif mark_style == "colored outline":
+                    # Draw inside the selected person only. Keep the scene, held props and
+                    # occluding objects visible instead of painting over the whole mask.
+                    radius = max(1, round(min(h, w) * 0.005))
+                    eroded = 1 - F.max_pool2d((~selected)[:, None].float(), 2 * radius + 1, 1, radius)[:, 0]
+                    hm = selected & (eroded < 0.5)
+                else:
+                    hm = grow_masks(selected.float(), float(hybrid_grow)) > 0.5
                 col = HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)]
+                if mark_style == HATCHING_STYLE:
+                    first = next((mask for mask in selected if bool(mask.any())), None)
+                    ys, xs = torch.where(first) if first is not None else ([], [])
+                    hatch_scale = max(64, min(int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1))) if len(xs) else 64
                 for i in range(n):
                     if bool(hm[i].any()):
-                        fill = mark_fill(mark_style, image[i, ..., :3].float(), nm[i], hm[i], col)
-                        base[i][hm[i]] = fill.to(base.dtype)[hm[i]]
+                        fill = mark_fill(mark_style, image[i, ..., :3].float(), nm[i] if nm is not None else None, hm[i], col)
+                        if mark_style == HATCHING_STYLE:
+                            target = hm[i] if protected is None else hm[i] & ~protected[i]
+                            alpha = hatching_alpha(target, hatch_scale, hatch_width, hatch_spacing)[..., None].to(base.dtype)
+                            base[i] = base[i] * (1 - alpha) + fill.to(base.dtype) * alpha
+                        elif mark_style == PROTECTED_NORMAL_STYLE:
+                            import cv2
+                            import numpy as np
+                            target = hm[i]
+                            if protected is not None:
+                                keep = cv2.dilate(protected[i].numpy().astype(np.uint8),
+                                                  np.ones((5, 5), np.uint8)) > 0
+                                target = target & ~torch.from_numpy(keep)
+                            if bool(target.any()):
+                                feather_px = round(min(h, w) * max(0.0, float(edge_feather)))
+                                alpha = feather_inside_mask(target, feather_px).to(base.dtype)
+                                alpha = alpha[..., None]
+                                base[i] = base[i] * (1 - alpha) + fill.to(base.dtype) * alpha
+                        else:
+                            base[i][hm[i]] = fill.to(base.dtype)[hm[i]]
+        # Apply the same opacity control to the guide sent to H3. Blending against the
+        # original hybrid base preserves stacked pickers and fades both fills and DWPose marks.
+        opacity = min(1.0, max(0.0, float(mark_opacity)))
+        if opacity < 1.0:
+            base = base_source + (base - base_source) * opacity
         lost_runs = []   # stretches where a picked subject has no mask after its first appearance: the panel offers them to add to the strip
         for sj in subjects:
             if not any(r["source"] == "picked" for r in report_s[sj]):
@@ -1171,10 +1509,13 @@ class BFSVideoSegmentPicker:
                 elif run is not None: lost_runs.append({"subject": sj, "start": run[0], "end": run[1]}); run = None
             if run is not None: lost_runs.append({"subject": sj, "start": run[0], "end": run[1]})
         ui = {"bfs_vsegpick": [{"frames": panels, "indices": strip, "report": [report[i] for i in strip], "subjects": subjects,
-                                "count": n, "lost": lost_runs, "timeline": (st("building the timeline previews", 0.9) or timeline_strip(image, per_subject))}]}
+                                "protect_anchors": lock_anchors,
+                                "protected_frames": [bool(locked[i].any()) if locked is not None else False for i in strip],
+                                "count": n, "lost": lost_runs,
+                                "timeline": (st("building the timeline previews", 0.9) or timeline_strip(image, per_subject, locked))}]}
         lost_frames = sum(r["end"] - r["start"] + 1 for r in lost_runs)
         st(f"done: {len(subjects)} subject(s), {lost_frames} frames without a mask", 1.0, log=True)
-        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects}), base)}
+        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects, "active_subjects": [int(sj) for sj in subjects if bool(per_subject[sj].any())], "mark_style": mark_style}), base)}
 
 
 NODE_CLASS_MAPPINGS = {"BFSVideoSegmentPicker": BFSVideoSegmentPicker}

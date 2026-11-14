@@ -11,7 +11,7 @@ NODE = SC.BFSH3KeyframeConditioning
 
 class InputsTest(unittest.TestCase):
     def test_modes(self):
-        self.assertEqual(SC.MODES, ["keyframe pins", "normal map guide", "DWPose guide"])
+        self.assertEqual(SC.MODES, ["keyframe pins", "normal map guide", "DWPose guide", "translucent overlay guide", "outline guide"])
 
     def test_pictures_grouped_first(self):
         t = NODE.INPUT_TYPES()
@@ -45,6 +45,27 @@ class PromptTest(unittest.TestCase):
         self.assertIn("2 keyframes of the target video are pinned at 0.0s, 1.5s", p)
         self.assertIn("<Picture 2>", p)
         self.assertIn("1 keyframe of the target video is pinned at 2.0s", SC.pins_caption(1, [2.0]))
+
+    def test_overlay_prompt(self):
+        prompt = SC.overlay_caption(2)
+        self.assertIn("translucent red overlay", prompt)
+        self.assertIn("translucent blue overlay", prompt)
+        self.assertIn("original appearance visible beneath it is not the target appearance", prompt)
+        self.assertIn("The tint must disappear in the result", prompt)
+        self.assertNotIn("<Picture 3>", prompt)
+
+    def test_outline_prompt_preserves_props(self):
+        prompt = SC.outline_caption(2)
+        self.assertIn("red outline", prompt)
+        self.assertIn("blue outline", prompt)
+        self.assertIn("held or interacting objects", prompt)
+        self.assertIn("foreground occlusions", prompt)
+        self.assertNotIn("<Picture 3>", prompt)
+
+    def test_normal_map_prompt_preserves_occluders(self):
+        prompt = SC.normals_caption(1)
+        self.assertIn("held objects and foreground occluders", prompt)
+        self.assertIn("original positions, shapes and colors", prompt)
 
 
 if __name__ == "__main__":

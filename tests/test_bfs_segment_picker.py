@@ -1,7 +1,10 @@
 import importlib.util
 import json
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -9,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("bfs_segment_picker", ROOT / "bfs_segment_picker.py")
 SP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SP)
+ORIGINAL_DETECT_TEXT = SP.detect_text
+ORIGINAL_DETECT_POINTS = SP.detect_points
 
 
 def rect(h, w, x0, y0, x1, y1):
@@ -75,6 +80,49 @@ class GeometryTest(unittest.TestCase):
         self.assertEqual(SP.parse_color("#FF00FF"), (255, 0, 255))
         self.assertEqual(SP.parse_color("0f0"), (0, 255, 0))
         self.assertEqual(SP.parse_color("nope"), (255, 0, 255))
+
+
+class InferenceModeTest(unittest.TestCase):
+    def test_text_and_point_sam_calls_run_in_inference_mode(self):
+        calls = []
+
+        class FakeDetect:
+            @staticmethod
+            def execute(**kwargs):
+                calls.append(torch.is_inference_mode_enabled())
+                return types.SimpleNamespace(args=(torch.ones(1, 4, 4), [[{"score": 0.9}]]))
+
+        parent = types.ModuleType("comfy_extras")
+        parent.__path__ = []
+        child = types.ModuleType("comfy_extras.nodes_sam3")
+        child.SAM3_Detect = FakeDetect
+        frame = torch.zeros(1, 4, 4, 3)
+        with patch.dict(sys.modules, {"comfy_extras": parent, "comfy_extras.nodes_sam3": child}), \
+             patch.object(SP, "_text_cond", return_value=[]):
+            self.assertEqual(len(ORIGINAL_DETECT_TEXT((None, None), frame, "person", 0.4, 1)), 1)
+            self.assertTrue(ORIGINAL_DETECT_POINTS((None, None), frame, [{"x": 0.5, "y": 0.5, "label": 1}], 0.4).any())
+        self.assertEqual(calls, [True, True])
+
+
+class AutoObjectsTest(unittest.TestCase):
+    def test_rejects_scene_sized_generic_object_but_keeps_person(self):
+        h, w = 20, 40
+        scene = torch.zeros(h, w, dtype=torch.bool)
+        scene[::2, :] = True
+        scene[-1, :] = True
+        person = rect(h, w, 10, 2, 28, 18)
+
+        def detect_text(sam, frame, concept, threshold, max_detections):
+            mask = person if concept == "person" else scene
+            return [(mask, {"score": .9})]
+
+        frame = torch.zeros(1, h, w, 3)
+        with patch.object(SP, "detect_text", side_effect=detect_text):
+            objects = SP.auto_objects((None, None), frame, ["objects", "person"], .4, 8, 0.)
+        with patch.object(SP, "detect_text", return_value=[(scene, {"score": .9})]):
+            large_person = SP.auto_objects((None, None), frame, ["person"], .4, 8, 0.)
+        self.assertEqual([(o["id"], o["label"]) for o in objects], [("a1", "person")])
+        self.assertEqual(len(large_person), 1)
 
 
 class SessionTest(unittest.TestCase):

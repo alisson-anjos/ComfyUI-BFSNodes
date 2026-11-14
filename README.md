@@ -268,7 +268,8 @@ segmented again on load.
 
 Hand edits (1.118.0): **🖌 Brush** paints extra area into the mark (e.g. hair SAM left
 out), **➖ Remove** cuts out what SAM segments at the points you place, and **🧽 Eraser**
-paints what to cut out. Each becomes a chip; unselect it to switch it off. Brush and
+paints what to cut out; **shift** while painting does the opposite of the tool (the brush
+erases, the eraser paints back). Each becomes a chip; unselect it to switch it off. Brush and
 eraser strokes belong to the image they were painted on and are dropped when the image
 changes. Fixed: clicking inside the node no longer shrinks its canvas while the side
 panel is open.
@@ -289,6 +290,23 @@ change (per subject and per shot). After the first Propagate, picking on a frame
 propagates by itself (**auto**). The **Whole video** scrubber shows every frame with
 its masks, the lost stretches in red; **＋ add this frame** puts any frame in the strip
 to fix it. A status line with a progress bar and a log shows what runs.
+
+Hand fixes on a picked frame (1.121.1): **🖌 Brush** paints into the active color's
+mark and **shift** while painting erases from it (e.g. a stray piece of mask over a
+hand). Strokes not applied yet are applied when you change color or frame, or press
+Apply fix, so they are never lost. What any color adds on a frame (brush, points, text)
+is shared by every color there: each color selects from the same objects, and ✕ on an
+added object removes it for all of them.
+
+With an object selected, the brush edits that object's own mask (1.121.2): a stroke grows
+the selected mask it starts on (or the nearest selected one) and shift trims it, with no
+new object on top. The chip shows ✎; ↺ drops the edits.
+
+`clean_masks` cleans the subject masks where people touch (arms around each other, hands
+crossing): on every frame, and on the picked frames before tracking, any piece smaller
+than that % of its subject's area joins what surrounds it. A speck of blue on the red
+arm becomes red, a hole in a mask is filled, a stray bit on the background goes away;
+each subject's main body always stays. 0 = off; 0.5–2 is usually enough.
 
 Outputs: `masks`, `marked` (tinted), `overlay`, `report`, and `hybrid`: the guide
 with each subject drawn in its color, by `mark_style`:
@@ -319,3 +337,25 @@ them with their spec), **BFS Keyframe Marks** / **BFS Track From Frame (SAM 3)**
 tracked person's mask at each keyframe), **BFS Workflow Loop** (run a part of the
 graph once per item, injecting the item and changing widgets per iteration),
 **BFS XY Sweep** (a grid of any two widgets' values) and **BFS Frame Loop Start/End**.
+
+### MiniMax H3 Image character swap
+
+**Auto Subjects:** connect the Picker's `hybrid` and `report` outputs to **BFS H3 Image Character Swap • Auto Subjects**, then connect references to the fixed red, blue and green slots. The node reads the actual selected colors; no manual subject count is needed. The guide is Picture 1 and active references follow from Picture 2 in color order. Blue or green may be used without red. Leave `prompt_override` empty for the generated prompt, or provide a complete replacement prompt; reference selection remains automatic.
+
+**BFS Optional Reference Image** loads a reference or returns no image for `[none]`. Both the target `megapixels` and interpolation `scale_method` are editable; 4 MP + Lanczos are defaults. Aspect ratio is preserved, and empty references skip resizing. Native H3 encoding still applies its own reference-size limits.
+
+The Picker's **colored hatching + contour** mode preserves the source pixels between colored lines, with `hatch_width` and `hatch_spacing` controls. MoGe is not executed for hatching. For normal-map guidance, connect rendered MoGe normals to the Picker and keep its normal convention consistent. The automatic prompt follows the Picker mode. **BFS H3 Image Swap Comparison** shows only active references and labels their actual Picture numbers.
+
+Requires **ComfyUI 0.45.0+** and the H3 Image model, image VAE and matching text encoder.
+
+Use **BFS H3 Image Character Swap Conditioning** with the Picker's single-image `hybrid` as `guide_image`. Connect character references in red, blue and green order. The generated prompt treats the guide as **Picture 1** and the characters as **Pictures 2–4**. Connect `positive` and `latent` to the sampler; the node also outputs the prompt for inspection. Normal map, DWPose, translucent overlay and outline guides are supported.
+
+**Add Guide for MiniMax H3 Image (BFS)** is an optional experimental alignment step. Connect the model, positive conditioning, native image latent, image VAE and marked guide; use its returned MODEL and positive with the sampler. It aligns the guide's frozen reference positions to the target canvas. It does not use the video/audio Add Guide latent format. Structural checks passed; visual equivalence to a video-trained guide LoRA is not guaranteed.
+
+For **MolmoPoint-8B** in Video Segment Picker, connect `point_model` from the loader in [ComfyUI-Molmo2-H3](https://github.com/alisson-anjos/ComfyUI-Molmo2-H3), select `MolmoPoint-8B` in `propagation_method`, and use **Apply fix** with the desired repair scope. SAM 3 still produces the masks.
+
+### Model surgery
+
+**BFS Model Surgery** takes a MODEL and returns a cloned MODEL with reversible weight scaling. Execute once to populate the layer panel; filter names and add scale rules. Rules are a JSON list using `pattern` (glob by default, or `regex: true`), `scale`, optional `enabled`, and optional `rows: [start, exclusive_stop]`. Overlapping rules multiply in list order. Empty rules preserve the model. Connect after LoRA loaders to scale the materialized weights, including their preceding patches. This scales the model weights themselves, rather than just the LoRA delta; CLIP and VAE are separate.
+
+**BFS H3 PDD Surgery** provides experimental shared-base and per-offset controls for native H3 PDD output heads. All strengths at 1 preserve the original model. Setting offsets to zero does **not** recover a pre-distillation checkpoint, and sigmas stay unchanged.

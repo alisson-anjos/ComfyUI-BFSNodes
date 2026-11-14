@@ -1,12 +1,16 @@
 """BFS H3 Character Swap Conditioning: MiniMax H3 Character Swap where the guide says who is replaced.
 
-Three ways to mark the subjects (`mode`):
+Five ways to mark the subjects (`mode`):
   - "keyframe pins": the source video as an aligned guide (Add Guide at frame 0) plus one Add Guide per edited keyframe
     at its own frame index (frames of the result with the new people in place, e.g. from BFS Keyframe Planner).
   - "normal map guide": the guide video with each subject to replace drawn as its normal map in gray detail, tinted with
     the subject's color (1 red, 2 blue, 3 green = Picture 1..3).
   - "DWPose guide": the guide video with each subject erased to gray and drawn as its DWPose skeleton (body, hands and
     face, with the eyes and the mouth opening) in the subject's color.
+  - "translucent overlay guide": the source video with each subject's mask tinted in its color at the Picker's
+    mark_opacity, so the original pose and motion remain visible under the tint.
+  - "outline guide": the source video with a thin colored contour inside each subject's mask; the scene and held
+    objects remain visible.
 The marked guides come from BFS Video Segment Picker (`hybrid` output). The Pictures are native references and the
 prompt is written from the mode and the number of Pictures (or prompt_override).
 """
@@ -17,8 +21,9 @@ import torch
 GRAY = 128.0 / 255.0     # background of the keyframe_video preview
 MAX_KEYFRAMES = 8
 MAX_PICTURES = 3
-PINS, NORMALS, POSE = "keyframe pins", "normal map guide", "DWPose guide"
-MODES = [PINS, NORMALS, POSE]
+PINS, NORMALS, POSE, OVERLAY, OUTLINE = ("keyframe pins", "normal map guide", "DWPose guide",
+                                        "translucent overlay guide", "outline guide")
+MODES = [PINS, NORMALS, POSE, OVERLAY, OUTLINE]
 SUBJECT_COLORS = ["red", "blue", "green"]
 
 
@@ -53,7 +58,46 @@ def normals_caption(k):
             'changes, not where the new look must end, and everything else in the guide is the real video.\n' + defs +
             f'\nsummary: [video editing + reference generation] The target video is the guide video with {who}, from the first frame '
             'to the last, following each mark\'s pose and motion. Every other person, the layout, the backgrounds, the camera and the '
-            'motion stay exactly as in the guide video.\nretention_analysis:\n' + ret + '\nEveryone else, the layout and the backgrounds: fully_preserved.')
+            'motion stay exactly as in the guide video. Keep held objects and foreground occluders in their original '
+            'positions, shapes and colors; they are separate from the subject being replaced.\nretention_analysis:\n' + ret +
+            '\nEveryone else, held objects, foreground occluders, the layout and the backgrounds: fully_preserved.')
+
+
+def overlay_caption(k):
+    """Prompt for the Picker's translucent color overlay, where source appearance is still visible underneath."""
+    C = SUBJECT_COLORS
+    defs = '\n'.join(f'<Subject {j}> is the person under the translucent {C[j - 1]} overlay in the guide video. '
+                     f'Replace that person with <Picture {j}> while keeping their position, pose, motion and timing.'
+                     for j in range(1, k + 1))
+    ret = '\n'.join(f'<Subject {j}>: attribute_transfer - use the face, hair, body and full outfit of <Picture {j}>; '
+                    f'use the {C[j - 1]} marked person only for position, pose, motion and timing.'
+                    for j in range(1, k + 1))
+    return ('character_swap:\nsubject_definitions:\nThe guide is the original video with a translucent color overlay on each '
+            'person to replace. The overlay identifies the person; the original appearance visible beneath it is not the target '
+            'appearance. The tint must disappear in the result.\n' + defs +
+            '\nsummary: [video editing + reference generation] Replace every marked person throughout the video with their '
+            'matching Picture. Keep their actions, camera motion, all unmarked people and the background as in the guide. '
+            'Do not render the colored overlays.\nretention_analysis:\n' + ret +
+            '\nUnmarked people and background: fully_preserved.')
+
+
+def outline_caption(k):
+    """Prompt for a person contour that leaves the original scene and interactions unobscured."""
+    C = SUBJECT_COLORS
+    defs = '\n'.join(f'<Subject {j}> is the person inside the {C[j - 1]} outline in the guide video. '
+                     f'Take their new appearance from <Picture {j}> while retaining their position, pose, motion and timing.'
+                     for j in range(1, k + 1))
+    ret = '\n'.join(f'<Subject {j}>: attribute_transfer - use the face, hair, body and full outfit of <Picture {j}>; '
+                    f'keep the movement and interactions of the {C[j - 1]} outlined person.'
+                    for j in range(1, k + 1))
+    return ('character_swap:\nsubject_definitions:\nThe guide is the original video with a thin colored outline on each '
+            'person to replace. The outline is only an identity marker and must disappear in the result. The source person '
+            'inside the outline provides pose and motion, while their new appearance comes from the matching Picture.\n' + defs +
+            '\nsummary: [video editing + reference generation] Replace only the outlined people throughout the video. '
+            'Preserve the background, other people, and all held or interacting objects with their original colors, positions, '
+            'shapes and contact with the subjects. Preserve foreground occlusions and the camera motion. Do not render the '
+            'colored outlines.\nretention_analysis:\n' + ret +
+            '\nBackground, other people, held objects and occlusions: fully_preserved.')
 
 
 def _tail(k):
@@ -108,8 +152,9 @@ class BFSH3KeyframeConditioning:
             "width": ("INT", {"forceInput": True}), "height": ("INT", {"forceInput": True}), "length": ("INT", {"forceInput": True}),
             "picture_1": ("IMAGE", {"tooltip": "Subject 1 (red mark in the guide modes)."}),
             "mode": (MODES, {"default": PINS, "tooltip": "How the subjects to replace are marked: edited keyframes pinned at their "
-                                                         "frames, or a guide with each subject drawn as a colored normal map or "
-                                                         "DWPose skeleton (BFS Video Segment Picker)."}),
+                                                         "frames, or a guide with each subject drawn as a colored normal map, "
+                                                         "DWPose skeleton, translucent color overlay, or colored outline "
+                                                         "(BFS Video Segment Picker)."}),
             "keyframe_until": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01,
                                          "tooltip": "keyframe pins only, on the returned model: the guides condition every step whose "
                                                     "sigma is at least this; below it only the Pictures remain. 0.5 = more faithful to "
@@ -128,8 +173,9 @@ class BFSH3KeyframeConditioning:
     FUNCTION = "encode"
     CATEGORY = "BFS/MiniMax H3"
     DESCRIPTION = ("MiniMax H3 Character Swap conditioning. keyframe pins: the source video plus one Add Guide per edited "
-                   "keyframe. normal map guide / DWPose guide: the marked guide from BFS Video Segment Picker, subjects 1-4 = "
-                   "red, blue, green, yellow = Picture 1-4. The Pictures as references and the matching prompt.")
+                   "keyframe. Guide modes use the BFS Video Segment Picker hybrid output: normal map, DWPose, translucent "
+                   "overlay or colored outline. Red, blue and green marks correspond to Pictures 1, 2 and 3. "
+                   "The node writes the matching prompt automatically.")
 
     @staticmethod
     def _collect(kw, fps=24.0):
@@ -290,7 +336,7 @@ class BFSH3KeyframeConditioning:
         pictures = [picture_1] + [kw[f"picture_{j}"] for j in range(2, MAX_PICTURES + 1) if kw.get(f"picture_{j}") is not None]
         kfs = self._collect(kw)
         if mode != PINS:
-            return self._guide(clip, vae, guide_video, width, height, length, pictures, prompt_override, model, kw, pose=mode == POSE)
+            return self._guide(clip, vae, guide_video, width, height, length, pictures, prompt_override, model, kw, mode=mode)
         if not kfs:
             raise ValueError("No keyframes: connect the Planner's keyframes + keyframe_spec, or keyframe_1 / time_1.")
         if len(guide_video) != length:
@@ -322,13 +368,14 @@ class BFSH3KeyframeConditioning:
         return (self._until(model, keyframe_until, keyframe_until_drops.startswith("keyframes")), positive, latent, prompt, video,
                 pictures)
 
-    def _guide(self, clip, vae, guide_video, width, height, length, pictures, prompt_override, model, kw, pose=False):
-        """Normal map / DWPose guide: the marked guide (subjects drawn as color-coded marks) as the only aligned guide, every
+    def _guide(self, clip, vae, guide_video, width, height, length, pictures, prompt_override, model, kw, mode=NORMALS):
+        """Marked guide (subjects drawn as color-coded marks) as the only aligned guide, every
         step; the Pictures in color order; no keyframes."""
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide, MiniMaxH3ReferenceToVideo
         if len(guide_video) != length:
             raise ValueError(f"guide has {len(guide_video)} frames, length is {length}: connect Prepare's length.")
-        prompt = prompt_override.strip() or (pose_caption if pose else normals_caption)(len(pictures))
+        captions = {NORMALS: normals_caption, POSE: pose_caption, OVERLAY: overlay_caption, OUTLINE: outline_caption}
+        prompt = prompt_override.strip() or captions[mode](len(pictures))
         print("[BFS H3 keyframe] guide prompt:\n" + prompt, flush=True)
         try:
             positive, latent = MiniMaxH3ReferenceToVideo.execute(

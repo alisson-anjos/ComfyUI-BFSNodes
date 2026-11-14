@@ -2,10 +2,53 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
-## [1.119.6] - 2026-11-09
+## [1.121.3] - 2026-11-14
 
 ### Fixed
 - **BFS Shot H3 Conditioning (`BFSShotH3ConditioningSimple`)**: Reset newly added number and toggle widgets when loading workflows saved with the older `use_ref_2` layout, preventing shifted values such as `blur` from being parsed as `clip_video_fps`.
+
+## [1.121.2] - 2026-11-13
+
+### Added
+- **Segment Picker / Video Segment Picker**: with an object selected, the brush edits that object's mask instead of adding a new object on top: a stroke grows the selected mask it starts on (or the nearest selected one), shift trims it. The chip shows ✎ and ↺ drops the edits. The brush stays on after ✓ Apply painted area.
+- **Video Segment Picker**: `clean_masks` (default 0 = off) cleans the masks where subjects touch: on every frame, and on the picked frames before tracking, any piece smaller than that % of its subject's area joins what surrounds it (stray specks of one color on another subject switch to it, holes are filled, stray bits on the background go away). A subject's largest piece always stays; overlaps elsewhere are left as they were.
+
+## [1.121.1] - 2026-11-13
+
+### Fixed
+- **Video Segment Picker**: a region painted with the brush no longer disappears when you switch to another color and back. Strokes not applied yet are applied to their color before the color or frame changes or a run starts, and the tool and brush size stay selected.
+
+### Changed
+- **Video Segment Picker**: objects added on a frame (brush, points, text) are shared by every color there; each color selects its own. Removing an added object removes it for every color.
+- **Segment Picker / Video Segment Picker**: hold **shift** while painting to do the opposite of the tool: the brush erases from the mark, the eraser paints back. Erasing and painting over the same spot keeps whatever was painted last.
+
+## [1.121.0] - 2026-11-12
+
+### Added
+- **H3 Image Auto Subjects conditioning**: reads the selected colors and guide style from the Picker report, includes only the corresponding character references and generates a matching prompt. Supports non-contiguous colors, an optional full `prompt_override`, and a blocked first pass while the user makes selections.
+- **Optional Reference Image**: an unused `[none]` slot skips loading/resizing. Active images use native proportional resizing with editable `megapixels` and `scale_method` controls (defaults: 4 MP, Lanczos).
+- **H3 Image Swap Comparison**: shows the original, marked guide, active references with their Picture numbering, and result; unused reference branches remain lazy.
+- **H3 Image Character Swap Prompt**: standalone prompt generation, including the new hatching format.
+- **Model Surgery**: inspect model parameter names and shapes, filter layers, and apply reversible scaling rules by glob, regex or row range using native ModelPatcher patches. Includes a browser panel.
+- **H3 PDD Surgery**: experimental independent scaling of the shared output head and PDD offset blocks, without changing sigmas or allocating full-size deltas. It does not undo distillation.
+
+### Changed
+- **Video Segment Picker**: adds colored hatching with a matching contour, editable line width/spacing and protected-object handling. The existing report output now includes the active subject IDs and mark style for automatic downstream conditioning.
+- Register the new modules independently so unavailable optional features do not prevent the rest of BFSNodes from loading.
+
+## [1.120.0] - 2026-11-10
+
+### Added
+- **BFS H3 Image Character Swap Conditioning**: native H3 Image conditioning and automatic still-image prompts. The guide is Picture 1; red, blue and green references are Pictures 2, 3 and 4. Supports normal maps, DWPose, overlays and outlines. Requires ComfyUI 0.45.0 or later.
+- **Add Guide for MiniMax H3 Image (BFS)**: experimental frozen guide reference aligned to the target image positions through a cloned ModelPatcher. Uses native H3 Image latents without an audio stream.
+- **Video Segment Picker**: optional `point_model` input and MolmoPoint-8B tracking method. Connect the loader from ComfyUI-Molmo2-H3.
+- Protected-object selections, a normal-map-inside-mask mode with feathered edges, translucent overlays and colored outlines.
+
+### Fixed
+- Bound picker mask caches by memory size, keep cached masks as boolean tensors and preserve existing masks when filling empty stretches.
+- Track empty stretches and nearest-anchor windows instead of repeatedly recomputing the full clip.
+- Correct SAM inference tensor handling for point edits, rendering invalidation, normal-map lazy input requests and Apply fix messages.
+- Stabilize compare preview sizing; expose memory cleanup after comparison.
 
 ## [1.119.5] - 2026-11-09
 
