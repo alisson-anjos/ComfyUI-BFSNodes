@@ -246,7 +246,7 @@ class BFSH3TokenWeightEditor:
             'weights_json':('STRING',{'default':'{}','multiline':True})},
             'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True}),
                 'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3), one per line. Applies to every exact occurrence in the encoded prompt. No extra CLIP pass.'}),
-                'attention_strength':('FLOAT',{'default':2.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'})}}
+                'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'})}}
     RETURN_TYPES=('CONDITIONING','MODEL','STRING')
     RETURN_NAMES=('positive','model','report')
     FUNCTION='edit';CATEGORY='BFS/MiniMax H3'
@@ -254,7 +254,7 @@ class BFSH3TokenWeightEditor:
         'Does not decode embeddings back into words. Attention mode works with TARA (Flash Partitions) or directly on MiniMax H3 models (T2V/I2V). '
         'No direct edits to visual rows, reference latents or pooled embeddings. Changes take effect on next queue.')
 
-    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=2.0):
+    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0):
         if not conditioning or TRACE not in conditioning[0][1]:
             if clip is None or original_prompt is None:
                 raise ValueError('Connect traced BFS Native Reference Set to Video conditioning, or provide H3 CLIP and the exact original prompt. Embeddings alone cannot be decoded into original words.')
