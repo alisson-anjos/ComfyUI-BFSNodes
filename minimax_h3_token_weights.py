@@ -414,21 +414,23 @@ class BFSH3TokenWeightEditor:
     @classmethod
     def INPUT_TYPES(cls):
         return {'required':{'conditioning':('CONDITIONING',),'model':('MODEL',),
-            'mode':(['attention logits (experimental)','embedding magnitude (experimental)'],{}),
-            'inspect_only':('BOOLEAN',{'default':False,'tooltip':'On: show tokens and stop before sampling. Adjust tokens in the panel; switch off and queue again to render.'}),
-            'weights_json':('STRING',{'default':'{}','multiline':True})},
-            'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True}),
-                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3) or (snowy:-1), or [cat|fox:-1] blending. Supports full annotated prompt.'}),
-                'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'}),
-                'report_format':(['json','compact (changes)','annotated prompt'],{'default':'json','tooltip':'Format for the report output: json (raw indices), compact (changes only, good for video overlays), or annotated prompt (full text with (word:weight)).'}),
-                'start_percent':('FLOAT',{'default':0.0,'min':0.0,'max':1.0,'step':0.01,'tooltip':'Start of the sampling range where token attention weights apply (0.0 = first step).'}),
+            'mode':(['attention logits (experimental)','embedding magnitude (experimental)'],{'tooltip':'attention logits (recommended): modifies attention logits (log(gain) * attention_strength) and scales V for gain < 1.0, bypassing DiT RMSNorm for strong control. embedding magnitude: scales raw input embeddings before DiT (often absorbed by RMSNorm).'}),
+            'inspect_only':('BOOLEAN',{'default':False,'tooltip':'On: populate the token panel and stop before sampling (no GPU render). Switch off and queue again to generate.'}),
+            'weights_json':('STRING',{'default':'{}','multiline':True,'tooltip':'JSON weight map managed by the token panel. Automatically resets if the upstream prompt changes.'})},
+            'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True,'tooltip':'Exact clean prompt sent to the upstream text encoder. Used with CLIP to map token positions without re-encoding.'}),
+                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Synced with the panel. Supports (phrase:weight) from -2.0 to 3.0 (>1 boost, 0.05..0.99 suppress logits+V, 0 zero V, <0 invert V) and [a|b:bias] blending. Does not re-run Qwen3-VL unless [a|b] blending is used.'}),
+                'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Global sensitivity multiplier on attention logit biases (attention_strength * log(gain)). Does not affect tokens at 1.0.'}),
+                'report_format':(['json','compact (changes)','annotated prompt'],{'default':'json','tooltip':'report output format: json (raw indices), compact (changes only, ideal for video overlay labels), or annotated prompt (full text with (word:weight)).'}),
+                'start_percent':('FLOAT',{'default':0.0,'min':0.0,'max':1.0,'step':0.01,'tooltip':'Start of the sampling range where token attention weights apply (0.0 = first step). Keep 0.0..1.0 for full generation.'}),
                 'end_percent':('FLOAT',{'default':1.0,'min':0.0,'max':1.0,'step':0.01,'tooltip':'End of the sampling range where token attention weights apply (1.0 = last step).'})}}
     RETURN_TYPES=('CONDITIONING','MODEL','STRING')
     RETURN_NAMES=('positive','model','report')
     FUNCTION='edit';CATEGORY='BFS/MiniMax H3'
-    DESCRIPTION=('Experimental word/subword controls. Requires traced BFS native H3 conditioning, or the exact original prompt and H3 CLIP. '
-        'Does not decode embeddings back into words. Attention mode works with TARA (Flash Partitions) or directly on MiniMax H3 models (T2V/I2V). '
-        'No direct edits to visual rows, reference latents or pooled embeddings. Changes take effect on next queue.')
+    DESCRIPTION=('Post-encoder per-token/phrase weight editor for MiniMax H3 (T2V, I2V/FL2VA, Ref2V, Image, and TARA). '
+        'Works without re-running Qwen3-VL: upstream encodes the clean prompt once, and this node maps token positions via CPU tokenizer '
+        'and applies weights in DiT attention (or Flash Partitions with TARA). '
+        'Weights (-2.0..3.0): >1.0 boosts attention logits; 0.05..0.99 lowers logits and scales V; 0.0 zeros V (neutralizes); <0.0 inverts V (pushes away). '
+        'Panel tips: click a token, Ctrl/Cmd-click to multi-select, double-click to select all occurrences of a word. Visual tokens are never modified.')
 
     def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0,report_format='json',start_percent=0.0,end_percent=1.0):
         if not conditioning or TRACE not in conditioning[0][1]:

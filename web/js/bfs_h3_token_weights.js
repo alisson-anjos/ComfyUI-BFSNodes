@@ -210,7 +210,7 @@ app.registerExtension({
             style: "width:100%;height:100%;box-sizing:border-box;padding:12px;background:#101725;color:#d9e6ff;border-radius:10px;font:12px system-ui;display:flex;flex-direction:column;gap:8px"
           }, [
             h("b", "H3 · Text token weights"),
-            h("div", "Original tokenizer labels · synced with weighted_phrases"),
+            h("div", "Original tokenizer labels · >1 boost, 0.05–0.99 suppress, 0 zero V, <0 invert V"),
             h("input", {
               value: filter.value,
               onInput: e => { filter.value = e.target.value; },
