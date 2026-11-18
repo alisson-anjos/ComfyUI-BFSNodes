@@ -117,6 +117,21 @@ def test_token_attention_weights_work_without_tara_via_direct_override():
     assert math.isclose(float(captured['v'][0,0,4,0]),0.2,rel_tol=1e-5)
 
 
+def test_token_editor_report_formats():
+    conditioning,_,_=traced()
+    editor=tokens.BFSH3TokenWeightEditor()
+    compact=editor.edit(
+        conditioning,None,mode='embedding magnitude (experimental)',inspect_only=False,
+        weights_json='{"weights":{"0":0.05,"1":3.0}}',report_format='compact (changes)',
+    )['result'][2]
+    assert compact=='embed | (blue:0.05) (shirt:3)'
+    annotated=editor.edit(
+        conditioning,None,mode='embedding magnitude (experimental)',inspect_only=False,
+        weights_json='{"weights":{"0":0.05}}',report_format='annotated prompt',
+    )['result'][2]
+    assert annotated=='(blue:0.05) shirt'
+
+
 def test_new_example_graphs_have_no_cycles_and_keep_original_audio():
     for suffix in ('','_loop'):
         d=json.loads((ROOT/f'examples/h3_tara_cast_sam31{suffix}.api.json').read_text())

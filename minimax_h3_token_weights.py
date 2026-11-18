@@ -237,6 +237,60 @@ def contiguous_ranges(weights,start):
     return result
 
 
+def _grouped_token_phrases(trace,weights):
+    tokens=trace['tokens'];prompt=trace.get('prompt','')
+    groups=[]
+    for index,gain in sorted(weights.items()):
+        if groups and groups[-1][1]+1==index and groups[-1][2]==gain:
+            groups[-1]=(groups[-1][0],index,gain)
+        else:
+            groups.append((index,index,gain))
+    items=[]
+    for a,b,gain in groups:
+        if all('char_start' in tokens[i] and 'char_end' in tokens[i] for i in range(a,b+1)):
+            ca,cb=tokens[a]['char_start'],tokens[b]['char_end']
+            raw=prompt[ca:cb]
+        else:
+            ca=cb=None
+            raw=''.join(tokens[i]['label'] for i in range(a,b+1))
+        lead=raw[:len(raw)-len(raw.lstrip())]
+        trail=raw[len(raw.rstrip()):]
+        core=raw.strip() or raw
+        items.append((a,b,ca,cb,lead,core,trail,gain))
+    return items
+
+
+def format_report(trace,weights,mode,attention_strength,base_weights,report_format='json'):
+    if report_format=='compact (changes)':
+        tag=f'attn x{float(attention_strength):g}' if mode=='attention logits (experimental)' else 'embed'
+        if not weights:return f'{tag} | baseline (no overrides)'
+        parts=[f'({core}:{gain:g})' for _,_,_,_,_,core,_,gain in _grouped_token_phrases(trace,weights)]
+        return f'{tag} | ' + ' '.join(parts)
+    if report_format=='annotated prompt':
+        prompt=trace.get('prompt','')
+        items=_grouped_token_phrases(trace,weights)
+        if items and all(ca is not None for _,_,ca,cb,_,_,_,_ in items):
+            out=[];cursor=0
+            for _,_,ca,cb,lead,core,trail,gain in items:
+                out.append(prompt[cursor:ca])
+                out.append(f'{lead}({core}:{gain:g}){trail}')
+                cursor=cb
+            out.append(prompt[cursor:])
+            return ''.join(out)
+        # Fallback when character offsets are unavailable
+        by_idx={a:(b,lead,core,trail,gain) for a,b,_,_,lead,core,trail,gain in items}
+        out=[];i=0;tokens=trace['tokens']
+        while i<len(tokens):
+            if i in by_idx:
+                b,lead,core,trail,gain=by_idx[i]
+                out.append(f'{lead}({core}:{gain:g}){trail}')
+                i=b+1
+            else:
+                out.append(tokens[i]['label']);i+=1
+        return ''.join(out)
+    return json.dumps(dict(mode=mode,attention_strength=float(attention_strength),weighted_tokens=len(weights),forces=weights,phrase_weighted_tokens=len(base_weights)),indent=2)
+
+
 class BFSH3TokenWeightEditor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -246,7 +300,8 @@ class BFSH3TokenWeightEditor:
             'weights_json':('STRING',{'default':'{}','multiline':True})},
             'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True}),
                 'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3), one per line. Applies to every exact occurrence in the encoded prompt. No extra CLIP pass.'}),
-                'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'})}}
+                'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'}),
+                'report_format':(['json','compact (changes)','annotated prompt'],{'default':'json','tooltip':'Format for the report output: json (raw indices), compact (changes only, good for video overlays), or annotated prompt (full text with (word:weight)).'})}}
     RETURN_TYPES=('CONDITIONING','MODEL','STRING')
     RETURN_NAMES=('positive','model','report')
     FUNCTION='edit';CATEGORY='BFS/MiniMax H3'
@@ -254,7 +309,7 @@ class BFSH3TokenWeightEditor:
         'Does not decode embeddings back into words. Attention mode works with TARA (Flash Partitions) or directly on MiniMax H3 models (T2V/I2V). '
         'No direct edits to visual rows, reference latents or pooled embeddings. Changes take effect on next queue.')
 
-    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0):
+    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0,report_format='json'):
         if not conditioning or TRACE not in conditioning[0][1]:
             if clip is None or original_prompt is None:
                 raise ValueError('Connect traced BFS Native Reference Set to Video conditioning, or provide H3 CLIP and the exact original prompt. Embeddings alone cannot be decoded into original words.')
@@ -307,7 +362,7 @@ class BFSH3TokenWeightEditor:
                     _install_direct_attention(model,spans,float(attention_strength))
         else:raise ValueError('Unknown token weight mode')
         print(f'[BFS H3 Token Editor] sampling enabled; mode={mode}; {len(weights)} weighted text token(s).',flush=True)
-        report=json.dumps(dict(mode=mode,attention_strength=float(attention_strength),weighted_tokens=len(weights),forces=weights,phrase_weighted_tokens=len(base_weights)),indent=2)
+        report=format_report(trace,weights,mode,attention_strength,base_weights,report_format=report_format)
         return {'ui':ui,'result':(conditioning,model,report)}
 
 
