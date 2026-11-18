@@ -2042,7 +2042,11 @@
         "attention logits (experimental)",
         false,
         "{}",
-        ""
+        "",
+        1.0,
+        "json",
+        0.0,
+        1.0
       ]
     },
     {
