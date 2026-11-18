@@ -130,6 +130,11 @@ def test_token_editor_report_formats():
         weights_json='{"weights":{"0":0.05}}',report_format='annotated prompt',
     )['result'][2]
     assert annotated=='(blue:0.05) shirt'
+    plain=editor.edit(
+        conditioning,None,mode='embedding magnitude (experimental)',inspect_only=False,
+        weighted_phrases='blue shirt',report_format='compact (changes)',
+    )['result'][2]
+    assert plain=='embed | baseline (no overrides)'
 
 
 def test_new_example_graphs_have_no_cycles_and_keep_original_audio():

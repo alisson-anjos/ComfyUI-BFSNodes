@@ -78,7 +78,9 @@ def span_weights(trace,spans):
 def phrase_weights(text,trace):
     if not text.strip():return {}
     clean,spans=parse_prompt_weights(text)
-    if not spans:raise ValueError('Use explicit weighted phrases such as (golden fur:1.3)')
+    if not spans:
+        if clean==trace['prompt']:return {}
+        raise ValueError('Use explicit weighted phrases such as (golden fur:1.3)')
     if clean==trace['prompt']:return span_weights(trace,spans)
     covered=[False]*len(clean)
     for span in spans:
@@ -337,7 +339,7 @@ class BFSH3TokenWeightEditor:
             raise ValueError('Token trace overlaps visual or invalid rows; refusing to weight those embeddings')
         norms=tensor[0,rows].detach().float().norm(dim=-1).cpu().tolist()
         records=[dict(r,norm=norms[i],gain=weights.get(i,1.),base_gain=base_weights.get(i,1.)) for i,r in enumerate(trace['tokens'])]
-        ui={'bfs_h3_tokens':[dict(tokens=records,prompt_sha256=trace['prompt_sha256'],mode=mode,
+        ui={'bfs_h3_tokens':[dict(tokens=records,prompt_sha256=trace['prompt_sha256'],prompt=trace['prompt'],mode=mode,
               message=error or ('Inspect only: sampling blocked. Adjust weights, switch inspect_only off, queue again.' if inspect_only else 'Weights applied for this queued execution.'))]}
         if error or inspect_only:
             from comfy_execution.graph_utils import ExecutionBlocker
