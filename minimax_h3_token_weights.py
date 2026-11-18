@@ -180,8 +180,49 @@ def attention_biases(layout,plan,control,device):
     text_stop=next(b for a,b,kind in layout.segments if kind=='text')
     if control['sequence_length']!=text_stop:
         raise ValueError('Token attention weights belong to a different conditioning length; connect this editor MODEL and positive together')
-    return [(start,stop,torch.full((plan.target_stop-plan.target_start,),math.log(gain),device=device))
+    strength=float(control.get('strength',1.0))
+    return [(start,stop,torch.full((plan.target_stop-plan.target_start,),strength*math.log(gain),device=device))
             for start,stop,gain in control['ranges']]
+
+
+def _direct_attention_override(ranges,strength,previous):
+    def override(func,q,k,v,heads,mask=None,**kwargs):
+        k_len=k.shape[-2]
+        valid=[(a,b,g) for a,b,g in ranges if b<=k_len]
+        if valid:
+            v_scaled=None
+            bias_mask=None
+            for start,stop,gain in valid:
+                if gain<1.0:
+                    if v_scaled is None:v_scaled=v.clone()
+                    v_scaled[...,start:stop,:]*=gain
+                bias=strength*math.log(gain)
+                if bias!=0.0:
+                    if bias_mask is None:
+                        if mask is None:bias_mask=q.new_zeros((1,1,1,k_len))
+                        elif mask.dtype!=torch.bool:bias_mask=mask.clone()
+                        else:bias_mask=None
+                    if bias_mask is not None:
+                        bias_mask[...,start:stop]+=bias
+            if v_scaled is not None:v=v_scaled
+            if bias_mask is not None:mask=bias_mask
+        if previous is not None:
+            return previous(func,q,k,v,heads,mask=mask,**kwargs)
+        return func(q,k,v,heads,mask=mask,**kwargs)
+    return override
+
+
+def _install_direct_attention(model,ranges,strength):
+    previous=model.model_options.get('model_function_wrapper')
+    def wrapper(model_function,args):
+        conds=args.get('c',{})
+        to=dict(conds.get('transformer_options',{}))
+        cond_or_uncond=to.get('cond_or_uncond')
+        if cond_or_uncond is None or 0 in cond_or_uncond:
+            to['optimized_attention_override']=_direct_attention_override(ranges,strength,to.get('optimized_attention_override'))
+            args=dict(args,c=dict(conds,transformer_options=to))
+        return previous(model_function,args) if previous else model_function(args['input'],args['timestep'],**args['c'])
+    model.set_model_unet_function_wrapper(wrapper)
 
 
 def contiguous_ranges(weights,start):
@@ -204,15 +245,16 @@ class BFSH3TokenWeightEditor:
             'inspect_only':('BOOLEAN',{'default':False,'tooltip':'On: show tokens and stop before sampling. Adjust tokens in the panel; switch off and queue again to render.'}),
             'weights_json':('STRING',{'default':'{}','multiline':True})},
             'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True}),
-                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3), one per line. Applies to every exact occurrence in the encoded prompt. No extra CLIP pass.'})}}
+                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3), one per line. Applies to every exact occurrence in the encoded prompt. No extra CLIP pass.'}),
+                'attention_strength':('FLOAT',{'default':2.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'})}}
     RETURN_TYPES=('CONDITIONING','MODEL','STRING')
     RETURN_NAMES=('positive','model','report')
     FUNCTION='edit';CATEGORY='BFS/MiniMax H3'
     DESCRIPTION=('Experimental word/subword controls. Requires traced BFS native H3 conditioning, or the exact original prompt and H3 CLIP. '
-        'Does not decode embeddings back into words. Attention mode requires TARA upstream and uses Flash Partitions. '
+        'Does not decode embeddings back into words. Attention mode works with TARA (Flash Partitions) or directly on MiniMax H3 models (T2V/I2V). '
         'No direct edits to visual rows, reference latents or pooled embeddings. Changes take effect on next queue.')
 
-    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases=''):
+    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=2.0):
         if not conditioning or TRACE not in conditioning[0][1]:
             if clip is None or original_prompt is None:
                 raise ValueError('Connect traced BFS Native Reference Set to Video conditioning, or provide H3 CLIP and the exact original prompt. Embeddings alone cannot be decoded into original words.')
@@ -255,17 +297,17 @@ class BFSH3TokenWeightEditor:
                 conditioning=[[edited,dict(meta)]]
         elif mode=='attention logits (experimental)':
             if weights:
-                if not model.model_options.get('bfs_h3_native_temporal_v1'):
-                    raise ValueError('Token attention mode needs TARA upstream; route this MODEL output to the guider and use its positive output together')
                 spans=contiguous_ranges(weights,trace['start'])
                 model=model.clone();opts=dict(model.model_options.get('transformer_options',{}))
                 if OPTION in opts:
                     raise ValueError('Use only one Token Weight Editor per MODEL path')
-                opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans)
+                opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans,strength=float(attention_strength))
                 model.model_options['transformer_options']=opts
+                if not model.model_options.get('bfs_h3_native_temporal_v1'):
+                    _install_direct_attention(model,spans,float(attention_strength))
         else:raise ValueError('Unknown token weight mode')
         print(f'[BFS H3 Token Editor] sampling enabled; mode={mode}; {len(weights)} weighted text token(s).',flush=True)
-        report=json.dumps(dict(mode=mode,weighted_tokens=len(weights),forces=weights,phrase_weighted_tokens=len(base_weights)),indent=2)
+        report=json.dumps(dict(mode=mode,attention_strength=float(attention_strength),weighted_tokens=len(weights),forces=weights,phrase_weighted_tokens=len(base_weights)),indent=2)
         return {'ui':ui,'result':(conditioning,model,report)}
 
 

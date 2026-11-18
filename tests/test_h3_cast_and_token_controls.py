@@ -85,6 +85,38 @@ def test_token_attention_weights_clone_model_and_keep_conditioning_unchanged():
     assert tokens.OPTION not in m.model_options.get('transformer_options',{})
 
 
+def test_token_attention_weights_work_without_tara_via_direct_override():
+    import math
+    import torch
+    class Model:
+        def __init__(self):self.model_options={};self.wrapper=None
+        def clone(self):m=Model();m.model_options=dict(self.model_options);m.wrapper=self.wrapper;return m
+        def set_model_unet_function_wrapper(self,fn):self.wrapper=fn
+    conditioning,_,_=traced();m=Model()
+    out=tokens.BFSH3TokenWeightEditor().edit(
+        conditioning,m,inspect_only=False,
+        weights_json='{"weights":{"0":2.0,"1":0.2}}',
+        attention_strength=2.0,
+    )['result']
+    assert out[0] is conditioning and out[1] is not m and out[1].wrapper is not None
+    captured={}
+    def fake_model(x,t,**c):
+        override=c['transformer_options']['optimized_attention_override']
+        q=torch.zeros((1,2,8,4))
+        k=torch.zeros((1,2,8,4))
+        v=torch.ones((1,2,8,4))
+        def attn(q_,k_,v_,heads,mask=None,**kw):
+            captured['mask']=mask
+            captured['v']=v_
+            return v_
+        return override(attn,q,k,v,2)
+    out[1].wrapper(fake_model,{'input':torch.zeros(1),'timestep':torch.zeros(1),'c':{'transformer_options':{'cond_or_uncond':[0]}}})
+    assert math.isclose(float(captured['mask'][0,0,0,3]),2.0*math.log(2.0),rel_tol=1e-5)
+    assert math.isclose(float(captured['mask'][0,0,0,4]),2.0*math.log(0.2),rel_tol=1e-5)
+    assert math.isclose(float(captured['v'][0,0,3,0]),1.0,rel_tol=1e-5)
+    assert math.isclose(float(captured['v'][0,0,4,0]),0.2,rel_tol=1e-5)
+
+
 def test_new_example_graphs_have_no_cycles_and_keep_original_audio():
     for suffix in ('','_loop'):
         d=json.loads((ROOT/f'examples/h3_tara_cast_sam31{suffix}.api.json').read_text())
