@@ -2,6 +2,14 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.122.4] - 2026-11-18
+
+### Added
+- **BFS H3 Token / Word Weight Editor (`BFSH3TokenWeightEditor`)**:
+  - Pre-run stopword/punctuation dimming (`opacity: 0.55`) to visually separate content words before rendering.
+  - Zero-cost measured DiT attention probe (`bfs_h3_token_impact`) rendered as a distinct gold top bar, `★` badge on high-attention tokens, and percentage in the token tooltip.
+  - Detailed tooltips on all inputs and node description explaining `attention logits` vs `embedding magnitude`, negative weights, and panel shortcuts.
+
 ## [1.122.3] - 2026-11-18
 
 ### Added
