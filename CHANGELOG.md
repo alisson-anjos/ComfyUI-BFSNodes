@@ -2,6 +2,13 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.122.1] - 2026-11-18
+
+### Added
+- **BFS H3 Token / Word Weight Editor (`BFSH3TokenWeightEditor`)**:
+  - `attention logits (experimental)` now works directly on MiniMax H3 models without requiring TARA upstream (enabling Text-to-Video and reference-free workflows via `optimized_attention_override` on positive conditioning).
+  - Added optional `attention_strength` input (default `2.0`, range `0.0`–`5.0`) to scale attention logit biases (`attention_strength * log(gain)`), and added attention `V` scaling for `gain < 1.0` in direct mode for strong concept suppression.
+
 ## [1.122.0] - 2026-11-14
 
 ### Changed
