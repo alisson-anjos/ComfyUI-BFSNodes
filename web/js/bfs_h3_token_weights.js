@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { createApp, h, ref, reactive, computed } from "./vendor/vue.esm-browser.prod.mjs";
 
 function parsePromptWeights(source) {
   function parse(text) {
@@ -114,22 +115,29 @@ app.registerExtension({
     type.prototype.onNodeCreated = function () {
       const result = created?.apply(this, arguments), node = this;
       const host = document.createElement("div");
-      host.style.cssText = "width:100%;height:100%;box-sizing:border-box;padding:12px;background:#101725;color:#d9e6ff;border-radius:10px;font:12px system-ui;display:flex;flex-direction:column;gap:8px";
-      host.innerHTML = `<b>H3 · Text token weights</b><div>Original tokenizer labels · synced with weighted_phrases</div><input class="search" placeholder="Filter token / word…" style="color:#eee;background:#1b2940;padding:5px;border:1px solid #375071"><div class="actions" style="display:flex;gap:6px;align-items:center"><button data-action="minus">−0.1</button><button data-action="plus">+0.1</button><button data-action="reset">Reset selected</button><button data-action="clear">Reset overrides</button></div><div class="selection">Click a token; Ctrl/Cmd-click to select several.</div><div class="tokens" style="flex:1;overflow:auto;min-height:150px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start"></div><div class="status" style="color:#91b2d9">Queue once in inspect-only mode to load tokens. Changes apply on the next queued run.</div>`;
-      const box = host.querySelector(".tokens"), status = host.querySelector(".status"), selected = new Set();
-      let view = null, syncing = false, phrasesHooked = false;
+      host.style.cssText = "width:100%;height:100%;min-width:480px;min-height:370px;box-sizing:border-box";
+
+      const view = ref(null);
+      const filter = ref("");
+      const status = ref("Queue once in inspect-only mode to load tokens. Changes apply on the next queued run.");
+      const selected = reactive(new Set());
+      const docState = ref({});
+      let syncing = false, phrasesHooked = false;
+
       const widget = () => node.widgets?.find(w => w.name === "weights_json");
       const phrasesWidget = () => node.widgets?.find(w => w.name === "weighted_phrases");
-      function doc() { try { return JSON.parse(widget()?.value || "{}"); } catch { return {}; } }
+      function readDoc() { try { return JSON.parse(widget()?.value || "{}"); } catch { return {}; } }
+
       function save(d, updatePhrases = true) {
         syncing = true;
         try {
+          docState.value = d;
           const w = widget();
           if (w) { w.value = JSON.stringify(d); w.callback?.(w.value); }
-          if (updatePhrases && view?.prompt) {
+          if (updatePhrases && view.value?.prompt) {
             const pw = phrasesWidget();
             if (pw) {
-              const nextText = buildAnnotatedPrompt(view.prompt, view.tokens, d.weights || {});
+              const nextText = buildAnnotatedPrompt(view.value.prompt, view.value.tokens, d.weights || {});
               if (pw.value !== nextText) {
                 pw.value = nextText;
                 if (pw.inputEl && pw.inputEl.value !== nextText) pw.inputEl.value = nextText;
@@ -140,14 +148,14 @@ app.registerExtension({
           node.setDirtyCanvas(true, true);
         } finally { syncing = false; }
       }
+
       function syncFromPhrases(text) {
-        if (syncing || !view?.prompt) return;
-        const weights = mapPhrasesToWeights(text, view.tokens, view.prompt);
-        const d = { prompt_sha256: view.prompt_sha256, weights };
-        save(d, false);
-        status.textContent = "Synced from weighted_phrases. Queue to apply.";
-        render();
+        if (syncing || !view.value?.prompt) return;
+        const weights = mapPhrasesToWeights(text, view.value.tokens, view.value.prompt);
+        save({ prompt_sha256: view.value.prompt_sha256, weights }, false);
+        status.value = "Synced from weighted_phrases. Queue to apply.";
       }
+
       function hookPhrasesWidget() {
         if (phrasesHooked) return;
         const pw = phrasesWidget();
@@ -157,42 +165,88 @@ app.registerExtension({
         pw.callback = function (val) { origCb?.apply(this, arguments); syncFromPhrases(val); };
         if (pw.inputEl) pw.inputEl.addEventListener("input", e => syncFromPhrases(e.target.value));
       }
-      function render() {
-        if (!view) return;
-        const d = doc(), valid = !d.prompt_sha256 || d.prompt_sha256 === view.prompt_sha256;
-        const filter = host.querySelector(".search").value.toLowerCase(); box.replaceChildren();
-        const max = Math.max(1, ...view.tokens.map(t => t.norm));
-        for (const token of view.tokens) {
-          if (filter && !`${token.label} ${token.word}`.toLowerCase().includes(filter)) continue;
-          const gain = valid ? Number(d.weights?.[token.index] ?? token.base_gain ?? 1) : Number(token.base_gain ?? 1);
-          const button = document.createElement("button"); button.type = "button";
-          button.textContent = `${token.label.replaceAll("\n", "↵") || "∅"} ×${gain.toFixed(2)}`;
-          button.title = `Token ${token.index} · ID ${token.token_id}\nOriginal word/fragment: ${token.word}\nEmbedding norm: ${token.norm.toFixed(3)}\nNorm is not attention or importance. Double-click selects this word's occurrences.`;
-          button.style.cssText = `font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / max * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`;
-          button.onclick = e => { if (!e.ctrlKey && !e.metaKey) selected.clear(); if (selected.has(token.index)) selected.delete(token.index); else selected.add(token.index); render(); };
-          button.ondblclick = () => { selected.clear(); for (const t of view.tokens) if (t.word === token.word) selected.add(t.index); render(); }; box.append(button);
-        }
-        host.querySelector(".selection").textContent = `${selected.size} selected · click tokens; double-click selects matching word fragments`;
-      }
-      host.querySelector(".search").oninput = render;
-      host.querySelector(".actions").onclick = e => {
-        const action = e.target.dataset.action; if (!action || !view) return;
-        let d = doc();
-        if (action === "clear") { d = { prompt_sha256: view.prompt_sha256, weights: {} }; selected.clear(); }
-        else {
-          if (d.prompt_sha256 && d.prompt_sha256 !== view.prompt_sha256) { status.textContent = "Prompt changed. Reset all before weighting the new text."; return; }
-          d = { ...d, prompt_sha256: view.prompt_sha256, weights: { ...d.weights } };
+
+      function runAction(action) {
+        if (!view.value) return;
+        let d = readDoc();
+        if (action === "clear") {
+          d = { prompt_sha256: view.value.prompt_sha256, weights: {} };
+          selected.clear();
+        } else {
+          if (d.prompt_sha256 && d.prompt_sha256 !== view.value.prompt_sha256) {
+            status.value = "Prompt changed. Reset all before weighting the new text.";
+            return;
+          }
+          d = { ...d, prompt_sha256: view.value.prompt_sha256, weights: { ...d.weights } };
           for (const i of selected) {
-            const base = Number(view.tokens.find(t => t.index === i)?.base_gain ?? 1);
+            const base = Number(view.value.tokens.find(t => t.index === i)?.base_gain ?? 1);
             const gain = action === "reset" ? base : Math.min(3, Math.max(0.05, Math.round((Number(d.weights[i] ?? base) + (action === "plus" ? 0.1 : -0.1)) * 100) / 100));
             if (gain === base) delete d.weights[i]; else d.weights[i] = gain;
           }
         }
-        save(d, true); status.textContent = "Weights changed. Turn inspect_only off and queue to test. Other parameters and seed should stay fixed."; render();
-      };
+        save(d, true);
+        status.value = "Weights changed. Turn inspect_only off and queue to test. Other parameters and seed should stay fixed.";
+      }
+
+      const vueApp = createApp({
+        setup() {
+          const filteredTokens = computed(() => {
+            if (!view.value?.tokens) return [];
+            const q = filter.value.toLowerCase();
+            return q ? view.value.tokens.filter(t => `${t.label} ${t.word}`.toLowerCase().includes(q)) : view.value.tokens;
+          });
+          const maxNorm = computed(() => Math.max(1, ...(view.value?.tokens || []).map(t => t.norm)));
+          const isDocValid = computed(() => !docState.value.prompt_sha256 || docState.value.prompt_sha256 === view.value?.prompt_sha256);
+
+          return () => h("div", {
+            style: "width:100%;height:100%;box-sizing:border-box;padding:12px;background:#101725;color:#d9e6ff;border-radius:10px;font:12px system-ui;display:flex;flex-direction:column;gap:8px"
+          }, [
+            h("b", "H3 · Text token weights"),
+            h("div", "Original tokenizer labels · synced with weighted_phrases"),
+            h("input", {
+              value: filter.value,
+              onInput: e => { filter.value = e.target.value; },
+              placeholder: "Filter token / word…",
+              style: "color:#eee;background:#1b2940;padding:5px;border:1px solid #375071"
+            }),
+            h("div", { style: "display:flex;gap:6px;align-items:center" }, [
+              h("button", { type: "button", onClick: () => runAction("minus") }, "−0.1"),
+              h("button", { type: "button", onClick: () => runAction("plus") }, "+0.1"),
+              h("button", { type: "button", onClick: () => runAction("reset") }, "Reset selected"),
+              h("button", { type: "button", onClick: () => runAction("clear") }, "Reset overrides"),
+            ]),
+            h("div", `${selected.size} selected · click tokens; double-click selects matching word fragments`),
+            h("div", {
+              style: "flex:1;overflow:auto;min-height:150px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start"
+            }, filteredTokens.value.map(token => {
+              const gain = isDocValid.value ? Number(docState.value.weights?.[token.index] ?? token.base_gain ?? 1) : Number(token.base_gain ?? 1);
+              return h("button", {
+                key: token.index,
+                type: "button",
+                title: `Token ${token.index} · ID ${token.token_id}\nOriginal word/fragment: ${token.word}\nEmbedding norm: ${token.norm.toFixed(3)}\nNorm is not attention or importance. Double-click selects this word's occurrences.`,
+                style: `font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / maxNorm.value * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`,
+                onClick: e => {
+                  if (!e.ctrlKey && !e.metaKey) selected.clear();
+                  if (selected.has(token.index)) selected.delete(token.index); else selected.add(token.index);
+                },
+                onDblclick: () => {
+                  selected.clear();
+                  for (const t of view.value.tokens) if (t.word === token.word) selected.add(t.index);
+                }
+              }, `${token.label.replaceAll("\n", "↵") || "∅"} ×${gain.toFixed(2)}`);
+            })),
+            h("div", { style: "color:#91b2d9" }, status.value)
+          ]);
+        }
+      });
+      vueApp.mount(host);
+
       this._bfsTokenPanel = {
         update(d) {
-          view = d; selected.clear(); status.textContent = d.message;
+          view.value = d;
+          selected.clear();
+          status.value = d.message;
+          docState.value = readDoc();
           hookPhrasesWidget();
           const pw = phrasesWidget();
           if (pw && d.prompt && !pw.value?.trim()) {
@@ -205,9 +259,12 @@ app.registerExtension({
               if (pw.inputEl) pw.inputEl.value = nextText;
             } finally { syncing = false; }
           }
-          render();
         }
       };
+
+      const onRemoved = node.onRemoved;
+      node.onRemoved = function () { vueApp.unmount(); return onRemoved?.apply(this, arguments); };
+
       this.addDOMWidget("bfs_h3_token_panel", "div", host, { serialize: false, hideOnZoom: false, getMinHeight: () => 370 });
       this.setSize([Math.max(this.size[0], 550), Math.max(this.size[1], 660)]);
       return result;
