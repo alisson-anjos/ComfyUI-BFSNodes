@@ -2,6 +2,19 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.122.2] - 2026-11-18
+
+### Added
+- **BFS H3 Token / Word Weight Editor (`BFSH3TokenWeightEditor`)**:
+  - Added `report_format` selector (`json`, `compact (changes)`, `annotated prompt`) so the `report` output can be used directly as a human-readable video comparison overlay or annotated prompt string.
+  - Added T2V example workflow `examples/h3_t2v_token_weight_editor.comfy.json`.
+
+### Changed
+- **BFS H3 Token / Word Weight Editor UI & defaults**:
+  - Mounted the token editor panel as a Vue 3 app for Vue Nodes compatibility.
+  - Added auto-fill and bi-directional sync between the token panel and `weighted_phrases`, and ensured `Reset selected` resets tokens to `1.0`.
+  - Changed `attention_strength` default to `1.0`.
+
 ## [1.122.1] - 2026-11-18
 
 ### Added
