@@ -170,6 +170,15 @@ def test_negative_weights_step_window_and_prompt_blending():
     assert math.isclose(float(seen['mask'][0,0,0,4]),math.log(2.0),rel_tol=1e-5)
     # Prompt blending parser
     assert tokens.expand_prompt_blends('a [cat|fox:-1] runs')==[('a cat runs',0.0),('a fox runs',-1.0)]
+    # Negative weight scales V by gain * attention_strength
+    out5=tokens.BFSH3TokenWeightEditor().edit(
+        conditioning,m,inspect_only=False,
+        weights_json='{"weights":{"0":-1.0}}',
+        attention_strength=5.0,
+    )['result']
+    seen.clear()
+    out5[1].wrapper(fake_model,{'input':torch.zeros(1),'timestep':torch.tensor([0.5]),'c':{'transformer_options':{'cond_or_uncond':[0]}}})
+    assert math.isclose(float(seen['v'][0,0,3,0]),-5.0,rel_tol=1e-5)
     # Switching prompt auto-resets stale weights_json & weighted_phrases without blocking
     res=tokens.BFSH3TokenWeightEditor().edit(
         conditioning,m,inspect_only=False,

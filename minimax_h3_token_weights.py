@@ -259,7 +259,10 @@ def _direct_attention_override(ranges,strength,previous,extra_biases=(),probe_st
                     elif mask.dtype!=torch.bool:bias_mask=mask.clone()
                 return bias_mask
             for start,stop,gain in valid:
-                if gain<1.0:
+                if gain<0.0:
+                    if v_scaled is None:v_scaled=v.clone()
+                    v_scaled[...,start:stop,:]*=(gain*strength)
+                elif gain<1.0:
                     if v_scaled is None:v_scaled=v.clone()
                     v_scaled[...,start:stop,:]*=gain
                 if gain>0.0:
