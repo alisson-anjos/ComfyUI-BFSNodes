@@ -1,5 +1,18 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { createApp, h, ref, reactive, computed } from "./vendor/vue.esm-browser.prod.mjs";
+
+const LOW_IMPACT_WORDS = new Set([
+  "a", "an", "the", "of", "in", "on", "at", "to", "for", "from", "by", "with", "through",
+  "into", "onto", "upon", "under", "over", "near", "and", "or", "but", "as", "is", "are",
+  "was", "were", "be", "been", "it", "its", "this", "that", "these", "those"
+]);
+
+function isLowImpactToken(token) {
+  const s = (token.word || token.label || "").trim().toLowerCase();
+  if (!s || /^[\W_]+$/.test(s)) return true;
+  return LOW_IMPACT_WORDS.has(s);
+}
 
 function parsePromptWeights(source) {
   function parse(text) {
@@ -122,7 +135,16 @@ app.registerExtension({
       const status = ref("Queue once in inspect-only mode to load tokens. Changes apply on the next queued run.");
       const selected = reactive(new Set());
       const docState = ref({});
+      const measuredImpacts = ref(null);
       let syncing = false, phrasesHooked = false;
+
+      const onImpactEvent = e => {
+        const d = e?.detail;
+        if (d?.prompt_sha256 && Array.isArray(d.impacts)) {
+          measuredImpacts.value = { sha: d.prompt_sha256, scores: d.impacts };
+        }
+      };
+      api.addEventListener("bfs_h3_token_impact", onImpactEvent);
 
       const widget = () => node.widgets?.find(w => w.name === "weights_json");
       const phrasesWidget = () => node.widgets?.find(w => w.name === "weighted_phrases");
@@ -210,7 +232,7 @@ app.registerExtension({
             style: "width:100%;height:100%;box-sizing:border-box;padding:12px;background:#101725;color:#d9e6ff;border-radius:10px;font:12px system-ui;display:flex;flex-direction:column;gap:8px"
           }, [
             h("b", "H3 · Text token weights"),
-            h("div", "Original tokenizer labels · >1 boost, 0.05–0.99 suppress, 0 zero V, <0 invert V"),
+            h("div", "Original tokenizer labels · >1 boost, 0.05–0.99 suppress, 0 zero V, <0 invert V · gold bar/★ = measured attention"),
             h("input", {
               value: filter.value,
               onInput: e => { filter.value = e.target.value; },
@@ -228,11 +250,16 @@ app.registerExtension({
               style: "flex:1;overflow:auto;min-height:150px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start"
             }, filteredTokens.value.map(token => {
               const gain = isDocValid.value ? Number(docState.value.weights?.[token.index] ?? token.base_gain ?? 1) : Number(token.base_gain ?? 1);
+              const hasMeasured = measuredImpacts.value?.sha === view.value?.prompt_sha256;
+              const impact = hasMeasured ? Number(measuredImpacts.value.scores?.[token.index] ?? 0) : null;
+              const dimmed = !hasMeasured && gain === 1 && isLowImpactToken(token);
+              const star = impact !== null && impact >= 0.55 ? "★ " : "";
+              const impactTip = impact !== null ? `\nMeasured DiT attention: ${Math.round(impact * 100)}%` : (dimmed ? "\nLikely low impact (connector/punctuation)" : "");
               return h("button", {
                 key: token.index,
                 type: "button",
-                title: `Token ${token.index} · ID ${token.token_id}\nOriginal word/fragment: ${token.word}\nEmbedding norm: ${token.norm.toFixed(3)}\nNorm is not attention or importance. Double-click selects this word's occurrences.`,
-                style: `font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain <= 0 ? "#e06c75" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / maxNorm.value * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain <= 0 ? "#f79ca4" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`,
+                title: `Token ${token.index} · ID ${token.token_id}\nOriginal word/fragment: ${token.word}\nEmbedding norm: ${token.norm.toFixed(3)}${impactTip}\nDouble-click selects this word's occurrences.`,
+                style: `position:relative;overflow:hidden;font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;opacity:${dimmed ? "0.55" : "1"};border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain <= 0 ? "#e06c75" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / maxNorm.value * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain <= 0 ? "#f79ca4" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`,
                 onClick: e => {
                   if (!e.ctrlKey && !e.metaKey) selected.clear();
                   if (selected.has(token.index)) selected.delete(token.index); else selected.add(token.index);
@@ -241,7 +268,12 @@ app.registerExtension({
                   selected.clear();
                   for (const t of view.value.tokens) if (t.word === token.word) selected.add(t.index);
                 }
-              }, `${token.label.replaceAll("\n", "↵") || "∅"} ×${gain.toFixed(2)}`);
+              }, [
+                impact !== null ? h("span", {
+                  style: `position:absolute;top:0;left:0;height:3px;width:${Math.round(impact * 100)}%;background:#f5c542;pointer-events:none`
+                }) : null,
+                `${star}${token.label.replaceAll("\n", "↵") || "∅"} ×${gain.toFixed(2)}`
+              ]);
             })),
             h("div", { style: "color:#91b2d9" }, status.value)
           ]);
@@ -279,7 +311,7 @@ app.registerExtension({
       };
 
       const onRemoved = node.onRemoved;
-      node.onRemoved = function () { vueApp.unmount(); return onRemoved?.apply(this, arguments); };
+      node.onRemoved = function () { api.removeEventListener("bfs_h3_token_impact", onImpactEvent); vueApp.unmount(); return onRemoved?.apply(this, arguments); };
 
       this.addDOMWidget("bfs_h3_token_panel", "div", host, { serialize: false, hideOnZoom: false, getMinHeight: () => 370 });
       this.setSize([Math.max(this.size[0], 550), Math.max(this.size[1], 660)]);

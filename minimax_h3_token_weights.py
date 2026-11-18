@@ -217,8 +217,35 @@ def attention_biases(layout,plan,control,device):
     return rows
 
 
-def _direct_attention_override(ranges,strength,previous,extra_biases=()):
+def _emit_token_impact(q,k,start,num_tokens,seq_len,prompt_sha256):
+    if num_tokens<=0 or k.shape[-2]<start+num_tokens or q.shape[-2]<=seq_len:
+        return False
+    try:
+        from server import PromptServer
+        srv=getattr(PromptServer,'instance',None)
+        if srv is None:return False
+        with torch.no_grad():
+            q_sub=q[:,:,seq_len::32,:].float()
+            k_sub=k[:,:,start:start+num_tokens,:].float()
+            if q_sub.shape[2]==0:return False
+            scores=torch.matmul(q_sub,k_sub.transpose(-2,-1))/math.sqrt(q_sub.shape[-1])
+            probs=scores.softmax(dim=-1).mean(dim=(0,1,2))
+            peak=float(probs.max().item())
+            if peak<=0.0:return False
+            impacts=[round(float(x)/peak,3) for x in probs.detach().cpu().tolist()]
+        srv.send_sync('bfs_h3_token_impact',{'prompt_sha256':prompt_sha256,'impacts':impacts})
+        return True
+    except Exception:
+        return False
+
+
+def _direct_attention_override(ranges,strength,previous,extra_biases=(),probe_state=None):
     def override(func,q,k,v,heads,mask=None,**kwargs):
+        if probe_state is not None and not probe_state['done']:
+            probe_state['calls']+=1
+            if probe_state['calls']>=probe_state['target_call']:
+                if _emit_token_impact(q,k,probe_state['start'],probe_state['num_tokens'],probe_state['seq_len'],probe_state['prompt_sha256']):
+                    probe_state['done']=True
         k_len=k.shape[-2]
         valid=[(a,b,g) for a,b,g in ranges if b<=k_len]
         valid_extra=[(a,b,bias) for a,b,bias in extra_biases if b<=k_len and bias!=0.0]
@@ -267,15 +294,24 @@ def _in_step_window(model,args,start_percent,end_percent):
     return True
 
 
-def _install_direct_attention(model,ranges,strength,start_percent=0.0,end_percent=1.0,extra_biases=()):
+def _install_direct_attention(model,ranges,strength,start_percent=0.0,end_percent=1.0,extra_biases=(),probe_cfg=None):
     previous=model.model_options.get('model_function_wrapper')
+    probe_state=dict(probe_cfg,calls=0,done=False,target_call=12) if probe_cfg else None
     def wrapper(model_function,args):
         conds=args.get('c',{})
         to=dict(conds.get('transformer_options',{}))
         cond_or_uncond=to.get('cond_or_uncond')
-        if (cond_or_uncond is None or 0 in cond_or_uncond) and _in_step_window(model,args,start_percent,end_percent):
-            to['optimized_attention_override']=_direct_attention_override(ranges,strength,to.get('optimized_attention_override'),extra_biases=extra_biases)
-            args=dict(args,c=dict(conds,transformer_options=to))
+        if cond_or_uncond is None or 0 in cond_or_uncond:
+            active=(bool(ranges or extra_biases) and _in_step_window(model,args,start_percent,end_percent))
+            need_probe=(probe_state is not None and not probe_state['done'])
+            if active or need_probe:
+                eff_ranges=ranges if active else ()
+                eff_extra=extra_biases if active else ()
+                to['optimized_attention_override']=_direct_attention_override(
+                    eff_ranges,strength,to.get('optimized_attention_override'),
+                    extra_biases=eff_extra,probe_state=probe_state if need_probe else None,
+                )
+                args=dict(args,c=dict(conds,transformer_options=to))
         return previous(model_function,args) if previous else model_function(args['input'],args['timestep'],**args['c'])
     model.set_model_unet_function_wrapper(wrapper)
 
@@ -490,15 +526,17 @@ class BFSH3TokenWeightEditor:
                 for index,gain in weights.items():edited[:,trace['start']+index,:]*=gain
                 conditioning=[[edited,dict(meta)]]
         elif mode=='attention logits (experimental)':
-            if weights or extra_biases:
-                spans=contiguous_ranges(weights,trace['start']) if weights else []
+            spans=contiguous_ranges(weights,trace['start']) if weights else []
+            if model is not None and (weights or extra_biases or not model.model_options.get('bfs_h3_native_temporal_v1')):
                 model=model.clone();opts=dict(model.model_options.get('transformer_options',{}))
                 if OPTION in opts:
                     raise ValueError('Use only one Token Weight Editor per MODEL path')
-                opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans,extra_biases=extra_biases,strength=float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent))
-                model.model_options['transformer_options']=opts
+                if weights or extra_biases:
+                    opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans,extra_biases=extra_biases,strength=float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent))
+                    model.model_options['transformer_options']=opts
                 if not model.model_options.get('bfs_h3_native_temporal_v1'):
-                    _install_direct_attention(model,spans,float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent),extra_biases=extra_biases)
+                    probe_cfg=dict(start=trace['start'],num_tokens=len(trace['tokens']),seq_len=trace['sequence_length'],prompt_sha256=trace['prompt_sha256'])
+                    _install_direct_attention(model,spans,float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent),extra_biases=extra_biases,probe_cfg=probe_cfg)
         else:raise ValueError('Unknown token weight mode')
         print(f'[BFS H3 Token Editor] sampling enabled; mode={mode}; {len(weights)} weighted text token(s).',flush=True)
         report=format_report(trace,weights,mode,attention_strength,base_weights,report_format=report_format)
