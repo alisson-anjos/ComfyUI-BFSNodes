@@ -137,6 +137,50 @@ def test_token_editor_report_formats():
     assert plain=='embed | baseline (no overrides)'
 
 
+def test_negative_weights_step_window_and_prompt_blending():
+    import math
+    import torch
+    class ModelSampling:
+        def percent_to_sigma(self,p):return 1.0-p
+    class Model:
+        def __init__(self):self.model_options={};self.wrapper=None
+        def clone(self):m=Model();m.model_options=dict(self.model_options);m.wrapper=self.wrapper;return m
+        def set_model_unet_function_wrapper(self,fn):self.wrapper=fn
+        def get_model_object(self,name):return ModelSampling() if name=='model_sampling' else None
+    conditioning,_,_=traced();m=Model()
+    out=tokens.BFSH3TokenWeightEditor().edit(
+        conditioning,m,inspect_only=False,
+        weights_json='{"weights":{"0":-1.0,"1":2.0}}',
+        attention_strength=1.0,start_percent=0.2,end_percent=0.6,
+    )['result']
+    seen={}
+    def fake_model(x,t,**c):
+        override=c['transformer_options'].get('optimized_attention_override')
+        q=torch.zeros((1,2,8,4));k=torch.zeros((1,2,8,4));v=torch.ones((1,2,8,4))
+        def attn(q_,k_,v_,heads,mask=None,**kw):
+            seen['mask']=mask;seen['v']=v_;return v_
+        if override:return override(attn,q,k,v,2)
+        return attn(q,k,v,2)
+    # Outside window (sigma=0.9 -> percent 0.1 < 0.2)
+    out[1].wrapper(fake_model,{'input':torch.zeros(1),'timestep':torch.tensor([0.9]),'c':{'transformer_options':{'cond_or_uncond':[0]}}})
+    assert seen['mask'] is None and math.isclose(float(seen['v'][0,0,3,0]),1.0)
+    # Inside window (sigma=0.5 -> percent 0.5 in [0.2, 0.6])
+    out[1].wrapper(fake_model,{'input':torch.zeros(1),'timestep':torch.tensor([0.5]),'c':{'transformer_options':{'cond_or_uncond':[0]}}})
+    assert math.isclose(float(seen['v'][0,0,3,0]),-1.0,rel_tol=1e-5)
+    assert math.isclose(float(seen['mask'][0,0,0,4]),math.log(2.0),rel_tol=1e-5)
+    # Prompt blending parser
+    assert tokens.expand_prompt_blends('a [cat|fox:-1] runs')==[('a cat runs',0.0),('a fox runs',-1.0)]
+    # Switching prompt auto-resets stale weights_json & weighted_phrases without blocking
+    res=tokens.BFSH3TokenWeightEditor().edit(
+        conditioning,m,inspect_only=False,
+        weights_json='{"prompt_sha256":"old-prompt-hash","weights":{"0":2.5}}',
+        weighted_phrases='old prompt text (word:2.0)',
+        report_format='compact (changes)',
+    )
+    assert res['ui']['bfs_h3_tokens'][0]['prompt_changed'] is True
+    assert res['result'][0] is conditioning and res['result'][2]=='attn x1 | baseline (no overrides)'
+
+
 def test_new_example_graphs_have_no_cycles_and_keep_original_audio():
     for suffix in ('','_loop'):
         d=json.loads((ROOT/f'examples/h3_tara_cast_sam31{suffix}.api.json').read_text())

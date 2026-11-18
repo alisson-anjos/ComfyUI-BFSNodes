@@ -362,7 +362,8 @@
         "",
         1,
         "annotated prompt",
-        ""
+        0.0,
+        1.0
       ],
       "widgets_values_named": {
         "mode": "attention logits (experimental)",
@@ -371,7 +372,8 @@
         "weighted_phrases": "",
         "attention_strength": 1,
         "report_format": "annotated prompt",
-        "bfs_h3_token_panel": ""
+        "start_percent": 0.0,
+        "end_percent": 1.0
       }
     },
     {

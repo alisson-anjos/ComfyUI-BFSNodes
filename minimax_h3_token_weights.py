@@ -13,7 +13,32 @@ import torch
 
 TRACE='bfs_h3_prompt_trace'
 OPTION='bfs_h3_token_attention'
+MIN_GAIN=-2.0
+MAX_GAIN=3.0
 _OFFSET_TOKENIZERS=weakref.WeakKeyDictionary()
+_BLEND_RE=re.compile(r'\[([^\[\]]*\|[^\[\]]*)\]')
+_BLEND_OPT_RE=re.compile(r'(.*?)(?::(-?\d*\.?\d+))?\s*$',re.S)
+
+
+def expand_prompt_blends(text):
+    """Expand [a|b:-1] prompt blending groups into (prompt, logit_bias) variants."""
+    matches=list(_BLEND_RE.finditer(text))
+    if not matches:return [(text,0.0)]
+    groups=[]
+    for m in matches:
+        opts=[]
+        for raw in m.group(1).split('|'):
+            opt,bias=_BLEND_OPT_RE.fullmatch(raw.strip()).groups()
+            opts.append((opt,float(bias) if bias is not None else 0.0))
+        groups.append(opts)
+    total=max(len(g) for g in groups)
+    variants=[]
+    for i in range(total):
+        picks=[g[i%len(g)] for g in groups]
+        it=iter(picks)
+        expanded=_BLEND_RE.sub(lambda _:next(it)[0],text)
+        variants.append((expanded,sum(b for _,b in picks)))
+    return variants
 
 
 def parse_prompt_weights(text):
@@ -49,8 +74,8 @@ def parse_prompt_weights(text):
                 suffix=source[colon+1:stop].strip()
                 if re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?',suffix):
                     gain=float(suffix)
-                    if not math.isfinite(gain) or not .05<=gain<=3:
-                        raise ValueError('Inline prompt forces must be finite and between 0.05 and 3')
+                    if not math.isfinite(gain) or not MIN_GAIN<=gain<=MAX_GAIN:
+                        raise ValueError(f'Inline prompt forces must be finite and between {MIN_GAIN:g} and {MAX_GAIN:g}')
             inner,nested=parse(source[i+1:colon] if gain is not None else source[i+1:stop])
             prefix='' if gain is not None else '(';piece=prefix+inner+('' if gain is not None else ')')
             for span in nested:spans.append(dict(start=length+len(prefix)+span['start'],end=length+len(prefix)+span['end'],gain=span['gain']))
@@ -70,8 +95,8 @@ def span_weights(trace,spans):
         for token in trace['tokens']:
             if token['char_start']<span['end'] and token['char_end']>span['start']:
                 index=token['index'];result[index]=result.get(index,1.)*span['gain']
-    if any(not .05<=gain<=3 for gain in result.values()):
-        raise ValueError('Combined nested/overlapping phrase forces must stay between 0.05 and 3')
+    if any(not MIN_GAIN<=gain<=MAX_GAIN for gain in result.values()):
+        raise ValueError(f'Combined nested/overlapping phrase forces must stay between {MIN_GAIN:g} and {MAX_GAIN:g}')
     return result
 
 
@@ -172,8 +197,8 @@ def parse_weights(text,trace):
     result={}
     for key,value in data.get('weights',{}).items():
         index=int(key);gain=float(value)
-        if not 0<=index<len(trace['tokens']) or not math.isfinite(gain) or not .05<=gain<=3:
-            raise ValueError('Token indices must exist and forces must be finite between 0.05 and 3')
+        if not 0<=index<len(trace['tokens']) or not math.isfinite(gain) or not MIN_GAIN<=gain<=MAX_GAIN:
+            raise ValueError(f'Token indices must exist and forces must be finite between {MIN_GAIN:g} and {MAX_GAIN:g}')
         result[index]=gain
     return result
 
@@ -183,29 +208,40 @@ def attention_biases(layout,plan,control,device):
     if control['sequence_length']!=text_stop:
         raise ValueError('Token attention weights belong to a different conditioning length; connect this editor MODEL and positive together')
     strength=float(control.get('strength',1.0))
-    return [(start,stop,torch.full((plan.target_stop-plan.target_start,),strength*math.log(gain),device=device))
-            for start,stop,gain in control['ranges']]
+    rows=[]
+    for start,stop,gain in control['ranges']:
+        bias=strength*math.log(gain if gain>0.0 else 0.05)
+        rows.append((start,stop,torch.full((plan.target_stop-plan.target_start,),bias,device=device)))
+    for start,stop,bias in control.get('extra_biases',()):
+        rows.append((start,stop,torch.full((plan.target_stop-plan.target_start,),float(bias),device=device)))
+    return rows
 
 
-def _direct_attention_override(ranges,strength,previous):
+def _direct_attention_override(ranges,strength,previous,extra_biases=()):
     def override(func,q,k,v,heads,mask=None,**kwargs):
         k_len=k.shape[-2]
         valid=[(a,b,g) for a,b,g in ranges if b<=k_len]
-        if valid:
+        valid_extra=[(a,b,bias) for a,b,bias in extra_biases if b<=k_len and bias!=0.0]
+        if valid or valid_extra:
             v_scaled=None
             bias_mask=None
+            def ensure_mask():
+                nonlocal bias_mask
+                if bias_mask is None:
+                    if mask is None:bias_mask=q.new_zeros((1,1,1,k_len))
+                    elif mask.dtype!=torch.bool:bias_mask=mask.clone()
+                return bias_mask
             for start,stop,gain in valid:
                 if gain<1.0:
                     if v_scaled is None:v_scaled=v.clone()
                     v_scaled[...,start:stop,:]*=gain
-                bias=strength*math.log(gain)
-                if bias!=0.0:
-                    if bias_mask is None:
-                        if mask is None:bias_mask=q.new_zeros((1,1,1,k_len))
-                        elif mask.dtype!=torch.bool:bias_mask=mask.clone()
-                        else:bias_mask=None
-                    if bias_mask is not None:
+                if gain>0.0:
+                    bias=strength*math.log(gain)
+                    if bias!=0.0 and ensure_mask() is not None:
                         bias_mask[...,start:stop]+=bias
+            for start,stop,bias in valid_extra:
+                if ensure_mask() is not None:
+                    bias_mask[...,start:stop]+=bias
             if v_scaled is not None:v=v_scaled
             if bias_mask is not None:mask=bias_mask
         if previous is not None:
@@ -214,14 +250,31 @@ def _direct_attention_override(ranges,strength,previous):
     return override
 
 
-def _install_direct_attention(model,ranges,strength):
+def _in_step_window(model,args,start_percent,end_percent):
+    if start_percent<=0.0 and end_percent>=1.0:
+        return True
+    try:
+        ms=model.get_model_object('model_sampling')
+    except Exception:
+        ms=None
+    if ms is None:
+        return True
+    sigma=float(args['timestep'].flatten()[0])
+    if start_percent>0.0 and sigma>float(ms.percent_to_sigma(start_percent))+1e-5:
+        return False
+    if end_percent<1.0 and sigma<float(ms.percent_to_sigma(end_percent))-1e-5:
+        return False
+    return True
+
+
+def _install_direct_attention(model,ranges,strength,start_percent=0.0,end_percent=1.0,extra_biases=()):
     previous=model.model_options.get('model_function_wrapper')
     def wrapper(model_function,args):
         conds=args.get('c',{})
         to=dict(conds.get('transformer_options',{}))
         cond_or_uncond=to.get('cond_or_uncond')
-        if cond_or_uncond is None or 0 in cond_or_uncond:
-            to['optimized_attention_override']=_direct_attention_override(ranges,strength,to.get('optimized_attention_override'))
+        if (cond_or_uncond is None or 0 in cond_or_uncond) and _in_step_window(model,args,start_percent,end_percent):
+            to['optimized_attention_override']=_direct_attention_override(ranges,strength,to.get('optimized_attention_override'),extra_biases=extra_biases)
             args=dict(args,c=dict(conds,transformer_options=to))
         return previous(model_function,args) if previous else model_function(args['input'],args['timestep'],**args['c'])
     model.set_model_unet_function_wrapper(wrapper)
@@ -293,6 +346,70 @@ def format_report(trace,weights,mode,attention_strength,base_weights,report_form
     return json.dumps(dict(mode=mode,attention_strength=float(attention_strength),weighted_tokens=len(weights),forces=weights,phrase_weighted_tokens=len(base_weights)),indent=2)
 
 
+def _apply_prompt_blends(conditioning,clip,blended_text,trace):
+    variants=expand_prompt_blends(blended_text)
+    if len(variants)<=1:
+        return conditioning,(),{}
+    if clip is None:
+        raise ValueError('Prompt blending [a|b] requires H3 CLIP to be connected')
+    tensor,meta=conditioning[0]
+    tags=meta.get('minimax_token_tags')
+    if tags is None:
+        raise ValueError('Native H3 token tags are required for prompt blending')
+    decoder=clip.tokenizer.qwen3vl_32b
+    new_tensors=[];new_tags=[];new_records=[];extra_biases=[];blend_weights={};prompt_parts=[];char_offset=0
+    for idx,(opt_text,opt_bias) in enumerate(variants):
+        clean_opt,opt_spans=parse_prompt_weights(opt_text)
+        tokens=clip.tokenize(clean_opt)
+        batches=tokens.get('qwen3vl_32b')
+        if not batches or len(batches)!=1:
+            raise ValueError('Prompt blending requires the native H3 Qwen3-VL tokenizer')
+        ids=[int(t[0]) for t in batches[0]]
+        n=len(ids)
+        if idx==0 and clean_opt==trace['prompt']:
+            opt_tensor,opt_tags=tensor,tags.reshape(-1)
+            seg_start=trace['start']
+        else:
+            enc=clip.encode_from_tokens_scheduled(tokens)[0]
+            enc_t,enc_m=enc[0],enc[1]
+            enc_tags=enc_m['minimax_token_tags'].reshape(-1)
+            if idx==0:
+                opt_tensor,opt_tags=enc_t,enc_tags
+                seg_start=enc_t.shape[1]-n
+            else:
+                opt_tensor,opt_tags=enc_t[:,enc_t.shape[1]-n:],enc_tags[enc_tags.shape[0]-n:]
+                seg_start=sum(t.shape[1] for t in new_tensors)
+        new_tensors.append(opt_tensor);new_tags.append(opt_tags)
+        offsets=exact_offsets(getattr(decoder,'tokenizer',None),clean_opt,ids)
+        words=list(re.finditer(r'\S+',clean_opt))
+        base_tok_idx=len(new_records)
+        for ti,tid in enumerate(ids):
+            label=decoder.decode([tid],skip_special_tokens=False)
+            word=label
+            if offsets:
+                a,b=offsets[ti]
+                match=next((m for m in words if m.start()<b and m.end()>a),None)
+                if match:word=match.group()
+            rec=dict(index=base_tok_idx+ti,token_id=tid,label=label,word=word)
+            if offsets:rec.update(char_start=char_offset+int(offsets[ti][0]),char_end=char_offset+int(offsets[ti][1]))
+            new_records.append(rec)
+        for sp in opt_spans:
+            for ti in range(n):
+                rec=new_records[base_tok_idx+ti]
+                if 'char_start' in rec and rec['char_start']-char_offset<sp['end'] and rec['char_end']-char_offset>sp['start']:
+                    k=rec['index'];blend_weights[k]=blend_weights.get(k,1.)*sp['gain']
+        if opt_bias!=0.0:
+            extra_biases.append((seg_start,seg_start+n,float(opt_bias)))
+        prompt_parts.append(clean_opt);char_offset+=len(clean_opt)+3
+    joined_prompt=' | '.join(prompt_parts)
+    merged_tensor=torch.cat(new_tensors,dim=1)
+    merged_tags=torch.cat(new_tags,dim=0)
+    new_trace=dict(prompt_sha256=hashlib.sha256(joined_prompt.encode()).hexdigest(),prompt=joined_prompt,
+                   sequence_length=merged_tensor.shape[1],start=trace['start'],tokens=new_records,inline_spans=[])
+    new_meta=dict(meta,minimax_token_tags=merged_tags,**{TRACE:new_trace})
+    return [[merged_tensor,new_meta]],tuple(extra_biases),blend_weights
+
+
 class BFSH3TokenWeightEditor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -301,9 +418,11 @@ class BFSH3TokenWeightEditor:
             'inspect_only':('BOOLEAN',{'default':False,'tooltip':'On: show tokens and stop before sampling. Adjust tokens in the panel; switch off and queue again to render.'}),
             'weights_json':('STRING',{'default':'{}','multiline':True})},
             'optional':{'clip':('CLIP',),'original_prompt':('STRING',{'forceInput':True}),
-                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3), one per line. Applies to every exact occurrence in the encoded prompt. No extra CLIP pass.'}),
+                'weighted_phrases':('STRING',{'default':'','multiline':True,'tooltip':'Exact phrases such as (golden fur:1.3) or (snowy:-1), or [cat|fox:-1] blending. Supports full annotated prompt.'}),
                 'attention_strength':('FLOAT',{'default':1.0,'min':0.0,'max':5.0,'step':0.1,'tooltip':'Multiplier on attention logit biases in attention mode (higher = stronger emphasis/suppression).'}),
-                'report_format':(['json','compact (changes)','annotated prompt'],{'default':'json','tooltip':'Format for the report output: json (raw indices), compact (changes only, good for video overlays), or annotated prompt (full text with (word:weight)).'})}}
+                'report_format':(['json','compact (changes)','annotated prompt'],{'default':'json','tooltip':'Format for the report output: json (raw indices), compact (changes only, good for video overlays), or annotated prompt (full text with (word:weight)).'}),
+                'start_percent':('FLOAT',{'default':0.0,'min':0.0,'max':1.0,'step':0.01,'tooltip':'Start of the sampling range where token attention weights apply (0.0 = first step).'}),
+                'end_percent':('FLOAT',{'default':1.0,'min':0.0,'max':1.0,'step':0.01,'tooltip':'End of the sampling range where token attention weights apply (1.0 = last step).'})}}
     RETURN_TYPES=('CONDITIONING','MODEL','STRING')
     RETURN_NAMES=('positive','model','report')
     FUNCTION='edit';CATEGORY='BFS/MiniMax H3'
@@ -311,7 +430,7 @@ class BFSH3TokenWeightEditor:
         'Does not decode embeddings back into words. Attention mode works with TARA (Flash Partitions) or directly on MiniMax H3 models (T2V/I2V). '
         'No direct edits to visual rows, reference latents or pooled embeddings. Changes take effect on next queue.')
 
-    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0,report_format='json'):
+    def edit(self,conditioning,model,mode='attention logits (experimental)',inspect_only=False,weights_json='{}',clip=None,original_prompt=None,weighted_phrases='',attention_strength=1.0,report_format='json',start_percent=0.0,end_percent=1.0):
         if not conditioning or TRACE not in conditioning[0][1]:
             if clip is None or original_prompt is None:
                 raise ValueError('Connect traced BFS Native Reference Set to Video conditioning, or provide H3 CLIP and the exact original prompt. Embeddings alone cannot be decoded into original words.')
@@ -325,12 +444,28 @@ class BFSH3TokenWeightEditor:
             raise ValueError('Conditioning length no longer matches token trace')
         error=None
         base_weights={}
+        extra_biases=()
+        prompt_changed=False
         try:
-            base_weights=span_weights(trace,trace.get('inline_spans',[]))
-            extra=phrase_weights(weighted_phrases,trace)
-            for index,gain in extra.items():base_weights[index]=base_weights.get(index,1.)*gain
-            if any(not .05<=g<=3 for g in base_weights.values()):raise ValueError('Combined phrase forces must stay between 0.05 and 3')
-            weights=dict(base_weights);weights.update(parse_weights(weights_json,trace))
+            raw_w=json.loads(weights_json)
+            if isinstance(raw_w,dict) and raw_w.get('prompt_sha256') and raw_w['prompt_sha256']!=trace['prompt_sha256']:
+                prompt_changed=True
+        except (ValueError,TypeError):
+            pass
+        has_blend=(not prompt_changed) and bool(_BLEND_RE.search(weighted_phrases))
+        try:
+            if has_blend:
+                conditioning,extra_biases,base_weights=_apply_prompt_blends(conditioning,clip,weighted_phrases,trace)
+                tensor,meta=conditioning[0];trace=meta[TRACE]
+            else:
+                base_weights=span_weights(trace,trace.get('inline_spans',[]))
+                if not prompt_changed:
+                    extra=phrase_weights(weighted_phrases,trace)
+                    for index,gain in extra.items():base_weights[index]=base_weights.get(index,1.)*gain
+            if any(not MIN_GAIN<=g<=MAX_GAIN for g in base_weights.values()):raise ValueError(f'Combined phrase forces must stay between {MIN_GAIN:g} and {MAX_GAIN:g}')
+            weights=dict(base_weights)
+            if not prompt_changed:
+                weights.update(parse_weights(weights_json,trace))
             weights={i:g for i,g in weights.items() if g!=1}
         except ValueError as exc:weights={};error=str(exc)
         rows=[trace['start']+i for i in range(len(trace['tokens']))]
@@ -339,8 +474,8 @@ class BFSH3TokenWeightEditor:
             raise ValueError('Token trace overlaps visual or invalid rows; refusing to weight those embeddings')
         norms=tensor[0,rows].detach().float().norm(dim=-1).cpu().tolist()
         records=[dict(r,norm=norms[i],gain=weights.get(i,1.),base_gain=base_weights.get(i,1.)) for i,r in enumerate(trace['tokens'])]
-        ui={'bfs_h3_tokens':[dict(tokens=records,prompt_sha256=trace['prompt_sha256'],prompt=trace['prompt'],mode=mode,
-              message=error or ('Inspect only: sampling blocked. Adjust weights, switch inspect_only off, queue again.' if inspect_only else 'Weights applied for this queued execution.'))]}
+        ui={'bfs_h3_tokens':[dict(tokens=records,prompt_sha256=trace['prompt_sha256'],prompt=trace['prompt'],prompt_changed=prompt_changed,mode=mode,
+              message=error or ('Inspect only: sampling blocked. Adjust weights, switch inspect_only off, queue again.' if inspect_only else ('Prompt changed: stale overrides were reset for this run.' if prompt_changed else 'Weights applied for this queued execution.')))]}
         if error or inspect_only:
             from comfy_execution.graph_utils import ExecutionBlocker
             stop=ExecutionBlocker(None)
@@ -353,15 +488,15 @@ class BFSH3TokenWeightEditor:
                 for index,gain in weights.items():edited[:,trace['start']+index,:]*=gain
                 conditioning=[[edited,dict(meta)]]
         elif mode=='attention logits (experimental)':
-            if weights:
-                spans=contiguous_ranges(weights,trace['start'])
+            if weights or extra_biases:
+                spans=contiguous_ranges(weights,trace['start']) if weights else []
                 model=model.clone();opts=dict(model.model_options.get('transformer_options',{}))
                 if OPTION in opts:
                     raise ValueError('Use only one Token Weight Editor per MODEL path')
-                opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans,strength=float(attention_strength))
+                opts[OPTION]=dict(sequence_length=trace['sequence_length'],ranges=spans,extra_biases=extra_biases,strength=float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent))
                 model.model_options['transformer_options']=opts
                 if not model.model_options.get('bfs_h3_native_temporal_v1'):
-                    _install_direct_attention(model,spans,float(attention_strength))
+                    _install_direct_attention(model,spans,float(attention_strength),start_percent=float(start_percent),end_percent=float(end_percent),extra_biases=extra_biases)
         else:raise ValueError('Unknown token weight mode')
         print(f'[BFS H3 Token Editor] sampling enabled; mode={mode}; {len(weights)} weighted text token(s).',flush=True)
         report=format_report(trace,weights,mode,attention_strength,base_weights,report_format=report_format)

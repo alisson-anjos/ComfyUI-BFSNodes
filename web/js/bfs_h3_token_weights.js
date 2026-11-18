@@ -28,7 +28,7 @@ function parsePromptWeights(source) {
         const suffix = text.slice(colon + 1, stop).trim();
         if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(suffix)) {
           const val = Number(suffix);
-          if (Number.isFinite(val) && val >= 0.05 && val <= 3) gain = val;
+          if (Number.isFinite(val) && val >= -2 && val <= 3) gain = val;
         }
       }
       const sub = parse(gain !== null ? text.slice(i + 1, colon) : inside);
@@ -70,7 +70,7 @@ function mapPhrasesToWeights(text, tokens, prompt) {
     for (const t of tokens) {
       if (t.char_start == null || t.char_end == null) continue;
       if (t.char_start < s.end && t.char_end > s.start) {
-        const g = Math.min(3, Math.max(0.05, Math.round(((out[t.index] ?? 1) * s.gain) * 100) / 100));
+        const g = Math.min(3, Math.max(-2, Math.round(((out[t.index] ?? 1) * s.gain) * 100) / 100));
         out[t.index] = g;
       }
     }
@@ -187,7 +187,7 @@ app.registerExtension({
               delete d.weights[i];
             } else {
               const base = Number(tok?.base_gain ?? 1);
-              const gain = Math.min(3, Math.max(0.05, Math.round((Number(d.weights[i] ?? base) + (action === "plus" ? 0.1 : -0.1)) * 100) / 100));
+              const gain = Math.min(3, Math.max(-2, Math.round((Number(d.weights[i] ?? base) + (action === "plus" ? 0.1 : -0.1)) * 100) / 100));
               if (gain === base) delete d.weights[i]; else d.weights[i] = gain;
             }
           }
@@ -232,7 +232,7 @@ app.registerExtension({
                 key: token.index,
                 type: "button",
                 title: `Token ${token.index} · ID ${token.token_id}\nOriginal word/fragment: ${token.word}\nEmbedding norm: ${token.norm.toFixed(3)}\nNorm is not attention or importance. Double-click selects this word's occurrences.`,
-                style: `font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / maxNorm.value * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`,
+                style: `font:12px ui-monospace,monospace;white-space:pre-wrap;padding:6px;border-radius:5px;border:1px solid ${selected.has(token.index) ? "#fff" : gain > 1 ? "#53c9b2" : gain <= 0 ? "#e06c75" : gain < 1 ? "#df9d68" : "#304769"};background:linear-gradient(to top,#233d58 ${token.norm / maxNorm.value * 100}%,#172235 0);color:${gain > 1 ? "#9ff2d9" : gain <= 0 ? "#f79ca4" : gain < 1 ? "#ffca9c" : "#cbd9eb"};cursor:pointer`,
                 onClick: e => {
                   if (!e.ctrlKey && !e.metaKey) selected.clear();
                   if (selected.has(token.index)) selected.delete(token.index); else selected.add(token.index);
@@ -251,21 +251,29 @@ app.registerExtension({
 
       this._bfsTokenPanel = {
         update(d) {
+          const prevDoc = readDoc();
+          const changed = Boolean(d.prompt_changed || (prevDoc.prompt_sha256 && prevDoc.prompt_sha256 !== d.prompt_sha256));
           view.value = d;
           selected.clear();
           status.value = d.message;
-          docState.value = readDoc();
           hookPhrasesWidget();
-          const pw = phrasesWidget();
-          if (pw && d.prompt && !pw.value?.trim()) {
+          if (changed) {
             const weights = {};
             for (const t of d.tokens) if (t.gain != null && t.gain !== 1) weights[t.index] = t.gain;
-            syncing = true;
-            try {
-              const nextText = buildAnnotatedPrompt(d.prompt, d.tokens, weights);
-              pw.value = nextText;
-              if (pw.inputEl) pw.inputEl.value = nextText;
-            } finally { syncing = false; }
+            save({ prompt_sha256: d.prompt_sha256, weights }, true);
+          } else {
+            docState.value = prevDoc;
+            const pw = phrasesWidget();
+            if (pw && d.prompt && !pw.value?.trim()) {
+              const weights = {};
+              for (const t of d.tokens) if (t.gain != null && t.gain !== 1) weights[t.index] = t.gain;
+              syncing = true;
+              try {
+                const nextText = buildAnnotatedPrompt(d.prompt, d.tokens, weights);
+                pw.value = nextText;
+                if (pw.inputEl) pw.inputEl.value = nextText;
+              } finally { syncing = false; }
+            }
           }
         }
       };
@@ -276,6 +284,15 @@ app.registerExtension({
       this.addDOMWidget("bfs_h3_token_panel", "div", host, { serialize: false, hideOnZoom: false, getMinHeight: () => 370 });
       this.setSize([Math.max(this.size[0], 550), Math.max(this.size[1], 660)]);
       return result;
+    };
+    const configure = type.prototype.onConfigure;
+    type.prototype.onConfigure = function () {
+      const r = configure?.apply(this, arguments);
+      for (const [name, fallback] of [["start_percent", 0], ["end_percent", 1], ["attention_strength", 1]]) {
+        const w = this.widgets?.find(x => x.name === name);
+        if (w && (typeof w.value !== "number" || !Number.isFinite(w.value))) w.value = fallback;
+      }
+      return r;
     };
     const executed = type.prototype.onExecuted;
     type.prototype.onExecuted = function (message) { executed?.apply(this, arguments); const d = message?.bfs_h3_tokens?.[0]; if (d) this._bfsTokenPanel?.update(d); };

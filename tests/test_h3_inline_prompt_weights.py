@@ -33,7 +33,7 @@ def test_explicit_syntax_nested_literal_escapes_and_invalid_forces():
     assert w.parse_prompt_weights('a (blue:1.3')==('a (blue:1.3',[])
     for text in ('At (00:03.333), move.', '(Shot 1 at 00:03)', 'Ratio (32:64)'):
         assert w.parse_prompt_weights(text)==(text,[])
-    for text in ('(red:0)','(red:-1)','(red:3.1)','(:1.2)'):
+    for text in ('(red:-2.1)','(red:3.1)','(:1.2)'):
         with pytest.raises(ValueError):w.parse_prompt_weights(text)
 
 

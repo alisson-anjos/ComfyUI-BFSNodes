@@ -2,6 +2,19 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.122.3] - 2026-11-18
+
+### Added
+- **BFS H3 Token / Word Weight Editor (`BFSH3TokenWeightEditor`)**:
+  - Added negative weight support (`-2.0` to `3.0`) via direct attention `V` scaling for `gain <= 0`.
+  - Added `start_percent` and `end_percent` step-window controls for direct attention mode.
+  - Added `[a|b:bias]` prompt blending support when `clip` is connected.
+
+### Fixed
+- **BFS H3 Token / Word Weight Editor**:
+  - Automatically resets stale `weights_json` / `weighted_phrases` when the upstream prompt changes instead of blocking generation.
+  - Added `onConfigure` widget sanitization so older saved workflows load cleanly with the new `start_percent` / `end_percent` inputs.
+
 ## [1.122.2] - 2026-11-18
 
 ### Added
