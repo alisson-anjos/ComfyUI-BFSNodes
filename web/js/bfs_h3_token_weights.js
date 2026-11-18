@@ -152,6 +152,7 @@ app.registerExtension({
       function syncFromPhrases(text) {
         if (syncing || !view.value?.prompt) return;
         const weights = mapPhrasesToWeights(text, view.value.tokens, view.value.prompt);
+        for (const t of view.value.tokens) t.base_gain = 1;
         save({ prompt_sha256: view.value.prompt_sha256, weights }, false);
         status.value = "Synced from weighted_phrases. Queue to apply.";
       }
@@ -170,6 +171,7 @@ app.registerExtension({
         if (!view.value) return;
         let d = readDoc();
         if (action === "clear") {
+          for (const t of view.value.tokens) t.base_gain = 1;
           d = { prompt_sha256: view.value.prompt_sha256, weights: {} };
           selected.clear();
         } else {
@@ -179,9 +181,15 @@ app.registerExtension({
           }
           d = { ...d, prompt_sha256: view.value.prompt_sha256, weights: { ...d.weights } };
           for (const i of selected) {
-            const base = Number(view.value.tokens.find(t => t.index === i)?.base_gain ?? 1);
-            const gain = action === "reset" ? base : Math.min(3, Math.max(0.05, Math.round((Number(d.weights[i] ?? base) + (action === "plus" ? 0.1 : -0.1)) * 100) / 100));
-            if (gain === base) delete d.weights[i]; else d.weights[i] = gain;
+            const tok = view.value.tokens.find(t => t.index === i);
+            if (action === "reset") {
+              if (tok) tok.base_gain = 1;
+              delete d.weights[i];
+            } else {
+              const base = Number(tok?.base_gain ?? 1);
+              const gain = Math.min(3, Math.max(0.05, Math.round((Number(d.weights[i] ?? base) + (action === "plus" ? 0.1 : -0.1)) * 100) / 100));
+              if (gain === base) delete d.weights[i]; else d.weights[i] = gain;
+            }
           }
         }
         save(d, true);
