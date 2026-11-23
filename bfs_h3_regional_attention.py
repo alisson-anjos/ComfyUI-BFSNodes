@@ -21,6 +21,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+import comfy.patcher_extension
+
 from .bfs_video_segment_picker import HYBRID_COLORS
 
 PLAN_KEY = "bfs_h3_regional_plan"
@@ -467,6 +469,22 @@ def biased_attention(q, k, v, bias, skip_output_reshape):
     return out if skip_output_reshape else out.transpose(1, 2).reshape(B, S, H * D)
 
 
+def _sparse_conflict(model_options):
+    """A reason when another patch takes the attention calls away from this node (sol-attn / block-sparse attention,
+    or any DiT block replacement), else None. Those patches run their own kernel and never call this node's override."""
+    from .minimax_h3_sparse_compat import official_sparse_module
+    topts = model_options.get("transformer_options", {})
+    override = topts.get("optimized_attention_override")
+    blocks = (topts.get("patches_replace", {}) or {}).get("dit", {}) or {}
+    if override is not None and official_sparse_module(override):
+        return "Model Sparse Attention (sol-attn) is active"
+    if any(official_sparse_module(cb) for cb in blocks.values()):
+        return "a block-sparse attention patch replaces the DiT blocks"
+    if blocks:
+        return "another node replaces the DiT blocks"
+    return None
+
+
 class BFSH3RegionalReferenceAttention:
     @classmethod
     def INPUT_TYPES(cls):
@@ -506,7 +524,9 @@ class BFSH3RegionalReferenceAttention:
     DESCRIPTION = ("Routes each reference picture to its own person inside the attention, without masks: the guide's colored "
                    "face contours seed each person, the model's own features follow them through the video, and a soft bias "
                    "makes person j read Picture j (color order) and the background read no picture. Works with H3 video "
-                   "and H3 Image face swap. Recommended: routing soft, strength 4, background 4, bias_layers 'from route layer'.")
+                   "and H3 Image face swap. Recommended: routing soft, strength 4, background 4, bias_layers 'from route layer'. "
+                   "Not compatible with Model Sparse Attention (sol-attn) or other block-sparse / block-replacing "
+                   "attention nodes: they skip this node (a warning is logged). SageAttention and plain SDPA work.")
 
     def apply(self, model, positive, isolation="people", outside_subjects="no picture", dilate=1, guide=None, subject_map=None,
               route_layer=12, margin=0.05, routing="soft", strength=4.0, sharpness=0.05, background=4.0, tracking="propagate", radius=3, bias_layers="from route layer"):
@@ -538,6 +558,16 @@ class BFSH3RegionalReferenceAttention:
         topts = dict(m.model_options.get("transformer_options", {}))
         topts["optimized_attention_override"] = make_override(cfg, topts.get("optimized_attention_override"))
         m.model_options["transformer_options"] = topts
+        warned = {}
+
+        def check_sparse(model_patcher, timestep, model_options):
+            why = _sparse_conflict(model_options)
+            if why and not warned:
+                warned[why] = True
+                logging.warning(f"[BFS H3 Regional Attention] {why}: its own attention kernel skips this node on the "
+                                "calls it takes, so the picture routing is off there (fully off when the tracking layer is "
+                                "one of them). Remove that patch to use Regional Reference Attention.")
+        m.add_callback_with_key(comfy.patcher_extension.CallbacksMP.ON_PREPARE_STATE, "bfs_regional_sparse_check", check_sparse)
         logging.info(f"[BFS H3 Regional Attention] {('attention tracking from ' + ('subject_map seeds' if subject_map is not None else 'guide contours')) if guide is not None else 'subject masks (hard)'}, routing: {routing}, isolation: {isolation}")
         return (m,)
 

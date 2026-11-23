@@ -7,6 +7,13 @@ the H3 video face swap (Ref2VA) and the H3 Image face swap.
 **Interactive explainer** (side-by-side videos, the mechanism, live simulators for every parameter):
 https://claude.ai/artifact/KFuYAX6zLgtMejj5QZuc3H
 
+> **Attention backends.** Works with PyTorch SDPA / FlashAttention and SageAttention
+> (`--use-sage-attention`). **Not compatible with Model Sparse Attention (sol-attn)** or other
+> block-sparse / block-replacing attention nodes: they run their own kernel on the calls they take and
+> never pass them to this node, so the routing is silently off there, and fully off when block
+> `route_layer` is one of them. The node logs a warning when it detects one. Remove the sparse node
+> while using Regional Reference Attention.
+
 ![Regional Reference Attention](docs/illustrations/h3_regional_attention.png)
 
 ## The problem
@@ -70,6 +77,22 @@ Connect the same `positive` that goes to the sampler. The node only reads it to 
 When the node finds no contour colors, the console prints `no contour colors found in the guide: attention tracking is
 off`. When the picker could not draw a face's line, it prints `no contour found for picture(s) [...]`, and that picture
 stays neutral.
+
+## Attention backends
+
+| backend | works | notes |
+|---|---|---|
+| PyTorch SDPA / FlashAttention | yes | the normal path |
+| SageAttention (`--use-sage-attention`) | yes | blocks before `route_layer` stay on Sage; the biased blocks run PyTorch SDPA (the bias needs extra head dimensions), so they lose Sage's speedup |
+| Attention backends that swap the default function (e.g. Model Attention Backend) | likely | same as Sage: unbiased blocks keep the backend; not tested |
+| **Model Sparse Attention (sol-attn)**, VSA | **no** | the sparse node puts itself on top of every other attention override (and re-installs each step) and replaces the H3 blocks; its kernel never calls this node, so tracking and bias are skipped |
+| other block-sparse nodes (e.g. Spark-H3) | probably not | if they replace the blocks or do not pass calls down the override chain, the routing is skipped |
+
+Making the two work together needs one of:
+- the sparse kernel leaving the biased blocks to this node, which drops most of the speedup;
+- the bias implemented inside the sparse kernel, with text, guide and picture blocks always kept (sinks).
+
+Neither exists yet.
 
 ## Parameters
 

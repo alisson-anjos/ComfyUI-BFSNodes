@@ -338,7 +338,8 @@ Routes each reference picture to its own person inside MiniMax H3's attention, w
 masks: the picker's face contours seed each person, the model's own features follow them,
 and a soft bias makes person j read Picture j and the background read no picture. It fixes
 swapped identities, the weak second person and identity leaking onto unpicked people in
-multi face swap (video and H3 Image). See [how it works, wiring and results](H3_REGIONAL_ATTENTION.md)
+multi face swap (video and H3 Image). Not compatible with Model Sparse Attention (sol-attn),
+which skips it. See [how it works, wiring and results](H3_REGIONAL_ATTENTION.md)
 and the [interactive explainer](https://claude.ai/artifact/KFuYAX6zLgtMejj5QZuc3H).
 
 ### MiniMax H3 Image character swap
