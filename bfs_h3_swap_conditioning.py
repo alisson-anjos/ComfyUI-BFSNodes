@@ -11,6 +11,8 @@ Five ways to mark the subjects (`mode`):
     mark_opacity, so the original pose and motion remain visible under the tint.
   - "outline guide": the source video with a thin colored contour inside each subject's mask; the scene and held
     objects remain visible.
+  - "colored hatching + contour": colored hatching lines and a matching contour on each subject (the H3 Image swap
+    format; experimental on video).
 The marked guides come from BFS Video Segment Picker (`hybrid` output). The Pictures are native references and the
 prompt is written from the mode and the number of Pictures (or prompt_override).
 """
@@ -20,11 +22,13 @@ import torch
 
 GRAY = 128.0 / 255.0     # background of the keyframe_video preview
 MAX_KEYFRAMES = 8
-MAX_PICTURES = 3
-PINS, NORMALS, POSE, OVERLAY, OUTLINE = ("keyframe pins", "normal map guide", "DWPose guide",
-                                        "translucent overlay guide", "outline guide")
-MODES = [PINS, NORMALS, POSE, OVERLAY, OUTLINE]
-SUBJECT_COLORS = ["red", "blue", "green"]
+MAX_PICTURES = 6
+PINS, NORMALS, POSE, OVERLAY, OUTLINE, HATCH = ("keyframe pins", "normal map guide", "DWPose guide",
+                                               "translucent overlay guide", "outline guide", "colored hatching + contour")
+SPARSE_HATCH = "sparse hatching (multi swap v7)"   # experimental: Video Segment Picker settings mode 'sparse hatching'
+SPARSE_FACE = "sparse face contour (multi face swap)"   # experimental: Video Segment Picker settings mode 'sparse face contour'
+MODES = [PINS, NORMALS, POSE, OVERLAY, OUTLINE, HATCH, SPARSE_HATCH, SPARSE_FACE]
+SUBJECT_COLORS = ["red", "blue", "green", "yellow", "magenta", "cyan"]
 
 
 def pose_caption(k):
@@ -100,6 +104,23 @@ def outline_caption(k):
             '\nBackground, other people, held objects and occlusions: fully_preserved.')
 
 
+def hatching_caption(k):
+    """The H3 Image swap hatching prompt, worded for a guide video (experimental: that LoRA was trained on stills)."""
+    C = SUBJECT_COLORS
+    defs = ' '.join(f'<Subject {j}> is identified by the {C[j - 1]} hatching lines and matching {C[j - 1]} contour in the guide video; '
+                    f'its complete appearance comes from <Picture {j}>.' for j in range(1, k + 1))
+    return ('character_swap: subject_definitions: The guide video is the source video. Colored hatching lines and matching contours '
+            'identify the subjects to replace; the visible pixels between the lines provide pose, motion, expression, lighting and '
+            'scene context. ' + defs +
+            ' summary: [video editing + reference generation] Replace each marked subject with its assigned reference character in '
+            'every frame. Remove all colored lines and contours from the result. retention_analysis: Transfer the face, hair, skin, '
+            'body proportions and complete outfit from each assigned reference. Preserve the source pose, motion, hand positions, '
+            'head orientation, gaze and facial expression. Adapt each replacement to the source lighting, shadows and exposure. '
+            'Do not copy the pose or lighting of the reference. Do not retain the original marked subject\'s identity or clothing. '
+            'Preserve every unmarked person, the background, held objects, foreground occluders and the camera motion. '
+            'The hatching identifies who changes and does not constrain the replacement silhouette.')
+
+
 def _tail(k):
     subs = '\n'.join(f'<Subject {j}> is the person of the guide video who appears with the look of <Picture {j}> in the '
                      f'keyframes; the appearance comes from <Picture {j}>, the motion from the guide video.' for j in range(1, k + 1))
@@ -153,7 +174,8 @@ class BFSH3KeyframeConditioning:
             "picture_1": ("IMAGE", {"tooltip": "Subject 1 (red mark in the guide modes)."}),
             "mode": (MODES, {"default": PINS, "tooltip": "How the subjects to replace are marked: edited keyframes pinned at their "
                                                          "frames, or a guide with each subject drawn as a colored normal map, "
-                                                         "DWPose skeleton, translucent color overlay, or colored outline "
+                                                         "DWPose skeleton, translucent color overlay, colored outline, or colored "
+                                                         "hatching + contour (the H3 Image swap format, experimental on video) "
                                                          "(BFS Video Segment Picker)."}),
             "keyframe_until": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01,
                                          "tooltip": "keyframe pins only, on the returned model: the guides condition every step whose "
@@ -374,7 +396,11 @@ class BFSH3KeyframeConditioning:
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide, MiniMaxH3ReferenceToVideo
         if len(guide_video) != length:
             raise ValueError(f"guide has {len(guide_video)} frames, length is {length}: connect Prepare's length.")
-        captions = {NORMALS: normals_caption, POSE: pose_caption, OVERLAY: overlay_caption, OUTLINE: outline_caption}
+        from .bfs_h3_multi_swap_prompt import multi_swap_prompt, face_swap_prompt
+        captions = {NORMALS: normals_caption, POSE: pose_caption, OVERLAY: overlay_caption, OUTLINE: outline_caption,
+                    HATCH: hatching_caption, SPARSE_HATCH: lambda k: multi_swap_prompt(range(1, k + 1)),
+                    # one frame = the face swap IMAGE LoRA's prompt, more = the video one
+                    SPARSE_FACE: lambda k: face_swap_prompt(range(1, k + 1), image=length == 1)}
         prompt = prompt_override.strip() or captions[mode](len(pictures))
         print("[BFS H3 keyframe] guide prompt:\n" + prompt, flush=True)
         try:

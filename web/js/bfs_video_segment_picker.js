@@ -12,7 +12,23 @@ import { createApp, h, ref, reactive } from "./vendor/vue.esm-browser.prod.mjs";
 
 const fileUrl = f => api.apiURL(`/view?filename=${encodeURIComponent(f.filename)}&subfolder=${encodeURIComponent(f.subfolder || "")}&type=${f.type || "temp"}`);
 
-const SUBJECTS = [["1", "#eb2828", "red"], ["2", "#236eeb", "blue"], ["3", "#3ccd3c", "green"]];
+const SUBJECTS = [["1", "#eb2828", "red"], ["2", "#236eeb", "blue"], ["3", "#3ccd3c", "green"],
+                  ["4", "#f0cd1e", "yellow"], ["5", "#dc32dc", "magenta"], ["6", "#1ecde1", "cyan"]];
+// Experimental settings panel: the mode decides which options show; the classic widgets it replaces are hidden.
+const MODES = {
+  classic: { label: "Classic", hide: [] },
+  "sparse hatching": { label: "Multi Character Swap — Sparse Hatching", hide: ["mark_style", "hybrid_grow", "pose_region", "pose_gray_opacity",
+    "normals_convention", "edge_feather", "hatch_width", "hatch_spacing", "mark_color"] },
+  "sparse face contour": { label: "Multi Face Swap — Sparse Face Contour", hide: ["mark_style", "hybrid_grow", "pose_region", "pose_gray_opacity",
+    "normals_convention", "edge_feather", "hatch_width", "hatch_spacing", "mark_color"] },
+};
+const SPARSE = m => m === "sparse hatching" || m === "sparse face contour";
+const DEFAULTS = { mode: "classic", moments: 4, hatch_width: 1.0, hatch_spacing: 1.0, mark_after_cuts: true, mark_picked: false, placement: "auto", face_hatching: false };
+function parseSettings(text) {
+  let s = {};
+  try { s = JSON.parse(text || "{}") || {}; } catch { s = {}; }
+  return { ...DEFAULTS, ...(typeof s === "object" ? s : {}) };
+}
 function parse(text) {   // {frame: {subject: selection}}; a bare selection (older state) is subject 1
   let s = {};
   try { s = JSON.parse(text || "{}") || {}; } catch { s = {}; }
@@ -44,7 +60,7 @@ function styles() {
 .bvsp .btn.pri{background:var(--accent);border-color:#4b8ff7;color:#fff;font-weight:600}
 .bvsp .btn.pri:hover{background:#4b8ff7}
 .bvsp .chk{display:flex;align-items:center;gap:4px;color:var(--muted);font-size:11px;cursor:pointer;user-select:none}
-.bvsp .subj{display:flex;gap:4px}
+.bvsp .subj{display:flex;gap:4px;flex-wrap:wrap}
 .bvsp .subj .t{display:flex;align-items:center;gap:5px;border:1px solid var(--line);background:#23262c;border-radius:999px;padding:3px 10px 3px 6px;cursor:pointer;color:var(--muted);font-weight:600}
 .bvsp .subj .t .clr{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;margin-left:4px;font-size:10px;line-height:1;background:rgba(255,255,255,.15);color:#fff;cursor:pointer}
 .bvsp .subj .t .clr:hover{background:#f43f5e;color:#fff}
@@ -124,6 +140,63 @@ app.registerExtension({
       widget.serializeValue = () => widget.value;
     }
     const frames = reactive({ v: parse(widget?.value) });
+    const settingsWidget = node.widgets?.find(w => w.name === "settings");
+    if (settingsWidget) {
+      settingsWidget.type = "hidden"; settingsWidget.hidden = true; settingsWidget.computeSize = () => [0, -4];
+      settingsWidget.options = { ...(settingsWidget.options || {}), hidden: true, serialize: true };
+      settingsWidget.serializeValue = () => settingsWidget.value;
+    }
+    const cfg = reactive(parseSettings(settingsWidget?.value));
+    const applyMode = () => {   // hide the classic widgets the mode replaces, keep their values
+      const hide = new Set(MODES[cfg.mode]?.hide || []);
+      for (const w of node.widgets || []) {
+        if (w.name === "selection" || w.name === "settings" || w.type === "hidden" && !w._bfsModeHidden) continue;
+        if (hide.has(w.name)) {
+          if (!w._bfsModeHidden) { w._bfsModeHidden = { type: w.type, computeSize: w.computeSize }; w.type = "hidden"; w.hidden = true; w.computeSize = () => [0, -4]; }
+        } else if (w._bfsModeHidden) {
+          w.type = w._bfsModeHidden.type; w.computeSize = w._bfsModeHidden.computeSize; w.hidden = false; delete w._bfsModeHidden;
+        }
+      }
+      node.setSize?.([node.size[0], node.size[1]]);
+      node.graph?.setDirtyCanvas(true, true);
+    };
+    const saveSettings = () => { if (settingsWidget) settingsWidget.value = JSON.stringify({ ...cfg }); applyMode(); };
+    const num = (key, label, min, max, step, title) => h("label", { class: "chk", title }, [label,
+      h("input", { type: "number", min, max, step, value: cfg[key], style: "width:58px;background:#23262c;color:#e3e6eb;border:1px solid #3a3e47;border-radius:6px;padding:2px 4px;font:inherit",
+        onChange: e => { const v = Math.min(max, Math.max(min, +e.target.value || DEFAULTS[key])); cfg[key] = v; e.target.value = v; saveSettings(); } })]);
+    const flag = (key, label, title) => h("label", { class: "chk", title }, [
+      h("input", { type: "checkbox", checked: !!cfg[key], onChange: e => { cfg[key] = e.target.checked; saveSettings(); } }), label]);
+    const settingsCard = () => h("div", { class: "card" }, [
+      h("div", { class: "row" }, [
+        h("span", { style: "font-weight:600" }, "Mode"),
+        h("select", { value: cfg.mode, title: "Experimental: the options below change with the mode",
+          style: "background:#23262c;color:#e3e6eb;border:1px solid #3a3e47;border-radius:6px;padding:4px;font:inherit",
+          onChange: e => { cfg.mode = e.target.value; saveSettings(); } },
+          Object.entries(MODES).map(([k, m]) => h("option", { value: k }, m.label))),
+        h("span", { class: "sp" }),
+        h("span", { class: "muted" }, "experimental"),
+      ]),
+      SPARSE(cfg.mode) ? h("div", { class: "row", style: "flex-wrap:wrap" }, [
+        h("label", { class: "chk", title: "auto: the node picks the marked windows. manual: only the frames where you clicked a subject are marked for it" }, ["marks",
+          h("select", { value: cfg.placement, style: "background:#23262c;color:#e3e6eb;border:1px solid #3a3e47;border-radius:6px;padding:2px 4px;font:inherit",
+            onChange: e => { cfg.placement = e.target.value; saveSettings(); } },
+            [h("option", { value: "auto" }, "auto"), h("option", { value: "manual" }, "manual (frames I click)")])]),
+        cfg.placement === "manual" ? null : num("moments", "moments per subject", 1, 6, 1, "How many latent windows (4 frames each) get the hatching: the first and the last where the subject shows, the rest evenly in between"),
+        cfg.mode === "sparse face contour" ? flag("face_hatching", "hatching inside the face", "Experimental: also draw colored hatching lines inside the face contour (the face swap LoRAs were trained on the contour only)") : null,
+        cfg.mode === "sparse hatching" || cfg.mode === "sparse face contour" && cfg.face_hatching ? num("hatch_width", "line width", 0.25, 4, 0.05, "Hatching line and contour thickness. 1 = training format") : null,
+        cfg.mode === "sparse hatching" || cfg.mode === "sparse face contour" && cfg.face_hatching ? num("hatch_spacing", "spacing", 0.25, 4, 0.05, "Hatching line spacing. 1 = training format") : null,
+      ]) : null,
+      SPARSE(cfg.mode) && cfg.placement !== "manual" ? h("div", { class: "row", style: "flex-wrap:wrap" }, [
+        flag("mark_after_cuts", "mark after cuts and returns", "Always mark the first window after each camera cut and each time a subject comes back after missing"),
+        flag("mark_picked", "also mark the frames I clicked", "The windows of the frames where you picked a subject are always marked for that subject"),
+      ]) : null,
+      cfg.mode === "sparse face contour" ? h("div", { class: "muted" },
+        "Face swap: pick each person (subject N = color N = Picture N, up to 4). A thin line in that color is drawn on the inner border of their face, only in the marked moments (InsightFace landmarks).") : null,
+      cfg.mode === "sparse hatching" ? h("div", { class: "muted" },
+        cfg.placement === "manual"
+        ? "Subject N = color N = Picture N (up to 6). Click a subject on each frame you want marked (add frames from the timeline); 1-6 per subject, first and last appearance work best."
+        : "Subject N = color N = Picture N (up to 6). Always marked: first and last appearance (and cuts/returns when on); the other moments are spread evenly.") : null,
+    ]);
     let focusFrame = 0;
     const scopeWidget = node.widgets?.find(w => w.name === "propagate_scope");
     const validScopes = ["all frames", "only this frame", "from active frame onward", "from first selected frame onward", "fill only empty masks"];
@@ -280,6 +353,7 @@ app.registerExtension({
     };
     createApp({
       setup: () => () => h("div", { class: "bvsp" }, [
+        settingsCard(),
         h("div", { class: "card" }, [
           h("div", { class: "row" }, [
             h("div", { class: "subj" }, [...SUBJECTS.map(([k, col, name]) => h("span", {
@@ -395,6 +469,7 @@ app.registerExtension({
       setTimeout(() => {
         let saved = {};
         try { saved = JSON.parse(widget?.value || "{}"); } catch { /* ignore */ }
+        Object.assign(cfg, parseSettings(settingsWidget?.value)); applyMode();
         frames.v = parse(widget?.value); focusFrame = Number.isInteger(+saved.active_frame) ? +saved.active_frame : 0;
         if (scopeWidget?.value) scope.value = scopeWidget.value;
         mountPanel();
@@ -402,5 +477,6 @@ app.registerExtension({
       return r;
     };
     node.size = [Math.max(node.size[0], 780), Math.max(node.size[1], 1180)];
+    setTimeout(applyMode, 0);
   },
 });

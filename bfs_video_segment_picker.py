@@ -21,8 +21,96 @@ from .bfs_keyframe_marks import BFSTrackFromFrame
 
 MAX_FRAMES = 32           # frames segmented for the panel; a longer video shows an evenly spread strip
 # the hybrid guide: subject k drawn without its texture (e.g. its normal map in gray detail), tinted with its color
-HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60)]   # RGB: red, blue, green
+HYBRID_COLORS = [(235, 40, 40), (35, 110, 235), (60, 205, 60), (240, 205, 30), (220, 50, 220), (30, 205, 225)]
+HYBRID_COLOR_NAMES = ["red", "blue", "green", "yellow", "magenta", "cyan"]   # RGB above; subject j = color j = Picture j
+SPARSE_HATCHING = "sparse hatching"   # settings mode: hatching only in a few latent windows per subject (multi swap v7)
+SPARSE_FACE = "sparse face contour"   # settings mode: a thin colored line on the inner border of each subject's face (face swap)
+SPARSE_MODES = (SPARSE_HATCHING, SPARSE_FACE)
+_FACE_APP = None
+
+
+def face_app():
+    """InsightFace detector + 106-point landmarks (ComfyUI/models/insightface/models/buffalo_l), loaded once."""
+    global _FACE_APP
+    if _FACE_APP is None:
+        import os
+        import folder_paths
+        from insightface.app import FaceAnalysis
+        root = os.path.join(folder_paths.models_dir, "insightface")
+        _FACE_APP = FaceAnalysis(name="buffalo_l", root=root, allowed_modules=["detection", "landmark_2d_106"],
+                                 providers=["CPUExecutionProvider"])
+        _FACE_APP.prepare(ctx_id=-1, det_size=(640, 640))
+    return _FACE_APP
+
+
+def face_contour_overlay(frame_rgb01, subject_mask, color, hatch=False, hatch_width=1.0, hatch_spacing=1.0):
+    """Draw the face swap training mark on one frame: the face inside the subject mask (largest overlap) gets a thin line in
+    `color` on its inner border (jaw + brows hull, shrunk 6%), thickness ~ face width / 70. Returns the frame (0..1) or
+    None when no face of the subject is found."""
+    import cv2
+    import numpy as np
+    img = (frame_rgb01.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    faces = [f for f in face_app().get(bgr) if getattr(f, "landmark_2d_106", None) is not None]
+    if not faces:
+        return None
+    m = subject_mask.cpu().numpy().astype(bool)
+    def overlap(f):
+        x0, y0, x1, y1 = [int(v) for v in f.bbox]
+        x0, y0 = max(0, x0), max(0, y0); x1, y1 = min(m.shape[1], x1), min(m.shape[0], y1)
+        return m[y0:y1, x0:x1].mean() if x1 > x0 and y1 > y0 else 0.0
+    f = max(faces, key=overlap)
+    if overlap(f) < 0.2:
+        return None
+    lm = f.landmark_2d_106
+    pts = np.concatenate([lm[0:33], lm[43:52], lm[97:106]]).astype(np.float32)
+    hull = cv2.convexHull(pts)[:, 0]; c = hull.mean(0); hull = c + (hull - c) * 0.94
+    w = f.bbox[2] - f.bbox[0]
+    out = img.copy()
+    if hatch:   # experimental: colored hatching inside the face hull too (the face swap LoRAs were trained on the contour only)
+        fm = np.zeros(m.shape, np.uint8); cv2.fillPoly(fm, [hull.astype(np.int32)], 1)
+        a = hatching_alpha(torch.from_numpy(fm).bool(), float(w), hatch_width, hatch_spacing).numpy()[..., None]
+        out = (out * (1 - a) + np.array(color, np.float32)[None, None] * a).round().clip(0, 255).astype(np.uint8)
+    cv2.polylines(out, [hull.astype(np.int32)], True, tuple(int(v) for v in color), max(2, int(round(w / 70))), cv2.LINE_AA)
+    return torch.from_numpy(out).float() / 255.0
+
 HYBRID_TINT = 0.75
+
+
+def parse_settings(text):
+    """The panel's settings JSON -> dict (mode, moments, ...); {} when empty or invalid."""
+    try:
+        s = json.loads(text or "{}")
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def latent_window(j):
+    """Frames of H3 video latent j: latent 0 is frame 0 alone, latent j > 0 covers frames 4j-3..4j."""
+    return [0] if j == 0 else list(range(4 * j - 3, 4 * j + 1))
+
+
+def sparse_mark_frames(present, n, moments, cuts=(), forced=()):
+    """Frames to mark for one subject, in whole latent windows where it is present (the multi swap v7 training format).
+    Always marked: the first and the last window, the first window after every camera cut and after every return (the
+    subject was missing for at least one window), and the windows of the forced frames. The rest of the moments, up to
+    `moments` in all, are spread evenly in between. present: bool per frame; cuts: first frames of new shots."""
+    window_of = lambda f: 0 if f == 0 else (f + 3) // 4
+    windows = [j for j in range((n - 1) // 4 + 1) if any(present[f] for f in latent_window(j) if f < n)]
+    if not windows:
+        return []
+    must = {windows[0], windows[-1]}
+    must |= {b for a, b in zip(windows, windows[1:]) if b > a + 1}            # returns after a gap
+    for c in cuts:                                                               # first present window from each cut on
+        after = [j for j in windows if j >= window_of(int(c))]
+        if after:
+            must.add(after[0])
+    must |= {window_of(int(f)) for f in forced if 0 <= int(f) < n and window_of(int(f)) in windows}
+    rest = [j for j in windows if j not in must]
+    k = min(len(rest), max(0, int(moments) - len(must)))
+    picks = sorted(must | {rest[round((i + 1) * (len(rest) + 1) / (k + 1)) - 1] for i in range(k)})
+    return [f for j in picks for f in latent_window(j) if f < n and present[f]]
 
 
 def hybrid_tint(normal_rgb, color, alpha=HYBRID_TINT):
@@ -840,8 +928,8 @@ class BFSVideoSegmentPicker:
                                   "tooltip": "openpose mark: how opaque the gray region is (1.0 = fully hidden). Lower lets the "
                                              "background show through, but also the original person (clothes, body), which the "
                                              "result may then copy."}),
-            "max_subjects": (["auto", "1", "2", "3"], {"default": "auto",
-                             "tooltip": "Limit active subjects: 'auto' automatically detects connected picture inputs in downstream H3 conditioning (ignoring extra subjects like green if only 2 pictures are connected), or force 1, 2, or 3."}),
+            "max_subjects": (["auto", "1", "2", "3", "4", "5", "6"], {"default": "auto",
+                             "tooltip": "Limit active subjects: 'auto' automatically detects connected picture inputs in downstream H3 conditioning (ignoring extra subjects like green if only 2 pictures are connected), or force 1 to 6."}),
             "propagate_scope": (["all frames", "from first selected frame onward", "only this frame", "from active frame onward", "fill only empty masks"], {"default": "fill only empty masks",
                              "tooltip": "Fill only empty masks keeps every existing non-empty frame unchanged and fills only frames whose mask is empty. Only this frame replaces one mask; from active frame onward recalculates from the open frame and preserves earlier results; all frames recomputes the clip."}),
             "propagation_method": (["Molmo2 (classic)", "MolmoPoint-8B", "SAM 3 (current)"], {"default": "Molmo2 (classic)",
@@ -861,14 +949,17 @@ class BFSVideoSegmentPicker:
                                        "color on another subject (e.g. where hands and arms cross) go to that subject, holes inside "
                                        "a mask are filled, and a subject's main body is never removed. 0 = off; 0.5-2 is usually "
                                        "enough. Too high can swallow a small real part, like a fingertip of the other person."}),
+            # last, so saved workflows keep their widget order
+            "settings": ("STRING", {"default": "{}", "multiline": True, "tooltip": "Set by the settings panel (experimental): mode and its options as JSON."}),
         }
         return {"required": req, "optional": opt, "hidden": {**t.get("hidden", {}), "prompt": "PROMPT"}}
 
-    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE", "STRING", "IMAGE")
-    RETURN_NAMES = ("masks", "marked", "overlay", "report", "hybrid")
+    RETURN_TYPES = ("MASK", "IMAGE", "IMAGE", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("masks", "marked", "overlay", "report", "hybrid", "subject_map")
     OUTPUT_TOOLTIPS = ("One mask per frame: the person to replace.", "Every frame with the person tinted (mark_color, mark_opacity).",
                        "The strip frames with all objects found, numbered.", "JSON per frame: picked by hand, tracked from frame N, or empty.",
-                       "The H3 guide with each subject drawn in its color using mark_style and mark_opacity; 'normal map inside mask' keeps pixels outside the person and protect_mask unchanged.")
+                       "The H3 guide with each subject drawn in its color using mark_style and mark_opacity; 'normal map inside mask' keeps pixels outside the person and protect_mask unchanged.",
+                       "Every frame with each subject's mask filled with its color (red, blue, green, yellow, ...) on black: for BFS H3 Regional Reference Attention.")
     FUNCTION = "pick"
     CATEGORY = "BFS/Mask"
     OUTPUT_NODE = True
@@ -879,14 +970,15 @@ class BFSVideoSegmentPicker:
              hybrid_grow=0.08, free_after=FREE_MODES[0], pose_region="person outline",
              pose_gray_opacity=1.0, max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
              propagation_method="Molmo2 (classic)", unique_id=None, prompt=None, protect_mask=None, edge_feather=0.01,
-             hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0, **kw):
+             hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0, settings="{}", **kw):
         try:
             return self._pick(image, sam3_model, sam3_clip, concepts, threshold, max_per_concept, min_area, mark_color, mark_opacity,
                               selection, track, strip_frames, normals, normals_convention, hybrid_base, subject, mark_style,
                               molmo_clip, pose_keypoint, hybrid_grow, unique_id, pose_region, pose_gray_opacity,
                               max_subjects, molmo_descriptions, propagate_scope, propagation_method, prompt,
                               protect_mask=protect_mask, edge_feather=edge_feather, point_model=point_model,
-                              hatch_width=hatch_width, hatch_spacing=hatch_spacing, clean_masks=clean_masks)
+                              hatch_width=hatch_width, hatch_spacing=hatch_spacing, clean_masks=clean_masks,
+                              settings=settings)
         finally:
             self._free(sam3_model, free_after, point_model or molmo_clip)
 
@@ -901,6 +993,11 @@ class BFSVideoSegmentPicker:
             segment_only = False
         if segment_only:
             return []
+        cfg = parse_settings(kw.get("settings"))
+        manual_sparse = False
+        if cfg.get("mode") in SPARSE_MODES:   # hatching / face lines need no normals / pose; manual marks need no Molmo2
+            mark_style = HATCHING_STYLE
+            manual_sparse = cfg.get("placement") == "manual"
         need = []
         if normals is None and ("needs normals" in mark_style or mark_style == PROTECTED_NORMAL_STYLE):
             need.append("normals")
@@ -913,6 +1010,8 @@ class BFSVideoSegmentPicker:
                         if str(sk).isdigit() and state.get("selected")} or {1}
             vkey = video_key(image)
             reuse_existing = all((vkey, sj) in _LAST_TRACK_CACHE for sj in subjects)
+        if manual_sparse:
+            reuse_existing = True
         if molmo_clip is None and track and propagation_method == "Molmo2 (classic)" and not reuse_existing:
             need.append("molmo_clip")
         if point_model is None and track and propagation_method == "MolmoPoint-8B" and not reuse_existing:
@@ -959,8 +1058,17 @@ class BFSVideoSegmentPicker:
               pose_keypoint, hybrid_grow, unique_id, pose_region="person outline", pose_gray_opacity=1.0,
               max_subjects="auto", molmo_descriptions="", propagate_scope="fill only empty masks",
               propagation_method="Molmo2 (classic)", prompt=None, protect_mask=None, edge_feather=0.01,
-              point_model=None, hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0):
+              point_model=None, hatch_width=1.0, hatch_spacing=1.0, clean_masks=0.0, settings="{}"):
         st = Status(unique_id)
+        cfg = parse_settings(settings)
+        sparse = cfg.get("mode") in SPARSE_MODES
+        face_mode = cfg.get("mode") == SPARSE_FACE
+        if sparse:   # the panel's mode overrides the classic mark widgets
+            mark_style = HATCHING_STYLE
+            hatch_width = float(cfg.get("hatch_width", hatch_width))
+            hatch_spacing = float(cfg.get("hatch_spacing", hatch_spacing))
+        moments = int(cfg.get("moments", 4))
+        sparse_frames = {}
         n = int(image.shape[0])
         st(f"start: {n} frames", 0.0, log=True)
         strip = sorted(set(int(round(x)) for x in torch.linspace(0, n - 1, min(n, int(strip_frames), MAX_FRAMES)).tolist()))
@@ -989,7 +1097,7 @@ class BFSVideoSegmentPicker:
         subjects = sorted({int(sk) for frame_state in states.values() for sk, sv in frame_state.items()
                            if str(sk).isdigit() and (sv.get("selected") or [])} or {1})
         max_allowed = None
-        if str(max_subjects) in ("1", "2", "3"):
+        if str(max_subjects).isdigit():
             max_allowed = int(max_subjects)
         else:
             max_allowed = find_connected_picture_count(prompt, unique_id)
@@ -1075,7 +1183,8 @@ class BFSVideoSegmentPicker:
             ckey = ("v4", vkey, sj, json.dumps(mine, sort_keys=True), tuple(cuts), bool(track),
                     (point_model if propagation_method == "MolmoPoint-8B" else molmo_clip) is not None,
                     float(threshold),
-                    propagate_scope, propagation_method, active_frame, float(clean_masks))
+                    propagate_scope, propagation_method, active_frame, float(clean_masks),
+                    cfg.get("placement") if sparse else None)
             if (not segment_only and propagate_scope not in ("all frames", "fill only empty masks") and previous is not None
                     and len(previous) > 2 and previous[2] == mine):
                 per_subject[sj], report_s[sj] = previous[0].clone(), [dict(r) for r in previous[1]]
@@ -1108,6 +1217,25 @@ class BFSVideoSegmentPicker:
                     rp_prev[i] = {"frame": i, "source": "picked (pending propagate)"}
                 per_subject[sj] = m
                 report_s[sj] = rp_prev
+                continue
+            if sparse and cfg.get("placement") == "manual":
+                # manual sparse marks: only the latent window (4 frames) of each picked frame is marked, so only those
+                # frames are tracked -- no Molmo2, no whole-video propagation
+                m = torch.zeros(n, h, w, dtype=torch.bool)
+                rep = [{"frame": i, "source": "not marked (manual)"} for i in range(n)]
+                for a in user_anchors:
+                    win = [g for g in latent_window(0 if a == 0 else (a + 3) // 4) if g < n]
+                    lo, hi = win[0], win[-1] + 1
+                    tr = (BFSTrackFromFrame().track(image[lo:hi, ..., :3], sam3_model, own[sj][a][None], a - lo)[0]
+                          if track and hi - lo > 1 else None)
+                    for i in range(lo, hi):
+                        if i == a:
+                            m[i] = own[sj][a] > 0.5; rep[i] = {"frame": i, "source": "picked"}
+                        elif tr is not None:
+                            m[i] = tr[i - lo] > 0.5; rep[i] = {"frame": i, "source": f"tracked from {a}"}
+                st(f"subject {sj}: manual marks, tracked only the windows of frames {user_anchors}", None, log=True)
+                per_subject[sj] = m; report_s[sj] = rep
+                _cache_track_result(ckey, vkey, sj, m, rep, mine)
                 continue
             if propagate_scope == "fill only empty masks" and previous is not None:
                 # A local correction must not trigger Molmo2 or retrack good frames.
@@ -1343,6 +1471,9 @@ class BFSVideoSegmentPicker:
             per_subject.update(clean_subject_masks({sj: per_subject[sj] > 0.5 for sj in subjects}, clean_masks / 100.0))
             st(f"cleaned the masks: pieces under {clean_masks:g}% of a subject joined their surroundings", None, log=True)
         masks = torch.stack(list(per_subject.values())).amax(0).float()
+        subject_map = torch.zeros(masks.shape + (3,))
+        for sj, m in per_subject.items():
+            subject_map[m.cpu() > 0.5] = torch.tensor(HYBRID_COLORS[(int(sj) - 1) % len(HYBRID_COLORS)]) / 255.0
         anchors = sorted({i for sj in subjects for i in strip if bool(own[sj][i].any())})
         report = [{"frame": i, "subjects": {str(sj): report_s[sj][i]["source"] for sj in subjects}} for i in range(n)]
         if not anchors:
@@ -1469,7 +1600,30 @@ class BFSVideoSegmentPicker:
                     first = next((mask for mask in selected if bool(mask.any())), None)
                     ys, xs = torch.where(first) if first is not None else ([], [])
                     hatch_scale = max(64, min(int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1))) if len(xs) else 64
-                for i in range(n):
+                frames_to_mark = range(n)
+                if sparse:
+                    present = [bool(hm[i].any()) for i in range(n)]
+                    picked = [int(f) for f, fs in states.items() if str(f).isdigit() and isinstance(fs, dict)
+                              and ((fs.get(str(sj)) or {}).get("selected"))]
+                    if cfg.get("placement") == "manual":   # only the windows of the frames you clicked this subject on
+                        frames_to_mark = sorted({g for f in picked if 0 <= f < n
+                                                 for g in latent_window(0 if f == 0 else (f + 3) // 4) if g < n and present[g]})
+                    else:
+                        frames_to_mark = sparse_mark_frames(present, n, moments,
+                                                            cuts=cuts if cfg.get("mark_after_cuts", True) else [],
+                                                            forced=picked if cfg.get("mark_picked") else [])
+                    sparse_frames[str(sj)] = frames_to_mark
+                if face_mode:   # face swap: only a line on the inner border of the subject's face
+                    drawn = []
+                    for i in frames_to_mark:
+                        if bool(hm[i].any()):
+                            fr = face_contour_overlay(base[i, ..., :3].float(), hm[i], col, hatch=bool(cfg.get("face_hatching")),
+                                                      hatch_width=hatch_width, hatch_spacing=hatch_spacing)
+                            if fr is not None:
+                                base[i, ..., :3] = fr.to(base.dtype); drawn.append(int(i))
+                    sparse_frames[str(sj)] = drawn
+                    continue
+                for i in frames_to_mark:
                     if bool(hm[i].any()):
                         fill = mark_fill(mark_style, image[i, ..., :3].float(), nm[i] if nm is not None else None, hm[i], col)
                         if mark_style == HATCHING_STYLE:
@@ -1515,7 +1669,7 @@ class BFSVideoSegmentPicker:
                                 "timeline": (st("building the timeline previews", 0.9) or timeline_strip(image, per_subject, locked))}]}
         lost_frames = sum(r["end"] - r["start"] + 1 for r in lost_runs)
         st(f"done: {len(subjects)} subject(s), {lost_frames} frames without a mask", 1.0, log=True)
-        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects, "active_subjects": [int(sj) for sj in subjects if bool(per_subject[sj].any())], "mark_style": mark_style}), base)}
+        return {"ui": ui, "result": (masks, marked, torch.cat(overlays), json.dumps({"frames": report, "anchors": anchors, "subjects": subjects, "active_subjects": [int(sj) for sj in subjects if bool(per_subject[sj].any())], "mark_style": mark_style, "mode": cfg.get("mode", "classic"), "sparse_frames": sparse_frames, "cuts": cuts}), base, subject_map)}
 
 
 NODE_CLASS_MAPPINGS = {"BFSVideoSegmentPicker": BFSVideoSegmentPicker}

@@ -4,6 +4,8 @@ from .minimax_h3_token_weights import NODE_CLASS_MAPPINGS as H3TOK_NODE_CLASS_MA
 from .minimax_h3_token_weights import NODE_DISPLAY_NAME_MAPPINGS as H3TOK_NODE_DISPLAY_NAME_MAPPINGS
 from .minimax_h3_reference_binding import NODE_CLASS_MAPPINGS as H3BIND_NODE_CLASS_MAPPINGS
 from .minimax_h3_reference_binding import NODE_DISPLAY_NAME_MAPPINGS as H3BIND_NODE_DISPLAY_NAME_MAPPINGS
+from .bfs_h3_regional_attention import NODE_CLASS_MAPPINGS as H3REGION_NODE_CLASS_MAPPINGS
+from .bfs_h3_regional_attention import NODE_DISPLAY_NAME_MAPPINGS as H3REGION_NODE_DISPLAY_NAME_MAPPINGS
 from .bfs_h3_native_shot_loop import NODE_CLASS_MAPPINGS as H3LOOP_NODE_CLASS_MAPPINGS
 from .bfs_h3_native_shot_loop import NODE_DISPLAY_NAME_MAPPINGS as H3LOOP_NODE_DISPLAY_NAME_MAPPINGS
 from .nodes import NODE_CLASS_MAPPINGS as BFS_NODE_CLASS_MAPPINGS
@@ -157,6 +159,7 @@ NODE_CLASS_MAPPINGS = {
     **H3CAST_NODE_CLASS_MAPPINGS,
     **H3TOK_NODE_CLASS_MAPPINGS,
     **H3BIND_NODE_CLASS_MAPPINGS,
+    **H3REGION_NODE_CLASS_MAPPINGS,
     **H3LOOP_NODE_CLASS_MAPPINGS,
     **H3WORKFLOW_NODE_CLASS_MAPPINGS,
     **H3CLIP_NODE_CLASS_MAPPINGS,
@@ -194,6 +197,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **H3CAST_NODE_DISPLAY_NAME_MAPPINGS,
     **H3TOK_NODE_DISPLAY_NAME_MAPPINGS,
     **H3BIND_NODE_DISPLAY_NAME_MAPPINGS,
+    **H3REGION_NODE_DISPLAY_NAME_MAPPINGS,
     **H3LOOP_NODE_DISPLAY_NAME_MAPPINGS,
     **H3WORKFLOW_NODE_DISPLAY_NAME_MAPPINGS,
     **H3CLIP_NODE_DISPLAY_NAME_MAPPINGS,
@@ -232,7 +236,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 for _mod in ("bfs_keyframe_marks", "bfs_video_segment_picker", "bfs_h3_swap_conditioning", "bfs_keyframe_planner",
              "bfs_frame_loop", "bfs_xy_sweep", "bfs_workflow_loop", "bfs_h3_image_swap_prompt",
              "bfs_h3_image_swap_conditioning", "bfs_h3_image_swap_tools", "bfs_model_surgery",
-             "bfs_h3_pdd_surgery"):
+             "bfs_h3_pdd_surgery", "bfs_h3_multi_swap_prompt", "bfs_h3_face_swap_auto"):
     try:
         import importlib as _il
         _m = _il.import_module(f".{_mod}", __package__)
