@@ -510,6 +510,10 @@ class BFSH3RegionalReferenceAttention:
 
     def apply(self, model, positive, isolation="people", outside_subjects="no picture", dilate=1, guide=None, subject_map=None,
               route_layer=12, margin=0.05, routing="soft", strength=4.0, sharpness=0.05, background=4.0, tracking="propagate", radius=3, bias_layers="from route layer"):
+        if model is None:
+            raise ValueError("No model reached BFS H3 Regional Reference Attention. If its model comes from "
+                             "BFS H3 Face Swap • Auto Subjects, connect that node's optional `model` input "
+                             "(or wire the model here straight from the LoRA loader).")
         if guide is None and subject_map is None:
             raise ValueError("Connect `guide` (attention tracking, no masks) or `subject_map` (masks)")
         text_spans = {}
