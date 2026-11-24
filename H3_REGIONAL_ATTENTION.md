@@ -104,6 +104,7 @@ Neither exists yet.
 | `background` | 4.0 | Push away from every picture for tokens of nobody, so identity stays off the background and unpicked people. 8 suppressed real swaps wherever tracking missed part of a face. |
 | `route_layer` | 12 | Block whose features track the people. With an attention-trained LoRA, keep the value it was trained with. |
 | `bias_layers` | from route layer | **from route layer**: bias only from the tracking block on (what an attention-trained LoRA saw). **all**: every block after the first pass. |
+| `bias_start` / `bias_end` | 0 / 0 | First and last block that get the bias (0 = from `bias_layers` / to the last block). The face identity is decided from about block 24: `bias_start` 24 kept the quality of 12–49 in tests and ran about 30% faster. |
 | `sharpness` | 0.05 | Temperature of the tracking similarity. Lower means crisper labels. |
 | `radius` | 3 | How far (in 32 px tokens) a person may move between two latent frames (4 video frames). |
 | `tracking` | propagate | **propagate + match** also matches unreached tokens to the marked frames of the whole clip. No measurable gain in tests. |

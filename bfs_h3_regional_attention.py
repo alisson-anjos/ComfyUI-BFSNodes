@@ -308,7 +308,9 @@ def make_override(cfg, previous):
                 state[key] = route_from_attention(q, k, v, layout, cfg)
             if state[key] is None:
                 return attn(*args, **kwargs)
-            if cfg.get("from_route") and topts.get("block_index", 0) < cfg["route_layer"]:
+            b = topts.get("block_index", 0)
+            if (cfg.get("from_route") and b < cfg["route_layer"]) or b < cfg.get("bias_start", 0) or \
+                    (cfg.get("bias_end", 0) and b > cfg["bias_end"]):
                 return attn(*args, **kwargs)                              # bias only from the tracking layer on (as trained)
             if "soft" in state[key]:
                 return biased_attention(q, k, v, state[key]["soft"], kwargs.get("skip_output_reshape", False))
@@ -516,7 +518,10 @@ class BFSH3RegionalReferenceAttention:
                         "propagate: each person is followed frame to frame from the marked frames. propagate + match: what the "
                         "frame-to-frame step cannot reach (fast motion, camera cuts) is matched to the most similar marked tokens of the whole clip.")}),
                     "bias_layers": (["all", "from route layer"], {"default": "from route layer", "tooltip": "Which DiT layers get the bias: all, or only the tracking layer and the ones after it (what an attention-trained LoRA saw)."}),
-                    "radius": ("INT", {"default": 3, "min": 1, "max": 12, "tooltip": "Attention tracking: how far (in 32 px tokens) a person may move between two latent frames (4 video frames)."})}}
+                    "radius": ("INT", {"default": 3, "min": 1, "max": 12, "tooltip": "Attention tracking: how far (in 32 px tokens) a person may move between two latent frames (4 video frames)."}),
+                    "bias_start": ("INT", {"default": 0, "min": 0, "max": 49, "tooltip": "First block that gets the bias (0 = as bias_layers says). The tracking still runs at route_layer. 24 keeps the quality of the full range in tests (the face identity is decided from about block 24) and runs about 30% faster."}),
+                    "bias_end": ("INT", {"default": 0, "min": 0, "max": 49, "tooltip": "Last block that gets the bias (0 = the last block). Fewer biased blocks keep more of the fast attention backend."})}}
+
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -529,7 +534,7 @@ class BFSH3RegionalReferenceAttention:
                    "attention nodes: they skip this node (a warning is logged). SageAttention and plain SDPA work.")
 
     def apply(self, model, positive, isolation="people", outside_subjects="no picture", dilate=1, guide=None, subject_map=None,
-              route_layer=12, margin=0.05, routing="soft", strength=4.0, sharpness=0.05, background=4.0, tracking="propagate", radius=3, bias_layers="from route layer"):
+              route_layer=12, margin=0.05, routing="soft", strength=4.0, sharpness=0.05, background=4.0, tracking="propagate", radius=3, bias_layers="from route layer", bias_start=0, bias_end=0):
         if model is None:
             raise ValueError("No model reached BFS H3 Regional Reference Attention. If its model comes from "
                              "BFS H3 Face Swap • Auto Subjects, connect that node's optional `model` input "
@@ -546,7 +551,7 @@ class BFSH3RegionalReferenceAttention:
                "route_layer": int(route_layer), "margin": float(margin), "guide": None, "regions": None, "subjects": 0,
                "routing": routing, "strength": float(strength), "sharpness": float(sharpness), "background": float(background),
                "tracking": tracking, "radius": int(radius),
-               "from_route": bias_layers == "from route layer"}
+               "from_route": bias_layers == "from route layer", "bias_start": int(bias_start), "bias_end": int(bias_end)}
         if subject_map is not None:
             regions = subject_regions(subject_map.cpu())
             if regions is None:
