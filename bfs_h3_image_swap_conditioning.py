@@ -166,3 +166,97 @@ class BFSH3ImageAutoCharacterSwapConditioning(io.ComfyNode):
 
 NODE_CLASS_MAPPINGS['BFSH3ImageAutoCharacterSwapConditioning'] = BFSH3ImageAutoCharacterSwapConditioning
 NODE_DISPLAY_NAME_MAPPINGS['BFSH3ImageAutoCharacterSwapConditioning'] = 'BFS H3 Image Character Swap • Auto Subjects'
+
+
+
+# ---------- multi face swap (H3 Image face swap LoRA): guide = Picture 1, faces = Picture 2.. ----------
+FACE_COLORS = ('red', 'blue', 'green', 'yellow')
+
+
+def h3image_face_prompt(colors, caption="v1"):
+    """The face swap image LoRA's training caption, word for word. The guide is the first image the text encoder sees
+    ("Picture 1: " label) but the caption calls it "the guide image" and numbers only the faces: <Picture 1> is the
+    red face, <Picture 2> the blue one, and so on."""
+    if str(caption).startswith("v2"):
+        from .bfs_h3_multi_swap_prompt import face_swap_prompt_v2
+        return face_swap_prompt_v2(list(colors), image=True)
+    k = len(colors)
+    subs = "\n".join(f"<Subject {i + 1}> is the person whose face is outlined by the thin {c} line in the guide image."
+                     for i, c in enumerate(colors))
+    refs = [f"<Picture {i + 1}>" for i in range(k)]
+    refs = refs[0] if k == 1 else ", ".join(refs[:-1]) + " and " + refs[-1]
+    repl = "; ".join(f"replace the face of <Subject {i + 1}> with the face shown in <Picture {i + 1}>" for i in range(k))
+    return ("face_swap:\n"
+            "subject_definitions: The guide image is the source image. Thin colored lines on the inner border of a face mark the "
+            "faces to replace; the pixels inside and around the lines provide head pose, expression, gaze, lighting and scene "
+            f"context.\n{subs}\n{refs} {'is a reference' if k == 1 else 'are references'}.\n\n"
+            "summary: [image editing + reference generation]\n\n"
+            "detailed_description:\n"
+            f"In the target image, {repl}.\n"
+            "Transfer only the facial identity from each assigned reference: eyes, eyebrows, nose, lips, face shape and skin "
+            "tone; do not copy the hair, head shape, pose, expression or lighting of the reference.\n"
+            "For each <Subject> in the guide image, preserve the source head orientation, gaze and facial expression, the hair, "
+            "ears, body and clothing, and adapt each new face to the source lighting, shadows and exposure; do not mix "
+            "features between subjects.\n"
+            "Preserve every unmarked person, the background, held objects, foreground occluders and the framing.\n"
+            "Remove all colored lines from the result.")
+
+
+
+class BFSH3ImageFaceSwapAutoSubjects(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id='BFSH3ImageFaceSwapAutoSubjects',
+            display_name='BFS H3 Image Face Swap • Auto Subjects', category='BFS/MiniMax H3',
+            description='Multi face swap on H3 Image (experimental): the guide from the BFS Video Segment Picker in '
+                        "'sparse face contour' mode is the first image; the face of each picked color (red, blue, green, "
+                        'yellow) follows. Writes the face swap LoRA training prompt (faces numbered <Picture 1>, <Picture 2>, ...).',
+            inputs=[io.Clip.Input('clip'), io.Vae.Input('vae'), io.Image.Input('guide_image'),
+                    io.String.Input('picker_report', force_input=True),
+                    io.Image.Input('red_face', optional=True, lazy=True),
+                    io.Image.Input('blue_face', optional=True, lazy=True),
+                    io.Image.Input('green_face', optional=True, lazy=True),
+                    io.Image.Input('yellow_face', optional=True, lazy=True),
+                    io.Int.Input('width', default=0, min=0, max=16384, step=32),
+                    io.Int.Input('height', default=0, min=0, max=16384, step=32),
+                    io.String.Input('prompt_override', default='', multiline=True, optional=True,
+                        tooltip='Optional full replacement prompt. Use the training wording: the guide is "the guide image" and the picked faces are <Picture 1>, <Picture 2>, ... in color order.'),
+                    io.Combo.Input('caption', options=['v1 (current LoRAs)', 'v2 (color-shuffled datasets)'], default='v1 (current LoRAs)', optional=True,
+                        tooltip='Training caption of the LoRA: v1 for the current face swap LoRAs, v2 for LoRAs trained on the color-shuffled datasets.')],
+            outputs=[io.Conditioning.Output(display_name='positive'), io.Latent.Output(display_name='latent'),
+                     io.String.Output(display_name='prompt')])
+
+    @staticmethod
+    def _ids(picker_report):
+        import json
+        try:
+            r = json.loads(picker_report or '{}')
+        except Exception:
+            r = {}
+        return sorted({int(s) for s in (r.get('active_subjects') or r.get('subjects') or []) if 1 <= int(s) <= 4})
+
+    @classmethod
+    def check_lazy_status(cls, picker_report, red_face=None, blue_face=None, green_face=None, yellow_face=None, **kwargs):
+        faces = (red_face, blue_face, green_face, yellow_face)
+        return [f'{FACE_COLORS[s-1]}_face' for s in cls._ids(picker_report) if faces[s-1] is None]
+
+    @classmethod
+    def execute(cls, clip, vae, guide_image, picker_report, red_face=None, blue_face=None, green_face=None, yellow_face=None,
+                width=0, height=0, prompt_override='', caption='v1 (current LoRAs)'):
+        ids = cls._ids(picker_report)
+        if not ids:
+            raise ValueError("Pick at least one person in the Video Segment Picker ('sparse face contour' mode), then run again.")
+        faces = (red_face, blue_face, green_face, yellow_face)
+        pictures = [faces[s-1] for s in ids]
+        if any(p is None for p in pictures):
+            raise ValueError('Connect a face picture for every picked color: ' + ', '.join(FACE_COLORS[s-1] for s in ids))
+        prompt = (prompt_override or '').strip() or h3image_face_prompt([FACE_COLORS[s-1] for s in ids], caption)
+        images = {'image_1': guide_image[:1]}
+        images.update({f'image_{i}': p for i, p in enumerate(pictures, 2)})
+        positive, latent = MiniMaxH3ImageConditioning.execute(
+            clip=clip, vae=vae, prompt=prompt, width=width, height=height, images=images).args[:2]
+        return io.NodeOutput(positive, latent, prompt)
+
+
+NODE_CLASS_MAPPINGS['BFSH3ImageFaceSwapAutoSubjects'] = BFSH3ImageFaceSwapAutoSubjects
+NODE_DISPLAY_NAME_MAPPINGS['BFSH3ImageFaceSwapAutoSubjects'] = 'BFS H3 Image Face Swap • Auto Subjects'

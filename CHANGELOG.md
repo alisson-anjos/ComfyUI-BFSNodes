@@ -2,6 +2,15 @@
 
 All notable changes to **ComfyUI-BFSNodes** are documented in this file.
 
+## [1.123.0] - 2026-11-23
+
+### Added
+- **BFS H3 Regional Reference Attention (`BFSH3RegionalReferenceAttention`)**: routes each reference picture to its own person inside MiniMax H3's attention, with no masks. The guide's colored face contours seed each person, the model's own features at `route_layer` track them through the video, and a soft rank-2P logit bias makes person j read Picture j while the background reads no picture. Defaults: routing soft, strength 4, background 4, `bias_layers` from route layer. Works with the H3 video face swap and with H3 Image (the marked guide is reference image 1). Works with PyTorch SDPA and SageAttention; **not compatible with Model Sparse Attention (sol-attn)** or other block-sparse attention nodes, which skip it (the node logs a warning when one is active). See [H3_REGIONAL_ATTENTION.md](H3_REGIONAL_ATTENTION.md) and the [interactive explainer](https://claude.ai/artifact/KFuYAX6zLgtMejj5QZuc3H).
+- **BFS H3 Face Swap • Auto Subjects (`BFSH3FaceSwapAutoSubjects`, experimental)**: the multi face swap LoRA in one node. It reads the subjects picked in the Video Segment Picker, takes one face picture per picked color, writes the training prompt (always the v2 caption) and builds the Ref2VA conditioning with the marked guide. One guide frame gives the image prompt.
+- **BFS H3 Image Face Swap • Auto Subjects (`BFSH3ImageFaceSwapAutoSubjects`)**: the same for H3 Image. The guide is Picture 1 and the picked faces follow from Picture 2.
+- **Video Segment Picker settings panel**: a mode selector, **Classic** (default, the widgets as before), **Multi Character Swap — Sparse Hatching** and **Multi Face Swap — Sparse Face Contour**, with the options of each mode (moments, mark after cuts, placement, hatching inside the face). Sparse modes mark only a few latent windows per subject. Face contour draws a thin line on the inner border of each picked face; it needs InsightFace with `buffalo_l` in `models/insightface`. New `subject_map` output: each subject's mask in its color.
+- **BFS H3 Character Swap Conditioning**: modes `colored hatching + contour`, `sparse hatching (multi swap v7)` and `sparse face contour (multi face swap)`, with their training prompts.
+
 ## [1.122.4] - 2026-11-18
 
 ### Added

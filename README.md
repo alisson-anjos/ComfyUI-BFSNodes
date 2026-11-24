@@ -332,6 +332,16 @@ tracked person's mask at each keyframe), **BFS Workflow Loop** (run a part of th
 graph once per item, injecting the item and changing widgets per iteration),
 **BFS XY Sweep** (a grid of any two widgets' values) and **BFS Frame Loop Start/End**.
 
+### H3 Regional Reference Attention (1.123.0)
+
+Routes each reference picture to its own person inside MiniMax H3's attention, without
+masks: the picker's face contours seed each person, the model's own features follow them,
+and a soft bias makes person j read Picture j and the background read no picture. It fixes
+swapped identities, the weak second person and identity leaking onto unpicked people in
+multi face swap (video and H3 Image). Not compatible with Model Sparse Attention (sol-attn),
+which skips it. See [how it works, wiring and results](H3_REGIONAL_ATTENTION.md)
+and the [interactive explainer](https://claude.ai/artifact/KFuYAX6zLgtMejj5QZuc3H).
+
 ### MiniMax H3 Image character swap
 
 **Auto Subjects:** connect the Picker's `hybrid` and `report` outputs to **BFS H3 Image Character Swap • Auto Subjects**, then connect references to the fixed red, blue and green slots. The node reads the actual selected colors; no manual subject count is needed. The guide is Picture 1 and active references follow from Picture 2 in color order. Blue or green may be used without red. Leave `prompt_override` empty for the generated prompt, or provide a complete replacement prompt; reference selection remains automatic.
